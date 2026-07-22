@@ -1,6 +1,6 @@
 # Architectural decision record 0001: SQLite storage
 
-Status: Provisional
+Status: Accepted
 
 Date: 2026-07-22
 
@@ -49,10 +49,15 @@ The workload gate has these limits:
 - migration and backup must each complete in 120 seconds.
 - the 99th percentile query time must not be more than 250 ms.
 
-The GitHub Actions release matrix runs the functional and workload gates on
-Linux and macOS. This decision stays provisional until both hosted runners pass.
-BSD and non-local filesystem support stay outside the current supported
-platform set.
+GitHub Actions run
+[29964179974](https://github.com/mchalunderscore/tit/actions/runs/29964179974)
+passed all quality checks and both hosted workload gates. The Ubuntu 24.04.4
+LTS runner used Rust 1.96.0. Its migration took 1,528 ms, its backup took 954
+ms, and its 99th percentile query time was 18 microseconds. The macOS 26.4
+arm64 runner used Rust 1.96.0. Its migration took 1,774 ms, its backup took
+1,333 ms, and its 99th percentile query time was 22 microseconds. Each database
+was 113,926,144 bytes. BSD and non-local filesystem support stay outside the
+current supported platform set.
 
 ## Consequences
 
