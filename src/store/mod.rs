@@ -8,6 +8,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use thiserror::Error;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
 const SCHEMA_VERSION: i64 = 2;
 #[allow(
     dead_code,
@@ -224,6 +225,12 @@ fn configure(connection: &Connection) -> Result<(), StoreError> {
     verify_text_setting(connection, "journal_mode", "wal")?;
     verify_integer_setting(connection, "synchronous", 2, "2")?;
     verify_integer_setting(connection, "foreign_keys", 1, "1")?;
+    verify_integer_setting(
+        connection,
+        "busy_timeout",
+        BUSY_TIMEOUT_MILLISECONDS,
+        "5000",
+    )?;
     Ok(())
 }
 

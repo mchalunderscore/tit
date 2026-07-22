@@ -153,6 +153,13 @@ fn configures_connections_and_creates_the_current_schema() {
             .expect("read the foreign-key mode"),
         1
     );
+    assert_eq!(
+        store
+            .connection()
+            .pragma_query_value::<i64, _>(None, "busy_timeout", |row| row.get(0))
+            .expect("read the busy timeout"),
+        5_000
+    );
     store.integrity_check().expect("check database integrity");
 }
 
@@ -440,11 +447,37 @@ fn backs_up_a_consistent_database_while_writes_continue() {
         sequence
     });
 
+    let reader_running = Arc::clone(&running);
+    let reader_path = source_path.clone();
+    let (reader_ready_sender, reader_ready_receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let store = Store::open(&reader_path).expect("open the backup reader");
+        let mut read_count = 0;
+        while reader_running.load(Ordering::Relaxed) {
+            let _: i64 = store
+                .connection()
+                .query_row("SELECT count(*) FROM m1a_child", [], |row| row.get(0))
+                .expect("read while the backup runs");
+            if read_count == 0 {
+                reader_ready_sender
+                    .send(())
+                    .expect("signal that the reader is ready");
+            }
+            read_count += 1;
+        }
+        read_count
+    });
+    reader_ready_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("wait for the backup reader");
+
     source
         .backup(&backup_path)
         .expect("create an online backup");
     running.store(false, Ordering::Relaxed);
     let final_sequence = writer.join().expect("join the backup writer");
+    let read_count = reader.join().expect("join the backup reader");
+    assert!(read_count > 0);
     let backup = Store::open(&backup_path).expect("open the backup");
     backup.integrity_check().expect("check backup integrity");
     let backup_count: i64 = backup
@@ -457,11 +490,9 @@ fn backs_up_a_consistent_database_while_writes_continue() {
 
 #[test]
 fn migrates_each_committed_historical_fixture() {
-    for (name, fixture, initial_version) in
-        [("v1.sqlite", V1_FIXTURE, 1), ("v2.sqlite", V2_FIXTURE, 2)]
-    {
+    for (fixture, initial_version) in [(V1_FIXTURE, 1), (V2_FIXTURE, 2)] {
         let directory = TempDir::new().expect("create a temporary directory");
-        let path = database(&directory, name);
+        let path = database(&directory, "tit.sqlite3");
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
@@ -479,6 +510,7 @@ fn migrates_each_committed_historical_fixture() {
             "closed"
         };
         assert_eq!(state, expected);
+        store::doctor(directory.path()).expect("check the migrated fixture with doctor");
 
         let backup_path = migration_backup(&path, 1);
         assert_eq!(backup_path.exists(), initial_version == 1);
