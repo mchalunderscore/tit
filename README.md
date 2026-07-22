@@ -52,6 +52,19 @@ challenges. Read the SSH identity
 [architectural decision record](docs/adr/0002-ssh-identity.md) for the supported
 algorithms, limits, and current platform evidence.
 
+## Milestone 1C gate
+
+Install stock Git and OpenSSH. Then, run the read-side Git protocol gate:
+
+```text
+./scripts/check-m1c
+```
+
+This command uses stock Git to clone and fetch SHA-1 and SHA-256 repositories
+through smart HTTP and SSH. Read the read-side Git
+[architectural decision record](docs/adr/0003-read-side-git.md) for the protocol
+versions, limits, known omissions, and current platform evidence.
+
 ## Database check
 
 An initialized instance keeps its metadata in `tit.sqlite3`. Check an existing

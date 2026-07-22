@@ -1,6 +1,16 @@
 #[allow(dead_code, reason = "the SSH test uses only the shared key boundary")]
 #[path = "../src/auth.rs"]
 mod auth;
+#[allow(
+    dead_code,
+    reason = "the SSH identity test does not use each Git service API"
+)]
+#[path = "../src/git/mod.rs"]
+mod git;
+#[allow(
+    dead_code,
+    reason = "the SSH identity test does not start a Git service"
+)]
 #[path = "../src/ssh.rs"]
 mod ssh;
 

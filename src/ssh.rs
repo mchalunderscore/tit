@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,6 +15,9 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::auth::SshPublicKey;
+use crate::git::packetline::{MAX_REQUEST_BYTES, Packet, decode, encode_data};
+use crate::git::transport::GitRepositories;
+use crate::git::upload_pack::{ProtocolVersion, UploadPack, UploadPackError};
 
 const VERSION_COMMAND: &[u8] = b"tit --version";
 const GIT_PROTOCOL_VARIABLE: &str = "GIT_PROTOCOL";
@@ -30,6 +33,22 @@ impl RunningSshServer {
     pub(crate) async fn start(
         address: SocketAddr,
         authorized_keys: &[SshPublicKey],
+    ) -> Result<Self, SshServerError> {
+        Self::start_inner(address, authorized_keys, None).await
+    }
+
+    pub(crate) async fn start_with_git(
+        address: SocketAddr,
+        authorized_keys: &[SshPublicKey],
+        repositories: GitRepositories,
+    ) -> Result<Self, SshServerError> {
+        Self::start_inner(address, authorized_keys, Some(repositories)).await
+    }
+
+    async fn start_inner(
+        address: SocketAddr,
+        authorized_keys: &[SshPublicKey],
+        repositories: Option<GitRepositories>,
     ) -> Result<Self, SshServerError> {
         let listener = TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
@@ -65,6 +84,7 @@ impl RunningSshServer {
         let server = SshServer {
             authorized_keys,
             audit: Arc::clone(&audit),
+            repositories: repositories.map(Arc::new),
         };
         let (handle_sender, handle_receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -113,6 +133,7 @@ pub(crate) enum SshServerError {
 struct SshServer {
     authorized_keys: Arc<HashSet<PublicKey>>,
     audit: Arc<RequestAudit>,
+    repositories: Option<Arc<GitRepositories>>,
 }
 
 impl Server for SshServer {
@@ -122,6 +143,9 @@ impl Server for SshServer {
         SshSession {
             authorized_keys: Arc::clone(&self.authorized_keys),
             audit: Arc::clone(&self.audit),
+            repositories: self.repositories.clone(),
+            protocol: ProtocolVersion::V0,
+            git_channels: HashMap::new(),
         }
     }
 }
@@ -129,6 +153,14 @@ impl Server for SshServer {
 struct SshSession {
     authorized_keys: Arc<HashSet<PublicKey>>,
     audit: Arc<RequestAudit>,
+    repositories: Option<Arc<GitRepositories>>,
+    protocol: ProtocolVersion,
+    git_channels: HashMap<ChannelId, GitChannel>,
+}
+
+struct GitChannel {
+    service: UploadPack,
+    request: Vec<u8>,
 }
 
 impl Handler for SshSession {
@@ -235,6 +267,12 @@ impl Handler for SshSession {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         if variable_name == GIT_PROTOCOL_VARIABLE && valid_git_protocol(variable_value) {
+            self.protocol = match variable_value {
+                "version=0" => ProtocolVersion::V0,
+                "version=1" => ProtocolVersion::V1,
+                "version=2" => ProtocolVersion::V2,
+                _ => unreachable!("the Git protocol value was validated"),
+            };
             self.audit.accepted_env.fetch_add(1, Ordering::Relaxed);
             session.channel_success(channel)?;
         } else {
@@ -272,10 +310,131 @@ impl Handler for SshSession {
             session.eof(channel)?;
             session.close(channel)?;
         } else {
-            self.audit.rejected_exec.fetch_add(1, Ordering::Relaxed);
-            session.channel_failure(channel)?;
-            session.close(channel)?;
+            let service = if let Some(repositories) = &self.repositories
+                && let Ok(path) = repositories.resolve_ssh_command(command)
+                && let Ok(permit) = repositories.blocking_permit().await
+            {
+                let protocol = self.protocol;
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let service = UploadPack::open(&path)?;
+                    let advertisement = service.advertisement(protocol, false)?;
+                    Ok::<_, UploadPackError>((service, advertisement))
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+            } else {
+                None
+            };
+            if let Some((service, advertisement)) = service {
+                self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
+                session.channel_success(channel)?;
+                session.data(channel, advertisement)?;
+                self.git_channels.insert(
+                    channel,
+                    GitChannel {
+                        service,
+                        request: Vec::new(),
+                    },
+                );
+            } else {
+                self.audit.rejected_exec.fetch_add(1, Ordering::Relaxed);
+                session.channel_failure(channel)?;
+                session.close(channel)?;
+            }
         }
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let Some(mut git) = self.git_channels.remove(&channel) else {
+            return Ok(());
+        };
+        if git.request.len().saturating_add(data.len()) > MAX_REQUEST_BYTES {
+            fail_git_channel(channel, session)?;
+            return Ok(());
+        }
+        git.request.extend_from_slice(data);
+
+        let packets = match decode(&git.request) {
+            Ok(packets) => packets,
+            Err(super::git::packetline::PacketLineError::TruncatedHeader)
+            | Err(super::git::packetline::PacketLineError::TruncatedPacket) => {
+                self.git_channels.insert(channel, git);
+                return Ok(());
+            }
+            Err(_) => {
+                fail_git_channel(channel, session)?;
+                return Ok(());
+            }
+        };
+        if packets == [Packet::Flush] {
+            finish_git_channel(channel, 0, session)?;
+            return Ok(());
+        }
+
+        match self.protocol {
+            ProtocolVersion::V0 | ProtocolVersion::V1 => {
+                let done = packets.last().is_some_and(
+                    |packet| matches!(packet, Packet::Data(line) if trim_line(line) == b"done"),
+                );
+                if done {
+                    match respond_git(self.repositories.clone(), self.protocol, git).await {
+                        Some((_, Ok(response))) => {
+                            session.data(channel, response)?;
+                            finish_git_channel(channel, 0, session)?;
+                        }
+                        Some((_, Err(_))) | None => fail_git_channel(channel, session)?,
+                    }
+                } else if packets.last() == Some(&Packet::Flush) {
+                    let mut response = Vec::new();
+                    encode_data(b"NAK\n", &mut response).expect("a NAK packet is within the limit");
+                    session.data(channel, response)?;
+                    self.git_channels.insert(channel, git);
+                } else {
+                    self.git_channels.insert(channel, git);
+                }
+            }
+            ProtocolVersion::V2 => {
+                if packets.last() != Some(&Packet::Flush) {
+                    self.git_channels.insert(channel, git);
+                    return Ok(());
+                }
+                let fetch = packets.iter().any(
+                    |packet| matches!(packet, Packet::Data(line) if trim_line(line) == b"command=fetch"),
+                );
+                let done = packets.iter().any(
+                    |packet| matches!(packet, Packet::Data(line) if trim_line(line) == b"done"),
+                );
+                match respond_git(self.repositories.clone(), self.protocol, git).await {
+                    Some((mut git, Ok(response))) => {
+                        session.data(channel, response)?;
+                        if fetch && done {
+                            finish_git_channel(channel, 0, session)?;
+                        } else {
+                            git.request.clear();
+                            self.git_channels.insert(channel, git);
+                        }
+                    }
+                    Some((_, Err(_))) | None => fail_git_channel(channel, session)?,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.git_channels.remove(&channel);
         Ok(())
     }
 
@@ -331,8 +490,46 @@ impl SshSession {
     }
 }
 
+async fn respond_git(
+    repositories: Option<Arc<GitRepositories>>,
+    protocol: ProtocolVersion,
+    git: GitChannel,
+) -> Option<(GitChannel, Result<Vec<u8>, UploadPackError>)> {
+    let permit = repositories?.blocking_permit().await.ok()?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let response = git.service.respond(protocol, &git.request);
+        (git, response)
+    })
+    .await
+    .ok()
+}
+
 fn valid_git_protocol(value: &str) -> bool {
     matches!(value, "version=0" | "version=1" | "version=2")
+}
+
+fn trim_line(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\n").unwrap_or(line)
+}
+
+fn finish_git_channel(
+    channel: ChannelId,
+    status: u32,
+    session: &mut Session,
+) -> Result<(), russh::Error> {
+    session.exit_status_request(channel, status)?;
+    session.eof(channel)?;
+    session.close(channel)?;
+    Ok(())
+}
+
+fn fail_git_channel(channel: ChannelId, session: &mut Session) -> Result<(), russh::Error> {
+    let mut error = Vec::new();
+    encode_data(b"ERR invalid Git request\n", &mut error)
+        .expect("a Git error packet is within the limit");
+    session.data(channel, error)?;
+    finish_git_channel(channel, 1, session)
 }
 
 #[derive(Default)]

@@ -2,6 +2,8 @@
 mod auth;
 mod cli;
 mod config;
+#[allow(dead_code, reason = "M1C proves Git reads before the CLI serves them")]
+mod git;
 #[allow(dead_code, reason = "M1B proves the SSH server before M2 calls it")]
 mod ssh;
 mod store;

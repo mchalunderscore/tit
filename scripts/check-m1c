@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+./scripts/check
+cargo test --locked --release --test git_repository --test git_http --test git_ssh
