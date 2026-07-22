@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use url::Url;
 
 #[derive(Debug, Parser)]
@@ -12,6 +12,9 @@ use url::Url;
     arg_required_else_help = true
 )]
 pub(crate) struct Cli {
+    #[command(subcommand)]
+    pub(crate) command: Option<Command>,
+
     /// Read configuration from FILE
     #[arg(long, value_name = "FILE", conflicts_with = "user")]
     pub(crate) config: Option<PathBuf>,
@@ -39,4 +42,10 @@ pub(crate) struct Cli {
     /// Override the public SSH port
     #[arg(long, value_name = "PORT")]
     pub(crate) ssh_public_port: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Subcommand)]
+pub(crate) enum Command {
+    /// Check the instance database
+    Doctor,
 }

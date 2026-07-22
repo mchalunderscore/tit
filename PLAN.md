@@ -27,6 +27,7 @@ while the application does not run.
 System installations keep the full instance in `/srv/tit` by default.
 This includes `config.toml`, the metadata database, bare repositories, SSH host
 keys, instance secrets, and recoverable operational state.
+The metadata database name is `tit.sqlite3`.
 
 ## Product boundaries
 
@@ -535,6 +536,10 @@ Goal: remove the risks that can make the single-binary design invalid.
 
 Gate: restored and migrated fixtures pass SQLite integrity checks and `doctor`.
 No handler needs direct access to a `rusqlite` type or SQL statement.
+
+The M1A evidence and limits are in
+`docs/adr/0001-sqlite-storage.md`. The decision stays provisional until the
+Linux and macOS CI workload gates pass.
 
 ##### M1B — SSH identity
 

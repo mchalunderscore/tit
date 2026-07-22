@@ -25,6 +25,31 @@ root:
 
 This command formats, lints, tests, audits, and builds the release executable.
 
+## Milestone 1A gate
+
+Run the SQLite durability gate on a local filesystem:
+
+```text
+./scripts/check-m1a
+```
+
+This command also creates and measures a release database with 10,000 issue
+records and 1,000,000 event records. Read the SQLite
+[architectural decision record](docs/adr/0001-sqlite-storage.md) for the limits
+and current platform evidence.
+
+## Database check
+
+An initialized instance keeps its metadata in `tit.sqlite3`. Check an existing
+database with this command:
+
+```text
+tit --config /absolute/path/to/tit/config.toml doctor
+```
+
+The command does not create or migrate a database. Successful validation writes
+no output and returns exit code 0.
+
 ## Configuration validation
 
 Copy `config.example.toml` into an empty instance directory. Change

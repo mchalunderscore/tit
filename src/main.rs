@@ -1,11 +1,12 @@
 mod cli;
 mod config;
+mod store;
 
 use std::process::ExitCode;
 
 use clap::Parser;
 
-use crate::cli::Cli;
+use crate::cli::{Cli, Command};
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
@@ -18,7 +19,16 @@ fn main() -> ExitCode {
     };
 
     match config::load(&cli) {
-        Ok(_config) => ExitCode::SUCCESS,
+        Ok(config) => match cli.command {
+            None => ExitCode::SUCCESS,
+            Some(Command::Doctor) => match store::doctor(&config.instance_dir) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("tit: {error}");
+                    ExitCode::FAILURE
+                }
+            },
+        },
         Err(error) => {
             eprintln!("tit: {error}");
             ExitCode::FAILURE

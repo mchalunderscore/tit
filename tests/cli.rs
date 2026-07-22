@@ -9,6 +9,8 @@ use support::{
 };
 use tempfile::TempDir;
 
+const V2_DATABASE: &str = include_str!("fixtures/sqlite/v2.sql");
+
 #[test]
 fn help_and_version_use_standard_output() {
     for argument in ["--help", "--version"] {
@@ -54,6 +56,88 @@ fn a_configuration_error_uses_exit_code_one_and_standard_error() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).starts_with("tit: "));
+}
+
+#[test]
+fn doctor_checks_an_existing_current_database() {
+    let instance = TestInstance::new();
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the instance database");
+    database
+        .execute_batch(V2_DATABASE)
+        .expect("create the current database");
+    drop(database);
+
+    let output = instance.run(&[
+        "--config",
+        instance.config().to_str().expect("a UTF-8 path"),
+        "doctor",
+    ]);
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn doctor_does_not_create_or_migrate_a_database() {
+    let instance = TestInstance::new();
+    let database_path = instance.path().join("tit.sqlite3");
+    let arguments = [
+        "--config",
+        instance.config().to_str().expect("a UTF-8 path"),
+        "doctor",
+    ];
+
+    let missing = instance.run(&arguments);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(!database_path.exists());
+
+    let database = rusqlite::Connection::open(&database_path).expect("open the old database");
+    database
+        .execute_batch(include_str!("fixtures/sqlite/v1.sql"))
+        .expect("create the old database");
+    drop(database);
+
+    let old = instance.run(&arguments);
+    assert_eq!(old.status.code(), Some(1));
+    let database = rusqlite::Connection::open(&database_path).expect("reopen the old database");
+    assert_eq!(
+        database
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .expect("read the schema version"),
+        1
+    );
+}
+
+#[test]
+fn doctor_reports_a_foreign_key_violation() {
+    let instance = TestInstance::new();
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the instance database");
+    database
+        .execute_batch(V2_DATABASE)
+        .expect("create the current database");
+    database
+        .pragma_update(None, "foreign_keys", false)
+        .expect("disable foreign keys for the damaged fixture");
+    database
+        .execute(
+            "INSERT INTO m1a_child (id, parent_id, sequence, body) VALUES (2, 999, 1, 'orphan')",
+            [],
+        )
+        .expect("create a foreign-key violation");
+    drop(database);
+
+    let output = instance.run(&[
+        "--config",
+        instance.config().to_str().expect("a UTF-8 path"),
+        "doctor",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("foreign key violation"));
 }
 
 #[test]

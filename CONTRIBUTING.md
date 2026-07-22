@@ -104,6 +104,8 @@ Use the technical nouns in this list:
 - advertised hostname, hostname, onion hostname, and proxy command.
 - database constraint, foreign key, online backup, prepared statement, and
   schema migration.
+- durability gate, local filesystem, migration backup, percentile, and
+  workload gate.
 
 Use the technical verbs in this list:
 

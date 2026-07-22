@@ -30,4 +30,5 @@ jobs:
           persist-credentials: false
       - run: cargo --version
       - run: cargo test --locked --all-targets --all-features
+      - run: cargo test --locked --release --test sqlite_workload -- --ignored --nocapture
       - run: cargo build --locked --release
