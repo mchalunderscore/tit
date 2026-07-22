@@ -183,7 +183,7 @@ Add squash and rebase subsequently only if their attribution and audit semantics
 are clear.
 
 Metadata mutations append their domain event in the same database transaction.
-Git mutations use the durable intent protocol because refs and `native_db`
+Git mutations use the durable intent protocol because Git refs and SQLite
 cannot share a transaction. Feeds, audit history, notifications, and subsequent
 webhooks derive from completed events rather than each feature inventing a
 second history.
@@ -212,70 +212,69 @@ bounded retries, and per-repository scopes.
 
 ## Storage
 
-Application metadata belongs in one `native_db` database. Source code belongs
-in bare Git repositories. Do not store issues and reviews as Git refs or
-commits. Their transactions, indexes, permissions, and stable IDs belong to the
-CDE.
+Application metadata belongs in one SQLite database. `tit` accesses it through
+`rusqlite`. Source code belongs in bare Git repositories. Do not store issues
+and reviews as Git refs or commits. Their transactions, indexes, permissions,
+and stable IDs belong to the CDE.
 
 Application-level IDs must not expose reusable storage keys. Public objects
 receive stable, non-reassignable identifiers. Relations such as issue comments,
-repository collaborators, and pull-request reviews use explicit IDs and
-secondary indexes. Because the database does not enforce foreign keys or joins,
-the storage layer must validate references and do related mutations in one
-write transaction. Orphan and index-consistency checks belong in `tit doctor`.
+repository collaborators, and pull-request reviews use explicit IDs. SQLite
+foreign keys enforce record relationships.
+
+`UNIQUE`, `CHECK`, and `NOT NULL` constraints enforce applicable record rules.
+Related mutations use one write transaction. `tit` enables foreign keys on
+every database connection.
 
 Metadata search starts with bounded scans or explicit, derived term-index
 records. If that stops being adequate, add an embedded full-text index that can
-be rebuilt entirely from canonical `native_db` records. Source search remains an
+be rebuilt entirely from canonical SQLite tables. Source search remains an
 isolated bounded traversal of Git objects. Treat a subsequent index as
 derivable state.
 
 ### Rust persistence layer
 
-Use **`native_db` with `redb`** for the first implementation. Each CDE record
-is a versioned Rust type with specified primary and secondary indexes. Rust
-conversions define the model upgrades. Database transactions, models, and
-generated key types must stay behind repository-specific application
-interfaces rather than leaking into HTTP, SSH, feed, or Git protocol handlers.
+Use **`rusqlite` with bundled SQLite**. Enable only the necessary `bundled` and
+`backup` crate features. This choice gives each supported operating system the
+same SQLite version without a runtime shared-library dependency.
 
-This choice accepts a new API and ecosystem to get a pure-Rust, SQL-free
-persistence model. Pin the exact crate versions for each `tit` release. Treat
-the database file format as private. Do not support copies of a database file
-between arbitrary `tit` versions. Before the data model expands, the first
-feasibility spike must prove these properties:
+Do not add an ORM, query builder, connection pool, or migration framework at
+this time. Keep SQL, row conversion, transactions, and connection setup inside
+the `store` module. Use prepared statements and explicit column lists. Return
+domain types from the module instead of database rows or `rusqlite` types.
+
+Use WAL mode, `synchronous=FULL`, a bounded busy timeout, and foreign-key
+enforcement. Apply these settings to each connection and verify their effective
+values. The first feasibility spike must prove these properties:
 
 - crash recovery.
 - concurrent reads and writes.
-- snapshots.
-- model upgrades across historical schemas.
-- index consistency.
+- online backup and restore.
+- transactional migrations across historical schemas.
+- constraint and index consistency.
 - restoration into the next application version.
 
 Alternatives considered:
 
-- **Diesel** supplies compile-time query checks and SQLite support,
-  but its type-heavy query DSL and synchronous SQLite path add friction to a
-  small async server. Reconsider it if compile-time SQL correctness becomes
-  more valuable than concise persistence code.
-- **rusqlite** is a small and mature SQLite driver. It is not an ORM. If `tit`
-  uses it, SQL is necessary for almost all database operations.
-- **SQLx** has query checks and good async integration. Developers must write
-  SQL directly. Thus, it does not satisfy the primary database
-  requirement.
-- **redb directly** supplies a stable pure-Rust transactional key-value store.
-  In this design, `tit` must implement model serialization, secondary indexes,
-  and schema changes. `native_db` already supplies these functions.
-- **Turso's in-process Rust database** aims for SQLite compatibility without C,
-  but it is currently beta. At this time, it documents important compatibility gaps.
-  Revisit it once its production and file-format guarantees match SQLite's.
+- **`native_db` with `redb`** avoids SQL, but it adds a young abstraction and a
+  private data format. It also makes relationship checks and external inspection
+  application responsibilities.
+- **Diesel** supplies compile-time query checks, but its query DSL and generated
+  types add a second persistence model.
+- **SQLx** supplies asynchronous integration and query checks, but SQLite is
+  synchronous and the application must still own its SQL and migrations.
+- **System SQLite** decreases binary size, but behavior and enabled features can
+  differ between supported operating systems. Bundled SQLite prevents this drift.
 
-Model upgrades run automatically on startup only after taking an application
-lock and making a recoverable pre-upgrade snapshot. Destructive or long
-upgrades must instead be explicit `tit admin migrate` operations with a
-dry-run or status view. Each stable release keeps the historical model
-definitions and conversions that it needs. These items must support an upgrade
-from the oldest supported release. An unsupported gap stops the upgrade and
-gives a clear diagnostic.
+Schema migrations are numbered SQL files embedded in the executable. Apply all
+pending migrations in one `BEGIN EXCLUSIVE` transaction. Update
+`PRAGMA user_version` in that transaction. Keep historical migration files
+unchanged. An unsupported migration gap stops startup and gives a clear
+diagnostic.
+
+Before an automatic migration, use the SQLite online backup API to create a
+recoverable copy. Destructive or long migrations are explicit
+`tit admin migrate` operations with a status view and a dry-run where possible.
 
 ## Packaging and operation
 
@@ -295,7 +294,7 @@ tit doctor
 
 Administrative commands that must mutate a running instance, such as
 `tit invite-code`, use an owner-only Unix control socket beneath `/srv/tit`.
-They never open the live `native_db` database from a second process.
+They never open the live SQLite database from a second process.
 An offline command must first acquire the exclusive instance lock. If
 `tit serve` owns that lock, the command uses the control socket. If this is not
 possible, the command stops and gives a clear instruction.
@@ -307,11 +306,11 @@ The system configuration path is `/srv/tit/config.toml`, alongside all other
 instance data. Command-line overrides and environment variables for secrets are
 supported, and precedence must be deterministic.
 
-`backup` briefly establishes a consistent boundary. It creates a `native_db` hot
-snapshot. It copies or bundles all repositories and necessary configuration
+`backup` briefly establishes a consistent boundary. It uses the SQLite online
+backup API. It copies or bundles all repositories and necessary configuration
 into an archive with a specified format. `restore` verifies archive format, database
 compatibility, and repository integrity before replacing live state. `doctor`
-does checks of database records and indexes, model versions, repository object
+does checks of database records and indexes, schema versions, repository object
 integrity, filesystem permissions, key configuration, and listener readiness.
 
 The application produces structured logs without external infrastructure. It
@@ -331,7 +330,7 @@ Work proceeds through milestone gates. Do not start a milestone before the
 preceding gate passes. If a feasibility gate fails, change the design before
 you continue the feature work.
 
-**Current milestone:** Milestone 1A — `native_db` durability.
+**Current milestone:** Milestone 1A — SQLite durability.
 Update this marker only after the current milestone gate passes.
 
 ### Architecture
@@ -345,7 +344,7 @@ src/
   cli.rs              command-line contract
   config.rs           configuration loading and validation
   domain/             IDs, entities, invariants, and domain operations
-  store/              native_db models, indexes, upgrades, and repositories
+  store/              SQLite schema, queries, migrations, and repositories
   git/                object access, refs, wire protocol, and quarantine
   auth/               SSH keys, SSHSIG challenges, sessions, and recovery
   http/               routes, handlers, templates, and response policy
@@ -360,11 +359,11 @@ tests/                 black-box and protocol integration tests
 ```
 
 HTTP handlers, SSH handlers, and CLI commands call application services. They
-must not open `native_db`, manipulate repository paths, or update refs directly.
+must not open SQLite, manipulate repository paths, or update refs directly.
 The `store` and `git` modules expose narrow interfaces so neither their concrete
 crates nor generated types become part of the rest of the application.
 
-`native_db` is synchronous. Thus, storage operations run as bounded blocking
+`rusqlite` is synchronous. Thus, storage operations run as bounded blocking
 jobs. A database transaction cannot stay active across an `.await`.
 Begin with `tokio::task::spawn_blocking` behind a semaphore. Replace it with a
 dedicated storage executor only if measurements show scheduling overhead or
@@ -372,8 +371,8 @@ write starvation.
 
 #### Cross-store mutations
 
-Git refs and `native_db` cannot participate in one atomic transaction. Each
-operation that changes Git refs and `native_db` uses a durable intent record:
+Git refs and SQLite cannot participate in one atomic transaction. Each
+operation that changes Git refs and SQLite uses a durable intent record:
 
 1. Validate authorization and write an operation intent containing repository,
    initial refs, proposed refs, actor, and event payload.
@@ -393,7 +392,7 @@ not make refs reachable.
 
 ### Technical choices to prove, not assume
 
-Tentative dependencies are Tokio, Axum, `native_db`, `ssh-key`, Russh, Askama,
+Tentative dependencies are Tokio, Axum, `rusqlite`, `ssh-key`, Russh, Askama,
 `pulldown-cmark`, an HTML sanitizer, and selected `gix-*` crates. Pin the exact
 version in `Cargo.lock` when you add a dependency.
 
@@ -415,11 +414,11 @@ is ready for production.
 
 ### Core data model
 
-All persistent records carry a model version, creation time, and stable typed
-ID. Use random, non-reassignable IDs internally and per-repository monotonically
-increasing issue and pull-request numbers for human-facing URLs. Normalize
-usernames and repository slugs once at the domain boundary. Store the canonical
-form and display form where necessary.
+All persistent records carry a creation time and stable typed ID. Serialized
+event payloads also carry a version. Use random, non-reassignable IDs internally.
+Use per-repository increasing issue and pull-request numbers for human-facing
+URLs. Normalize usernames and repository slugs once at the domain boundary.
+Store the canonical form and display form where necessary.
 
 Initial record families are:
 
@@ -451,16 +450,18 @@ Secondary indexes cover child records, open items, events, active sessions, and
 incomplete operation intents. Invite-code hashes are unique and indexed. The
 store does not keep the clear text.
 
-The store layer enforces relationships because `native_db` has no foreign keys.
-Initially, do not delete an account or repository. Suspend an account. Archive
-a repository. Do not reassign comments, events, usernames, or public numbers.
+SQLite foreign keys use restrictive delete actions unless the schema specifies
+a different action. Initially, do not delete an account or repository. Suspend
+an account. Archive a repository. Do not reassign comments, events, usernames,
+or public numbers.
 
-`tit doctor` scans each relation and rebuildable index. It reports the exact
-record IDs in each inconsistency.
+`tit doctor` runs `PRAGMA integrity_check` and `PRAGMA foreign_key_check`. It
+also checks domain invariants that SQL constraints cannot express. It reports
+the exact record IDs in each inconsistency.
 
-Model upgrades live beside all historical models necessary for the supported
-upgrade window. Each release fixture includes a database created by the prior
-stable version, and CI restores and upgrades it before running integrity checks.
+Schema migrations stay in source control. Each release fixture includes a
+database created by the prior stable version. CI restores and migrates it before
+running integrity checks.
 
 ### Milestones
 
@@ -512,23 +513,28 @@ passes the ASD-STE100 review.
 
 Goal: remove the risks that can make the single-binary design invalid.
 
-##### M1A — native_db durability
+##### M1A — SQLite durability
 
-- Define two small versioned fixture models with unique and non-unique indexes.
-- Prove insert, update, delete, indexed range scan, concurrent reads, serialized
-  writes, rollback, hot snapshot, restore, and compaction behavior.
-- Generate fixtures for earlier database versions with committed fixture programs. Then,
-  upgrade through a minimum of two schema versions with conversion checks.
-- Kill a child process during representative writes and upgrades. Open the
+- Add `rusqlite` with only the `bundled` and `backup` features.
+- Define two small fixture tables with primary keys, foreign keys, constraints,
+  and unique and non-unique indexes.
+- Prove insert, update, delete, indexed range scans, concurrent reads,
+  serialized writes, busy handling, rollback, WAL checkpoint, and vacuum behavior.
+- Prove online backup and restore while reads and writes continue.
+- Generate earlier database fixtures with committed fixture programs. Migrate
+  through a minimum of two schema versions with transactional SQL migrations.
+- Kill a child process during representative writes and migrations. Open the
   database again. Make sure that it has the initial or new full state.
-- Verify exclusive-open, file-locking, `fsync`, atomic rename, snapshot, and
-  recovery behavior separately on each supported filesystem and operating
-  system. Do not infer BSD behavior from Linux or macOS results.
+- Verify locking, `synchronous=FULL`, WAL recovery, and backup behavior on each
+  supported filesystem and operating system. Do not infer BSD behavior from
+  Linux or macOS results.
+- Require a local filesystem unless a platform gate proves a different
+  filesystem has correct WAL locking and shared-memory behavior.
 - Use a workload of 10,000 issues and 1,000,000 events. Measure database growth,
-  snapshot time, and request latency.
+  backup time, migration time, and request latency.
 
-Gate: restore and each supported upgrade fixture pass `doctor`. No handler
-needs direct access to a `native_db` type.
+Gate: restored and migrated fixtures pass SQLite integrity checks and `doctor`.
+No handler needs direct access to a `rusqlite` type or SQL statement.
 
 ##### M1B — SSH identity
 
@@ -738,18 +744,18 @@ Goal: make failure recovery as deliberate as normal operation.
   writer.
 - **M6.2 Backup and restore.** First, give an offline backup procedure. Then
   add online backup. Take the global write and maintenance gate. Make a
-  `native_db` snapshot. Pause ref mutations and repacking while you copy the
+  SQLite online backup. Pause ref mutations and repacking while you copy the
   repositories. Copy the configuration, keys, and secrets into a checksummed
   manifest.
   Create archives with owner-only permissions and state plainly that they
   contain credentials. Restore always targets an empty instance directory
   before an explicit activation step.
-- **M6.3 Doctor.** Do checks of configuration, permissions, model versions,
+- **M6.3 Doctor.** Do checks of configuration, permissions, schema versions,
   record relations, indexes, and incomplete intents. Do checks of Git refs, reachable objects,
   quarantine debris, host keys, and backup manifests. Repair is a different,
   explicit command and never the default behavior. Add typed read-only inspect
   commands. Add a deterministic JSON Lines dump. These tools let operators
-  examine `native_db` records without its private file format.
+  examine SQLite records without application-specific decoding.
 - **M6.4 Limits and abuse resistance.** Enforce request sizes, timeouts,
   concurrency, and login and SSH attempt rates. Enforce pack, diff, archive, and
   Markdown limits. Use safe defaults for slow clients.
@@ -816,7 +822,7 @@ accept them mechanically.
 The first implementation cycle must complete only these tasks:
 
 1. M0.1 through M0.6.
-2. M1A. It gives the first `native_db` decision record and fixtures.
+2. M1A. It gives the first SQLite decision record and fixtures.
 3. M1B. It gives real OpenSSH and SSHSIG interoperability tests.
 4. M1C before any HTML repository browser is built.
 5. M1D before account, issue, or pull-request work begins.

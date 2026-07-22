@@ -72,6 +72,8 @@ Use the technical nouns in this list:
   code, command, configuration, database, executable, feed, and file.
 - framework, instance, interface, key, log, module, package, repository,
   role, route, server, session, token, username, Web UI, and workflow.
+- connection, constraint, index, parameter, query, query plan, row, schema,
+  statement, and table.
 - behavior, boundary, build, compatibility, content, crate, dependency,
   environment, feature, host, identity, implementation, and invariant.
 - license, metadata, milestone, model, owner, permission, platform, portability,
@@ -83,7 +85,7 @@ Use the technical nouns in this list:
   encoding, federation, filesystem, frontend, installation, link, organization,
   product, redirect, registry, requirement, secret, setting, and view.
 - API, CDE, CLI, CSS, DNS, HTML, HTTP, HTTPS, JavaScript, JSON, Markdown, RSS,
-  SSH, TOML, URL, and the names of operating systems.
+  SQL, SSH, TOML, URL, WAL, and the names of operating systems.
 - branch, clone, commit, diff, fetch, Git object, issue, merge, pack, pull
   request, push, ref, tag, and tree.
 - Cargo, Git, OpenSSH, Rust, SQLite, and the exact names of crates, commands,
@@ -100,6 +102,8 @@ Use the technical nouns in this list:
 - dependency audit, external test driver, fixture repository, loopback address,
   quality gate, Rust toolchain, standard error, and standard output.
 - advertised hostname, hostname, onion hostname, and proxy command.
+- database constraint, foreign key, online backup, prepared statement, and
+  schema migration.
 
 Use the technical verbs in this list:
 
@@ -109,7 +113,7 @@ Use the technical verbs in this list:
   validate.
 - build, conform, create, discuss, implement, own, pass, preserve, rewrite,
   spawn, and store.
-- blame, download, publish, search, and watch.
+- bind, blame, download, publish, query, search, and watch.
 
 Regular plural forms of the technical nouns are permitted. Use the technical
 verbs only in the forms that STE permits. A compound technical noun must use
@@ -147,6 +151,18 @@ to this section before you use a new project-specific term in documentation.
   invariants with explanatory messages.
 - Do not write unsafe Rust or custom cryptographic primitives without an
   explicit plan amendment and review.
+
+## SQL
+
+- Keep all SQL inside the `store` module. Return domain types instead of rows or
+  `rusqlite` types.
+- Bind all values as parameters. Do not construct SQL from user input.
+- Use explicit column lists. Add a constraint or index only for a specified
+  invariant or access pattern.
+- Keep each committed schema migration unchanged. Test each supported migration
+  path with a committed database fixture.
+- Enable and verify foreign keys on every connection. Use SQLite integrity and
+  foreign-key checks in tests and `tit doctor`.
 
 ## Dependencies
 
