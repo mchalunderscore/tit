@@ -12,9 +12,14 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
+rand = "0.10"
 rusqlite = { version = "0.40", default-features = false, features = ["backup", "bundled"] }
+russh = { version = "0.62", default-features = false, features = ["ring"] }
 serde = { version = "1.0", features = ["derive"] }
+sha2 = { version = "0.11", default-features = false }
+ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["ed25519", "p256", "std"] }
 thiserror = "2.0"
+tokio = { version = "1.53", default-features = false, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 toml = { version = "1.1", default-features = false, features = ["parse", "serde", "std"] }
 url = { version = "2.5", features = ["serde"] }
 

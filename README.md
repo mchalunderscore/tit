@@ -38,6 +38,20 @@ records and 1,000,000 event records. Read the SQLite
 [architectural decision record](docs/adr/0001-sqlite-storage.md) for the limits
 and current platform evidence.
 
+## Milestone 1B gate
+
+Install stock OpenSSH. Then, run the SSH identity gate:
+
+```text
+./scripts/check-m1b
+```
+
+This command uses stock `ssh`, `ssh-agent`, `ssh-add`, and `ssh-keygen` to do
+tests of public-key authentication, SSH request restrictions, and SSHSIG login
+challenges. Read the SSH identity
+[architectural decision record](docs/adr/0002-ssh-identity.md) for the supported
+algorithms, limits, and current platform evidence.
+
 ## Database check
 
 An initialized instance keeps its metadata in `tit.sqlite3`. Check an existing

@@ -1,5 +1,9 @@
+#[allow(dead_code, reason = "M1B proves SSH identity before M2 calls it")]
+mod auth;
 mod cli;
 mod config;
+#[allow(dead_code, reason = "M1B proves the SSH server before M2 calls it")]
+mod ssh;
 mod store;
 
 use std::process::ExitCode;
