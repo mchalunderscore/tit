@@ -1,7 +1,7 @@
 # tit
 
 `tit` is a small, self-hosted collaborative development environment (CDE) for
-Git. The project is in Milestone 1B and does not serve repositories at this time.
+Git. The project is in Milestone 1C and does not serve repositories at this time.
 
 Read [PLAN.md](PLAN.md) for the product design and implementation gates. Read
 [CONTRIBUTING.md](CONTRIBUTING.md) before you change code.

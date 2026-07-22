@@ -1,6 +1,6 @@
 # Architectural decision record 0002: SSH identity
 
-Status: Provisional
+Status: Accepted
 
 Date: 2026-07-22
 
@@ -86,8 +86,12 @@ namespace, key, malformed input, DSA, ECDSA P-384, RSA, RSA-SHA1, an unknown
 key, shells, PTYs, subsystems, agents, forwarding, arbitrary exec requests, and
 environment values.
 
-This decision stays provisional until the Linux and macOS hosted M1B gates
-pass.
+GitHub Actions run
+[29965784237](https://github.com/mchalunderscore/tit/actions/runs/29965784237)
+passed all quality checks and both hosted M1B gates. The Ubuntu 24.04.4 runner
+and the macOS 26.4 arm64 runner used Rust 1.96.0. Each release job passed all
+seven authentication tests and all four SSH server tests in debug and release
+modes. The SSH tests used the stock OpenSSH client and tools on each runner.
 
 ## Consequences
 
