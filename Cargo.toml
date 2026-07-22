@@ -1,0 +1,29 @@
+[package]
+name = "tit-cde"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+description = "A small self-hosted collaborative development environment"
+
+[[bin]]
+name = "tit"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+toml = { version = "1.1", default-features = false, features = ["parse", "serde", "std"] }
+url = { version = "2.5", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
