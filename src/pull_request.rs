@@ -9,10 +9,13 @@ use thiserror::Error;
 
 use crate::auth::{AuthError, validate_username};
 use crate::domain::repository::{RepositoryNameError, validate_slug};
+use crate::git::read::{
+    Comparison, ReadCancellation, ReadError, ReadLimits, RepositoryReadService,
+};
 use crate::git::repository::{GitRepository, GitRepositoryError};
 use crate::store::{
     NewPullRequestRefIntent, PullRequestDetail, PullRequestRecord, PullRequestRefIntentRecord,
-    Store, StoreError,
+    PullRequestRevisionRecord, Store, StoreError,
 };
 
 pub(crate) const MAX_TITLE_BYTES: usize = 200;
@@ -23,6 +26,12 @@ pub(crate) struct PullRequestService {
     database: PathBuf,
     repositories: PathBuf,
     operations: Arc<Mutex<()>>,
+}
+
+pub(crate) struct PullRequestComparison {
+    pub(crate) detail: PullRequestDetail,
+    pub(crate) revision: PullRequestRevisionRecord,
+    pub(crate) comparison: Comparison,
 }
 
 impl PullRequestService {
@@ -153,6 +162,10 @@ impl PullRequestService {
             .pull_request)
     }
 
+    #[allow(
+        dead_code,
+        reason = "integration tests and later non-Web callers read pull requests without comparison"
+    )]
     pub(crate) fn get(
         &self,
         owner: &str,
@@ -176,6 +189,51 @@ impl PullRequestService {
         Store::open(&self.database)?
             .pull_request(owner, repository, number, actor)
             .map_err(Into::into)
+    }
+
+    pub(crate) fn compare(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        revision: Option<i64>,
+        actor: Option<&str>,
+    ) -> Result<PullRequestComparison, PullRequestError> {
+        validate_username(owner)?;
+        validate_slug(repository)?;
+        if let Some(actor) = actor {
+            validate_username(actor)?;
+        }
+        if number < 1 || revision.is_some_and(|number| number < 1) {
+            return Err(PullRequestError::Number);
+        }
+        let _operation = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.recover_inner()?;
+        let detail = Store::open(&self.database)?.pull_request(owner, repository, number, actor)?;
+        let revision = match revision {
+            Some(number) => detail
+                .revisions
+                .iter()
+                .find(|revision| revision.number == number),
+            None => detail.revisions.last(),
+        }
+        .cloned()
+        .ok_or(PullRequestError::Revision)?;
+        let path = self.repository_path(&detail.repository.id)?;
+        let reader = RepositoryReadService::open(&path, ReadLimits::default())?;
+        let comparison = reader.comparison(
+            parse_id(&revision.base_object_id)?,
+            parse_id(&revision.head_object_id)?,
+            &ReadCancellation::default(),
+        )?;
+        Ok(PullRequestComparison {
+            detail,
+            revision,
+            comparison,
+        })
     }
 
     #[allow(
@@ -365,6 +423,8 @@ pub(crate) enum PullRequestError {
     Branch,
     #[error("pull-request number is not valid")]
     Number,
+    #[error("pull-request revision does not exist")]
+    Revision,
     #[error("pull-request refs have not changed")]
     Unchanged,
     #[error("stored pull-request object ID is not valid")]
@@ -375,6 +435,8 @@ pub(crate) enum PullRequestError {
     RepositoryPath,
     #[error("cannot access a pull-request repository: {0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Read(#[from] ReadError),
     #[error("cannot create a random pull-request ID")]
     Random,
     #[error("the system clock is before the Unix epoch")]

@@ -390,3 +390,17 @@ immutable revision object IDs, concurrent opens, intent recovery before and
 after a ref change, the Web forms, and historical schema migration. Read the
 [pull-request ref architectural decision record](docs/adr/0022-pull-request-refs.md)
 for the record, ref, permission, and recovery contracts.
+
+## Milestone 5.2 gate
+
+Run the pull-request comparison gate:
+
+```text
+./scripts/check-m5-2
+```
+
+This command tests SHA-1 and SHA-256 merge bases, commit ranges, changed paths,
+diffs, immutable revision selection, mergeability states, unrelated histories,
+work limits, and Web output. Read the
+[pull-request comparison architectural decision record](docs/adr/0023-pull-request-comparison.md)
+for the computation, limit, and cache contracts.

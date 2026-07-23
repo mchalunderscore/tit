@@ -781,6 +781,16 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
             .text()
             .contains("git fetch origin refs/pull/1/head")
     );
+    assert!(
+        pull_request_page
+            .text()
+            .contains("Comparison for revision 1")
+    );
+    assert!(
+        pull_request_page
+            .text()
+            .contains("Mergeability: already merged")
+    );
     let worktree = fixture.instance.path().join("worktree");
     run(Command::new("git")
         .arg("-C")
@@ -818,6 +828,26 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
             .count(),
         2
     );
+    assert!(
+        revised_pull_request_page
+            .text()
+            .contains("Comparison for revision 2")
+    );
+    assert!(
+        revised_pull_request_page
+            .text()
+            .contains("pull-request.txt")
+    );
+    let first_revision = request(
+        server.address(),
+        "GET",
+        "/alice/example/pulls/1?revision=1",
+        &[],
+        &[],
+    );
+    assert_eq!(first_revision.status, 200);
+    assert!(first_revision.text().contains("Comparison for revision 1"));
+    assert!(!first_revision.text().contains("pull-request.txt"));
     let search_page = request(server.address(), "GET", "/search", &[], &[]);
     assert_eq!(search_page.status, 200);
     assert!(

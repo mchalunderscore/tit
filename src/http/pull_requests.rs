@@ -1,7 +1,7 @@
 use askama::Template;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Extension, Path, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -84,6 +84,7 @@ async fn pull_request_detail(
     Extension(request_id): Extension<RequestId>,
     Extension(actor): Extension<RequestActor>,
     Path(path): Path<PullRequestPath>,
+    Query(query): Query<RevisionQuery>,
     headers: HeaderMap,
 ) -> Response {
     let Some(service) = state.pull_requests.clone() else {
@@ -92,12 +93,19 @@ async fn pull_request_detail(
     let owner = path.owner.clone();
     let repository = path.repository.clone();
     let result = job(state, move || {
-        service.get(&owner, &repository, path.number, actor.0.as_deref())
+        service.compare(
+            &owner,
+            &repository,
+            path.number,
+            query.revision,
+            actor.0.as_deref(),
+        )
     })
     .await;
     match result {
-        Ok(detail) => {
+        Ok(result) => {
             let csrf = cookie(&headers, CSRF_COOKIE).unwrap_or_default();
+            let detail = &result.detail;
             let pull_request = &detail.pull_request;
             render(
                 StatusCode::OK,
@@ -108,6 +116,8 @@ async fn pull_request_detail(
                     pull_request,
                     body_html: markdown::render(&pull_request.body),
                     revisions: &detail.revisions,
+                    selected_revision: result.revision.number,
+                    comparison: ComparisonView::from(&result.comparison),
                     csrf: &csrf,
                     can_revise: detail.can_revise && !csrf.is_empty(),
                 },
@@ -220,6 +230,7 @@ fn read_error(error: PullRequestError, request_id: &str) -> Response {
             "The pull request was not found.",
         ),
         PullRequestError::Number
+        | PullRequestError::Revision
         | PullRequestError::Auth(_)
         | PullRequestError::RepositoryName(_) => bad_request(request_id),
         _ => internal(request_id),
@@ -294,6 +305,11 @@ struct PullRequestPath {
     number: i64,
 }
 
+#[derive(Clone, Default, Deserialize)]
+struct RevisionQuery {
+    revision: Option<i64>,
+}
+
 #[derive(Template)]
 #[template(path = "pull_requests.html")]
 struct PullRequestListTemplate<'a> {
@@ -322,6 +338,68 @@ struct PullRequestTemplate<'a> {
     pull_request: &'a crate::store::PullRequestRecord,
     body_html: RenderedMarkdown,
     revisions: &'a [crate::store::PullRequestRevisionRecord],
+    selected_revision: i64,
+    comparison: ComparisonView,
     csrf: &'a str,
     can_revise: bool,
+}
+
+struct ComparisonView {
+    merge_base: String,
+    mergeability: &'static str,
+    commits: Vec<CommitView>,
+    changed_paths: Vec<String>,
+    files: Vec<DiffView>,
+}
+
+struct CommitView {
+    id: String,
+    message: String,
+}
+
+struct DiffView {
+    path: String,
+    binary: bool,
+    hunks: String,
+}
+
+impl From<&crate::git::read::Comparison> for ComparisonView {
+    fn from(comparison: &crate::git::read::Comparison) -> Self {
+        use crate::git::read::Mergeability;
+
+        Self {
+            merge_base: comparison
+                .merge_base
+                .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+            mergeability: match comparison.mergeability {
+                Mergeability::Unrelated => "unrelated histories",
+                Mergeability::AlreadyMerged => "already merged",
+                Mergeability::FastForward => "fast-forward",
+                Mergeability::Clean => "clean merge",
+                Mergeability::Conflicting => "conflicts",
+            },
+            commits: comparison
+                .commits
+                .iter()
+                .map(|commit| CommitView {
+                    id: commit.id.to_string(),
+                    message: String::from_utf8_lossy(&commit.message).into_owned(),
+                })
+                .collect(),
+            changed_paths: comparison
+                .changed_paths
+                .iter()
+                .map(|path| String::from_utf8_lossy(path).into_owned())
+                .collect(),
+            files: comparison
+                .files
+                .iter()
+                .map(|file| DiffView {
+                    path: String::from_utf8_lossy(&file.path).into_owned(),
+                    binary: file.binary,
+                    hunks: String::from_utf8_lossy(&file.hunks).into_owned(),
+                })
+                .collect(),
+        }
+    }
 }

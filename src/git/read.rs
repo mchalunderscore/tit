@@ -122,6 +122,24 @@ pub(crate) struct DiffFile {
     pub(crate) hunks: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Mergeability {
+    Unrelated,
+    AlreadyMerged,
+    FastForward,
+    Clean,
+    Conflicting,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Comparison {
+    pub(crate) merge_base: Option<ObjectId>,
+    pub(crate) commits: Vec<CommitInfo>,
+    pub(crate) changed_paths: Vec<Vec<u8>>,
+    pub(crate) files: Vec<DiffFile>,
+    pub(crate) mergeability: Mergeability,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BlameHunk {
     pub(crate) start_line: u32,
@@ -163,7 +181,10 @@ impl RepositoryReadService {
             return Err(ReadError::NotBare(path.to_owned()));
         }
         validate_limits(&limits)?;
-        Ok(Self { repository, limits })
+        Ok(Self {
+            repository: repository.with_object_memory(),
+            limits,
+        })
     }
 
     pub(crate) fn references(
@@ -347,10 +368,113 @@ impl RepositoryReadService {
         cancellation: &ReadCancellation,
     ) -> Result<Vec<DiffFile>, ReadError> {
         let budget = self.budget(cancellation);
-        let old = self.read_commit(old_commit, &budget)?;
-        let new = self.read_commit(new_commit, &budget)?;
-        let old_files = self.flatten_tree(old.tree, &budget)?;
-        let new_files = self.flatten_tree(new.tree, &budget)?;
+        self.diff_with_budget(old_commit, new_commit, &budget)
+    }
+
+    pub(crate) fn comparison(
+        &self,
+        base_commit: ObjectId,
+        head_commit: ObjectId,
+        cancellation: &ReadCancellation,
+    ) -> Result<Comparison, ReadError> {
+        let budget = self.budget(cancellation);
+        let base_history = self.history_with_budget(base_commit, &budget)?;
+        let head_history = self.history_with_budget(head_commit, &budget)?;
+        if base_history.len().saturating_add(head_history.len()) > self.limits.max_history_commits {
+            return Err(ReadError::Limit("comparison commits"));
+        }
+        let base_ids: HashSet<_> = base_history.iter().map(|commit| commit.id).collect();
+        let head_ids: HashSet<_> = head_history.iter().map(|commit| commit.id).collect();
+        let head_tree = head_history
+            .first()
+            .ok_or(ReadError::ObjectNotFound(head_commit))?
+            .tree;
+        budget.check()?;
+        let merge_base = match self.repository.merge_base(base_commit, head_commit) {
+            Ok(id) => Some(id.detach()),
+            Err(gix::repository::merge_base::Error::NotFound { .. }) => None,
+            Err(error) => return Err(ReadError::Git(error.to_string())),
+        };
+        let mut commit_bytes = 0_usize;
+        let mut commits = Vec::new();
+        for commit in head_history
+            .into_iter()
+            .filter(|commit| !base_ids.contains(&commit.id))
+        {
+            budget.check()?;
+            commit_bytes = checked_add(
+                commit_bytes,
+                commit.message.len(),
+                self.limits.max_diff_bytes,
+                "comparison output bytes",
+            )?;
+            commits.push(commit);
+        }
+        let files = match merge_base {
+            Some(merge_base) => self.diff_with_budget(merge_base, head_commit, &budget)?,
+            None => self.diff_trees_with_budget(
+                ObjectId::empty_tree(self.repository.object_hash()),
+                head_tree,
+                &budget,
+            )?,
+        };
+        let changed_paths = files.iter().map(|file| file.path.clone()).collect();
+        let mergeability = match merge_base {
+            None => Mergeability::Unrelated,
+            Some(_) if base_ids.contains(&head_commit) => Mergeability::AlreadyMerged,
+            Some(_) if head_ids.contains(&base_commit) => Mergeability::FastForward,
+            Some(merge_base) => {
+                budget.check()?;
+                self.diff_with_budget(merge_base, base_commit, &budget)?;
+                let options = self
+                    .repository
+                    .tree_merge_options()
+                    .map_err(|error| ReadError::Git(error.to_string()))?
+                    .with_rewrites(Some(Default::default()))
+                    .with_fail_on_conflict(Some(Default::default()));
+                let outcome = self
+                    .repository
+                    .merge_commits(base_commit, head_commit, Default::default(), options.into())
+                    .map_err(|error| ReadError::Git(error.to_string()))?;
+                if outcome
+                    .tree_merge
+                    .has_unresolved_conflicts(Default::default())
+                {
+                    Mergeability::Conflicting
+                } else {
+                    Mergeability::Clean
+                }
+            }
+        };
+        budget.check()?;
+        Ok(Comparison {
+            merge_base,
+            commits,
+            changed_paths,
+            files,
+            mergeability,
+        })
+    }
+
+    fn diff_with_budget(
+        &self,
+        old_commit: ObjectId,
+        new_commit: ObjectId,
+        budget: &ReadBudget<'_>,
+    ) -> Result<Vec<DiffFile>, ReadError> {
+        let old = self.read_commit(old_commit, budget)?;
+        let new = self.read_commit(new_commit, budget)?;
+        self.diff_trees_with_budget(old.tree, new.tree, budget)
+    }
+
+    fn diff_trees_with_budget(
+        &self,
+        old_tree: ObjectId,
+        new_tree: ObjectId,
+        budget: &ReadBudget<'_>,
+    ) -> Result<Vec<DiffFile>, ReadError> {
+        let old_files = self.flatten_tree(old_tree, budget)?;
+        let new_files = self.flatten_tree(new_tree, budget)?;
         let paths: BTreeMap<&[u8], ()> = old_files
             .keys()
             .chain(new_files.keys())
@@ -365,8 +489,8 @@ impl RepositoryReadService {
             if old == new {
                 continue;
             }
-            let old_data = self.diff_blob(old, &budget)?;
-            let new_data = self.diff_blob(new, &budget)?;
+            let old_data = self.diff_blob(old, budget)?;
+            let new_data = self.diff_blob(new, budget)?;
             bytes = checked_add(
                 bytes,
                 old_data.len(),

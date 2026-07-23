@@ -28,8 +28,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
+use git::read::{Mergeability, ReadCancellation, ReadError, ReadLimits, RepositoryReadService};
 use git::repository::GitRepository;
+use gix::hash::ObjectId;
 use pull_request::{PullRequestError, PullRequestService};
 use rusqlite::params;
 use store::{NewPullRequestRefIntent, Store, StoreError};
@@ -53,6 +56,18 @@ fn creates_revises_and_recovers_numbered_pull_request_refs_for_both_hashes() {
             .expect("open a pull request");
         assert_eq!(opened.number, 1);
         assert_eq!(fixture.pull_ref(1), opened.head_object_id);
+        let comparison = service
+            .compare("alice", "project", 1, None, None)
+            .expect("compare the first revision");
+        assert_eq!(comparison.detail.pull_request.number, 1);
+        assert_eq!(comparison.revision.number, 1);
+        assert_eq!(
+            comparison.comparison.mergeability,
+            Mergeability::FastForward
+        );
+        assert_eq!(comparison.comparison.commits.len(), 1);
+        assert_eq!(comparison.comparison.changed_paths, [b"feature.txt"]);
+        assert_eq!(comparison.comparison.files.len(), 1);
         run(
             &fixture.worktree,
             Command::new("git")
@@ -95,6 +110,19 @@ fn creates_revises_and_recovers_numbered_pull_request_refs_for_both_hashes() {
         assert_eq!(second.revisions.len(), 2);
         assert_eq!(second.revisions[0].head_object_id, opened.head_object_id);
         assert_eq!(second.revisions[1].head_object_id, revised.head_object_id);
+        let original_comparison = service
+            .compare("alice", "project", 1, Some(1), Some("alice"))
+            .expect("compare the immutable first revision");
+        assert_eq!(
+            original_comparison.revision.head_object_id,
+            opened.head_object_id
+        );
+        assert_eq!(original_comparison.comparison.commits.len(), 1);
+        let current_comparison = service
+            .compare("alice", "project", 1, None, Some("alice"))
+            .expect("compare the current revision");
+        assert_eq!(current_comparison.revision.number, 2);
+        assert_eq!(current_comparison.comparison.commits.len(), 2);
 
         let git = GitRepository::open(&fixture.bare).expect("open the bare fixture");
         let base = git
@@ -220,6 +248,144 @@ fn creates_revises_and_recovers_numbered_pull_request_refs_for_both_hashes() {
     }
 }
 
+#[test]
+fn classifies_clean_conflicting_and_already_merged_revisions_for_both_hashes() {
+    for (index, object_format) in ["sha1", "sha256"].into_iter().enumerate() {
+        let fixture = Fixture::new(object_format, index + 10);
+        fixture.commit_on("main", "base.txt", "base side\n", "advance base");
+        fixture.commit_on(
+            "feature",
+            "feature-two.txt",
+            "feature side\n",
+            "advance feature",
+        );
+        let service = PullRequestService::new(&fixture.database, &fixture.repositories);
+        service
+            .open(
+                "alice",
+                "project",
+                "alice",
+                "Clean divergence",
+                "The branches change different paths.",
+                "refs/heads/main",
+                "refs/heads/feature",
+            )
+            .expect("open a clean divergent pull request");
+        let object_state = git_object_state(&fixture.bare);
+        let clean = service
+            .compare("alice", "project", 1, None, None)
+            .expect("compare clean divergence");
+        assert_eq!(clean.comparison.mergeability, Mergeability::Clean);
+        assert_eq!(clean.comparison.changed_paths.len(), 2);
+        assert_eq!(git_object_state(&fixture.bare), object_state);
+
+        fixture.commit_on("main", "README.md", "main content\n", "change base content");
+        fixture.commit_on(
+            "feature",
+            "README.md",
+            "feature content\n",
+            "change feature content",
+        );
+        service
+            .open(
+                "alice",
+                "project",
+                "alice",
+                "Conflicting divergence",
+                "The branches change the same line.",
+                "refs/heads/main",
+                "refs/heads/feature",
+            )
+            .expect("open a conflicting pull request");
+        let object_state = git_object_state(&fixture.bare);
+        let conflicting = service
+            .compare("alice", "project", 2, None, None)
+            .expect("compare conflicting divergence");
+        assert_eq!(
+            conflicting.comparison.mergeability,
+            Mergeability::Conflicting
+        );
+        assert_eq!(git_object_state(&fixture.bare), object_state);
+
+        fixture.merge_feature_into_main();
+        service
+            .open(
+                "alice",
+                "project",
+                "alice",
+                "Merged head",
+                "The head is already in the base.",
+                "refs/heads/main",
+                "refs/heads/feature",
+            )
+            .expect("open an already merged pull request");
+        let merged = service
+            .compare("alice", "project", 3, None, None)
+            .expect("compare an already merged head");
+        assert_eq!(merged.comparison.mergeability, Mergeability::AlreadyMerged);
+
+        fixture.create_unrelated_branch();
+        service
+            .open(
+                "alice",
+                "project",
+                "alice",
+                "Unrelated head",
+                "The branches do not have a common commit.",
+                "refs/heads/main",
+                "refs/heads/unrelated",
+            )
+            .expect("open an unrelated pull request");
+        let unrelated = service
+            .compare("alice", "project", 4, None, None)
+            .expect("compare unrelated histories");
+        assert_eq!(unrelated.comparison.mergeability, Mergeability::Unrelated);
+        assert_eq!(unrelated.comparison.merge_base, None);
+        assert_eq!(unrelated.comparison.changed_paths, [b"unrelated.txt"]);
+
+        let base = ObjectId::from_hex(merged.revision.base_object_id.as_bytes())
+            .expect("parse the base ID");
+        let head = ObjectId::from_hex(merged.revision.head_object_id.as_bytes())
+            .expect("parse the head ID");
+        let limits = ReadLimits {
+            max_history_commits: 1,
+            ..ReadLimits::default()
+        };
+        let reader = RepositoryReadService::open(&fixture.bare, limits)
+            .expect("open a limited repository reader");
+        assert!(matches!(
+            reader.comparison(base, head, &ReadCancellation::default()),
+            Err(ReadError::Limit("history commits" | "comparison commits"))
+        ));
+
+        let base = ObjectId::from_hex(clean.revision.base_object_id.as_bytes())
+            .expect("parse the clean base ID");
+        let head = ObjectId::from_hex(clean.revision.head_object_id.as_bytes())
+            .expect("parse the clean head ID");
+        let limits = ReadLimits {
+            max_diff_bytes: 1,
+            ..ReadLimits::default()
+        };
+        let reader = RepositoryReadService::open(&fixture.bare, limits)
+            .expect("open an output-limited repository reader");
+        assert!(matches!(
+            reader.comparison(base, head, &ReadCancellation::default()),
+            Err(ReadError::Limit("comparison output bytes" | "diff bytes"))
+        ));
+
+        let limits = ReadLimits {
+            max_duration: Duration::from_nanos(1),
+            ..ReadLimits::default()
+        };
+        let reader = RepositoryReadService::open(&fixture.bare, limits)
+            .expect("open a time-limited repository reader");
+        assert!(matches!(
+            reader.comparison(base, head, &ReadCancellation::default()),
+            Err(ReadError::Deadline)
+        ));
+    }
+}
+
 struct Fixture {
     _directory: TempDir,
     database: PathBuf,
@@ -320,6 +486,58 @@ impl Fixture {
         );
     }
 
+    fn commit_on(&self, branch: &str, path: &str, content: &str, message: &str) {
+        run(
+            &self.worktree,
+            Command::new("git").args(["switch", "-q", branch]),
+        );
+        fs::write(self.worktree.join(path), content).expect("write branch content");
+        git_commit(&self.worktree, message);
+        run(
+            &self.worktree,
+            Command::new("git")
+                .args(["push", "-q"])
+                .arg(&self.bare)
+                .arg(branch),
+        );
+    }
+
+    fn merge_feature_into_main(&self) {
+        run(
+            &self.worktree,
+            Command::new("git").args(["switch", "-q", "main"]),
+        );
+        run(
+            &self.worktree,
+            Command::new("git").args(["merge", "-q", "--no-commit", "-X", "ours", "feature"]),
+        );
+        git_commit(&self.worktree, "merge feature");
+        run(
+            &self.worktree,
+            Command::new("git")
+                .args(["push", "-q"])
+                .arg(&self.bare)
+                .arg("main"),
+        );
+    }
+
+    fn create_unrelated_branch(&self) {
+        run(
+            &self.worktree,
+            Command::new("git").args(["switch", "-q", "--orphan", "unrelated"]),
+        );
+        fs::write(self.worktree.join("unrelated.txt"), b"unrelated\n")
+            .expect("write unrelated content");
+        git_commit(&self.worktree, "unrelated root");
+        run(
+            &self.worktree,
+            Command::new("git")
+                .args(["push", "-q"])
+                .arg(&self.bare)
+                .arg("unrelated"),
+        );
+    }
+
     fn pull_ref(&self, number: i64) -> String {
         GitRepository::open(&self.bare)
             .expect("open the bare fixture")
@@ -356,6 +574,16 @@ fn rev_parse(repository: &Path, revision: &str) -> String {
         .expect("read a fixture object ID")
         .trim()
         .to_owned()
+}
+
+fn git_object_state(repository: &Path) -> String {
+    let output = Command::new("git")
+        .args(["count-objects", "-v"])
+        .current_dir(repository)
+        .output()
+        .expect("count fixture objects");
+    assert!(output.status.success(), "count fixture objects");
+    String::from_utf8(output.stdout).expect("read the object count")
 }
 
 fn run(directory: &Path, command: &mut Command) {

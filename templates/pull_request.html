@@ -25,9 +25,56 @@
     <h2 id="revisions-heading">Revisions</h2>
     <ol>
 {% for revision in revisions %}
-      <li value="{{ revision.number }}">{{ revision.author }} recorded <code>{{ revision.head_object_id }}</code> against <code>{{ revision.base_object_id }}</code> at <time>{{ revision.created_at }}</time>.</li>
+      <li value="{{ revision.number }}">
+        {{ revision.author }} recorded <code>{{ revision.head_object_id }}</code> against <code>{{ revision.base_object_id }}</code> at <time>{{ revision.created_at }}</time>.
+{% if revision.number == selected_revision %}
+        <strong>Selected</strong>
+{% else %}
+        <a href="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}?revision={{ revision.number }}">Compare this revision</a>
+{% endif %}
+      </li>
 {% endfor %}
     </ol>
+  </section>
+
+  <section aria-labelledby="comparison-heading">
+    <h2 id="comparison-heading">Comparison for revision {{ selected_revision }}</h2>
+    <p>Merge base: <code>{{ comparison.merge_base }}</code></p>
+    <p>Mergeability: {{ comparison.mergeability }}</p>
+
+    <h3>Commits</h3>
+{% if comparison.commits.is_empty() %}
+    <p>This revision has no commits that are not in the base.</p>
+{% else %}
+    <ol>
+{% for commit in comparison.commits %}
+      <li><code>{{ commit.id }}</code> <span class="preserve-whitespace">{{ commit.message }}</span></li>
+{% endfor %}
+    </ol>
+{% endif %}
+
+    <h3>Changed paths</h3>
+{% if comparison.changed_paths.is_empty() %}
+    <p>This revision does not change a path.</p>
+{% else %}
+    <ul>
+{% for path in comparison.changed_paths %}
+      <li><code>{{ path }}</code></li>
+{% endfor %}
+    </ul>
+{% endif %}
+
+    <h3>Diff</h3>
+{% for file in comparison.files %}
+    <article>
+      <h4><code>{{ file.path }}</code></h4>
+{% if file.binary %}
+      <p>This file has binary content.</p>
+{% else %}
+      <pre>{{ file.hunks }}</pre>
+{% endif %}
+    </article>
+{% endfor %}
   </section>
 
 {% if can_revise %}
