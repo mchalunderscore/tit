@@ -10,14 +10,24 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use support::{create_ssh_key_fixture, free_address};
 use tempfile::TempDir;
 
+static SERVER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn server_test_lock() -> MutexGuard<'static, ()> {
+    SERVER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn serves_an_imported_repository_through_http_and_ssh() {
+    let _server_test = server_test_lock();
     let instance = TempDir::new().expect("create an instance directory");
     let http = free_address();
     let ssh = free_address();
@@ -430,6 +440,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
 
 #[test]
 fn keeps_private_git_hidden_from_http_but_allows_its_owner_over_ssh() {
+    let _server_test = server_test_lock();
     let instance = TempDir::new().expect("create an instance directory");
     let http = free_address();
     let ssh = free_address();
@@ -544,6 +555,7 @@ fn keeps_private_git_hidden_from_http_but_allows_its_owner_over_ssh() {
 
 #[test]
 fn creates_owned_repositories_with_stable_ssh_command_output() {
+    let _server_test = server_test_lock();
     let instance = TempDir::new().expect("create an instance directory");
     let http = free_address();
     let ssh = free_address();
@@ -846,6 +858,7 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
 
 #[test]
 fn enforces_account_roles_and_ref_policy_through_the_production_ssh_server() {
+    let _server_test = server_test_lock();
     let instance = TempDir::new().expect("create an instance directory");
     let http = free_address();
     let ssh = free_address();
@@ -1125,7 +1138,12 @@ fn wait_for_listener(address: SocketAddr, server: &mut ChildGuard) {
             .try_wait()
             .expect("check the server")
         {
-            panic!("tit serve stopped early with {status}");
+            let mut stderr = String::new();
+            if let Some(pipe) = server.0.as_mut().expect("a stopped server").stderr.as_mut() {
+                pipe.read_to_string(&mut stderr)
+                    .expect("read the stopped server error output");
+            }
+            panic!("tit serve stopped early with {status}: {stderr}");
         }
         assert!(
             Instant::now() < deadline,
