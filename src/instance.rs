@@ -190,6 +190,11 @@ mod tests {
         InstanceLock::acquire(directory.path()).expect("acquire the released instance lock");
 
         let lock_path = directory.path().join(LOCK_FILE);
+        assert!(
+            fs::read(&lock_path)
+                .expect("read the instance lock file")
+                .is_empty()
+        );
         fs::remove_file(&lock_path).expect("remove the lock file");
         symlink(directory.path().join("target"), &lock_path).expect("create a lock-file symlink");
         assert!(matches!(

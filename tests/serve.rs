@@ -73,6 +73,21 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     let mut server = spawn_server(&config);
     wait_for_listener(http, &mut server);
     wait_for_listener(ssh, &mut server);
+    let health = http_get(http, "/healthz");
+    assert!(health.starts_with("HTTP/1.1 200"));
+    assert!(health.ends_with("\r\n\r\nready\n"));
+
+    let second = Command::new(env!("CARGO_BIN_EXE_tit"))
+        .args([
+            "--config",
+            config.to_str().expect("a UTF-8 configuration path"),
+            "serve",
+        ])
+        .output()
+        .expect("start a second tit server");
+    assert!(!second.status.success());
+    assert!(String::from_utf8_lossy(&second.stderr).contains("owns the instance lock"));
+
     let control_socket = instance.path().join("control.sock");
     assert_eq!(
         fs::symlink_metadata(&control_socket)

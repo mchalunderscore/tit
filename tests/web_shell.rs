@@ -61,8 +61,10 @@ mod watch;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::time::Duration;
 
 use http::RunningWebServer;
+use tokio::io::AsyncWriteExt;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serves_the_semantic_shell_without_javascript() {
@@ -235,6 +237,26 @@ async fn serves_useful_errors_and_owns_request_ids() {
     assert_ne!(first.header("x-request-id"), second.header("x-request-id"));
 
     server.shutdown().await.expect("stop the Web server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancels_a_connection_after_the_shutdown_drain_limit() {
+    let server = start().await;
+    let mut stalled = tokio::net::TcpStream::connect(server.address())
+        .await
+        .expect("connect a stalled client");
+    stalled
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+        .await
+        .expect("write an incomplete request");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert!(
+        !server
+            .shutdown_bounded(Duration::from_millis(20))
+            .await
+            .expect("stop the Web server")
+    );
 }
 
 async fn start() -> RunningWebServer {

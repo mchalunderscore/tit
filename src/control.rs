@@ -7,7 +7,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::account::{AccountError, AccountService};
 
@@ -66,18 +66,22 @@ impl RunningControlServer {
         let (shutdown, mut receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
             let _cleanup = cleanup;
+            let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
-                    _ = &mut receiver => return Ok(()),
+                    _ = &mut receiver => break,
                     accepted = listener.accept() => {
                         let (stream, _) = accepted.map_err(ControlError::Accept)?;
                         let service = accounts.clone();
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             let _ = handle(stream, service).await;
                         });
-                    }
+                    },
+                    _ = connections.join_next(), if !connections.is_empty() => {}
                 }
             }
+            while connections.join_next().await.is_some() {}
+            Ok(())
         });
         Ok(Self { shutdown, task })
     }
@@ -86,6 +90,21 @@ impl RunningControlServer {
         let _ = self.shutdown.send(());
         self.task.await.map_err(|_| ControlError::Join)??;
         Ok(())
+    }
+
+    pub(crate) async fn shutdown_bounded(mut self, limit: Duration) -> Result<bool, ControlError> {
+        let _ = self.shutdown.send(());
+        match tokio::time::timeout(limit, &mut self.task).await {
+            Ok(result) => {
+                result.map_err(|_| ControlError::Join)??;
+                Ok(true)
+            }
+            Err(_) => {
+                self.task.abort();
+                let _ = self.task.await;
+                Ok(false)
+            }
+        }
     }
 }
 

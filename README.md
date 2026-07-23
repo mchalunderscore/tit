@@ -30,9 +30,16 @@ The `serve` command starts the HTTP and SSH listeners in one process. It creates
 `ssh_host_ed25519_key` with mode 600 during the first start and uses the same
 host key during subsequent starts. Keep this file with the instance data.
 
-The server owns the instance lock until it receives SIGINT or SIGTERM. Stop the
-server before you run an offline administrator command. Create a signup code
-through the control socket while the server runs:
+The server owns the instance lock until it receives SIGINT or SIGTERM. It does
+not put a process ID in the lock file. Stop the server before you run an offline
+administrator command.
+
+Use `GET /healthz` or `HEAD /healthz` as the readiness probe. The endpoint
+returns status 200 only after the HTTP and SSH listeners are ready. During
+shutdown, the server gives active connections 10 seconds to finish. It then
+cancels unfinished connections.
+
+Create a signup code through the control socket while the server runs:
 
 ```text
 tit --config /srv/tit/config.toml invite-code
@@ -476,3 +483,17 @@ This command tests branch pushes, pull-request revisions, anchored reviews,
 merges, concurrent ref updates, and recovery after an interrupted ref update.
 It also tests the Web workflow, the SSH checkout command, and historical schema
 migration.
+
+## Milestone 6.1 gate
+
+Run the process lifecycle gate:
+
+```text
+./scripts/check-m6-1
+```
+
+This command tests listener readiness, SIGTERM shutdown, the bounded connection
+drain, the empty advisory lock file, and rejection of a second server process.
+Read the
+[process lifecycle architectural decision record](docs/adr/0028-process-lifecycle.md)
+for the readiness, shutdown, and instance-lock contracts.

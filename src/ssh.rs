@@ -259,6 +259,24 @@ impl RunningSshServer {
         self.task.await.map_err(|_| SshServerError::Join)??;
         Ok(())
     }
+
+    pub(crate) async fn shutdown_bounded(
+        mut self,
+        limit: Duration,
+    ) -> Result<bool, SshServerError> {
+        self.handle.shutdown("tit shutdown".to_owned());
+        match tokio::time::timeout(limit, &mut self.task).await {
+            Ok(result) => {
+                result.map_err(|_| SshServerError::Join)??;
+                Ok(true)
+            }
+            Err(_) => {
+                self.task.abort();
+                let _ = self.task.await;
+                Ok(false)
+            }
+        }
+    }
 }
 
 async fn recover_pushes(repositories: &GitRepositories) -> Result<(), SshServerError> {

@@ -2,6 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rand::rng;
 use ssh_key::{Algorithm, LineEnding, PrivateKey};
@@ -12,12 +13,14 @@ use crate::auth::{AuthError, SshPublicKey};
 use crate::config::{Config, ConfigError};
 use crate::control::{ControlError, RunningControlServer};
 use crate::git::transport::{GitRepositories, RepositoryPathError};
-use crate::http::{PublicWebConfig, RunningWebServer, WebError};
+use crate::http::{ListenerReadiness, PublicWebConfig, RunningWebServer, WebError};
 use crate::instance::{InstanceError, InstanceLock, prepare_database, prepare_repository_root};
 use crate::policy::PolicyError;
 use crate::pull_request::{PullRequestError, PullRequestService};
 use crate::ssh::{AuthorizedSshKeys, RunningSshServer, SshServerError};
 use crate::store::{Store, StoreError};
+
+const SHUTDOWN_DRAIN_LIMIT: Duration = Duration::from_secs(10);
 
 pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
     let _lock = InstanceLock::acquire(&config.instance_dir)?;
@@ -32,6 +35,7 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
     let accounts = AccountService::new(database);
     let control = RunningControlServer::start(&config.instance_dir, accounts.clone())?;
     let authorized_keys = AuthorizedSshKeys::for_accounts(keys);
+    let readiness = ListenerReadiness::default();
 
     let (http_clone_base, ssh_clone_base) = clone_bases(config)?;
     let host_key = load_or_create_host_key(&config.instance_dir)?;
@@ -52,6 +56,7 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
             ssh_clone_base,
         },
         reload_keys,
+        readiness.clone(),
     )
     .await?;
     let ssh = match RunningSshServer::start_with_dynamic_keys(
@@ -69,13 +74,22 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
             return Err(error.into());
         }
     };
+    readiness.mark_ready();
 
     let signal = shutdown_signal().await;
-    let (ssh_result, web_result, control_result) =
-        tokio::join!(ssh.shutdown(), web.shutdown(), control.shutdown());
-    ssh_result?;
-    web_result?;
-    control_result?;
+    readiness.mark_stopping();
+    let (ssh_result, web_result, control_result) = tokio::join!(
+        ssh.shutdown_bounded(SHUTDOWN_DRAIN_LIMIT),
+        web.shutdown_bounded(SHUTDOWN_DRAIN_LIMIT),
+        control.shutdown_bounded(SHUTDOWN_DRAIN_LIMIT)
+    );
+    let ssh_drained = ssh_result?;
+    let web_drained = web_result?;
+    let control_drained = control_result?;
+    let drained = ssh_drained && web_drained && control_drained;
+    if !drained {
+        eprintln!("tit: the shutdown drain limit expired; unfinished connections were canceled");
+    }
     signal.map_err(ServeError::Signal)
 }
 

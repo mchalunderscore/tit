@@ -8,6 +8,8 @@ mod watches;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use askama::Template;
 use axum::Router;
@@ -57,6 +59,7 @@ struct WebState {
     feeds: Option<FeedTokenService>,
     search: Option<MetadataSearchService>,
     watches: Option<WatchService>,
+    readiness: Option<ListenerReadiness>,
     secure_cookies: bool,
 }
 
@@ -70,6 +73,25 @@ pub(crate) struct PublicWebConfig {
     pub(crate) instance_dir: PathBuf,
     pub(crate) http_clone_base: String,
     pub(crate) ssh_clone_base: String,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ListenerReadiness {
+    ready: Arc<AtomicBool>,
+}
+
+impl ListenerReadiness {
+    pub(crate) fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn mark_stopping(&self) {
+        self.ready.store(false, Ordering::Release);
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
 }
 
 pub(crate) struct RunningWebServer {
@@ -94,6 +116,7 @@ impl RunningWebServer {
                 feeds: None,
                 search: None,
                 watches: None,
+                readiness: None,
                 secure_cookies: false,
             },
         )
@@ -104,21 +127,23 @@ impl RunningWebServer {
         address: SocketAddr,
         config: PublicWebConfig,
     ) -> Result<Self, WebError> {
-        Self::start_public_inner(address, config, None).await
+        Self::start_public_inner(address, config, None, None).await
     }
 
     pub(crate) async fn start_public_with_key_reload(
         address: SocketAddr,
         config: PublicWebConfig,
         key_reloader: AccountKeyReloader,
+        readiness: ListenerReadiness,
     ) -> Result<Self, WebError> {
-        Self::start_public_inner(address, config, Some(key_reloader)).await
+        Self::start_public_inner(address, config, Some(key_reloader), Some(readiness)).await
     }
 
     async fn start_public_inner(
         address: SocketAddr,
         config: PublicWebConfig,
         key_reloader: Option<AccountKeyReloader>,
+        readiness: Option<ListenerReadiness>,
     ) -> Result<Self, WebError> {
         let jobs = Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS));
         let database = config.instance_dir.join(crate::store::DATABASE_FILE);
@@ -148,6 +173,7 @@ impl RunningWebServer {
                 feeds: Some(feeds),
                 search: Some(search),
                 watches: Some(watches),
+                readiness,
                 secure_cookies,
             },
         )
@@ -181,6 +207,21 @@ impl RunningWebServer {
         self.task.await.map_err(|_| WebError::Join)??;
         Ok(())
     }
+
+    pub(crate) async fn shutdown_bounded(mut self, limit: Duration) -> Result<bool, WebError> {
+        let _ = self.shutdown.send(());
+        match tokio::time::timeout(limit, &mut self.task).await {
+            Ok(result) => {
+                result.map_err(|_| WebError::Join)??;
+                Ok(true)
+            }
+            Err(_) => {
+                self.task.abort();
+                let _ = self.task.await;
+                Ok(false)
+            }
+        }
+    }
 }
 
 pub(crate) fn router() -> Router {
@@ -196,6 +237,7 @@ pub(crate) fn router() -> Router {
         feeds: None,
         search: None,
         watches: None,
+        readiness: None,
         secure_cookies: false,
     })
 }
@@ -212,6 +254,7 @@ fn router_with_state(state: WebState) -> Router {
         ));
     Router::new()
         .route("/", get(home))
+        .route("/healthz", get(health))
         .route("/go", get(go_to_repository))
         .route(
             "/signup",
@@ -275,6 +318,24 @@ async fn repository_actor(
 
 async fn home(Extension(request_id): Extension<RequestId>) -> Response {
     render_home(StatusCode::OK, &request_id.0, "", "", "")
+}
+
+async fn health(State(state): State<WebState>) -> Response {
+    let ready = state
+        .readiness
+        .as_ref()
+        .is_none_or(ListenerReadiness::is_ready);
+    let (status, body) = if ready {
+        (StatusCode::OK, "ready\n")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready\n")
+    };
+    Response::builder()
+        .status(status)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(body))
+        .expect("the readiness response is valid")
 }
 
 async fn go_to_repository(

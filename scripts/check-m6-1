@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+./scripts/check
+cargo test --locked --release --bin tit instance::tests::serializes_instance_owners_and_rejects_unsafe_files
+cargo test --locked --release --test web_shell cancels_a_connection_after_the_shutdown_drain_limit
+cargo test --locked --release --test serve serves_an_imported_repository_through_http_and_ssh
