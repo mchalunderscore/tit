@@ -23,7 +23,8 @@ const CURRENT_DATABASE: &str = concat!(
     include_str!("../src/store/migrations/012_issues.sql"),
     include_str!("../src/store/migrations/013_watches.sql"),
     include_str!("../src/store/migrations/014_feed_tokens.sql"),
-    "PRAGMA user_version = 14;\n",
+    include_str!("../src/store/migrations/015_pull_requests.sql"),
+    "PRAGMA user_version = 15;\n",
 );
 
 #[test]

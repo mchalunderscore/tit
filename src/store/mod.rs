@@ -12,7 +12,7 @@ mod event;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
 const MAX_ACTIVE_FEED_TOKENS: i64 = 32;
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -22,7 +22,7 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 14] = [
+const MIGRATIONS: [&str; 15] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
@@ -37,6 +37,7 @@ const MIGRATIONS: [&str; 14] = [
     include_str!("migrations/012_issues.sql"),
     include_str!("migrations/013_watches.sql"),
     include_str!("migrations/014_feed_tokens.sql"),
+    include_str!("migrations/015_pull_requests.sql"),
 ];
 
 #[allow(
@@ -133,6 +134,16 @@ pub(crate) enum StoreError {
     IssueAssigneeState,
     #[error("issue assignee does not exist or cannot read the repository: {0}")]
     IssueAssigneeNotFound(String),
+    #[error("pull request does not exist: {0}/{1}#{2}")]
+    PullRequestNotFound(String, String, i64),
+    #[error("pull-request access is not authorized")]
+    PullRequestDenied,
+    #[error("pull request is hidden by repository access policy")]
+    PullRequestHidden,
+    #[error("pull request is not open")]
+    PullRequestState,
+    #[error("pull-request ref intent {0} is not in the required state")]
+    PullRequestIntentState(String),
     #[error("repository watch access is not authorized")]
     WatchDenied,
     #[error("feed token access is not authorized")]
@@ -980,6 +991,7 @@ impl Store {
                         source_intent_id: None,
                         source_ordinal: None,
                         issue_id: None,
+                        pull_request_id: None,
                         event: &event,
                         actor: repository.owner,
                         ref_name: None,
@@ -1005,6 +1017,7 @@ impl Store {
                             source_intent_id: None,
                             source_ordinal: None,
                             issue_id: None,
+                            pull_request_id: None,
                             event: &event,
                             actor: repository.owner,
                             ref_name: Some(&reference.name),
@@ -1439,6 +1452,7 @@ impl Store {
                 source_intent_id: None,
                 source_ordinal: None,
                 issue_id: Some(&id),
+                pull_request_id: None,
                 event: &event,
                 actor: issue.actor,
                 ref_name: None,
@@ -1459,6 +1473,370 @@ impl Store {
             updated_at: issue.created_at,
             closed_at: None,
         })
+    }
+
+    pub(crate) fn begin_pull_request_open(
+        &mut self,
+        intent: &NewPullRequestRefIntent<'_>,
+    ) -> Result<PullRequestRefIntentRecord, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let access = repository_issue_access(
+            &transaction,
+            intent.owner,
+            intent.repository,
+            Some(intent.actor),
+        )?;
+        if !access.can_read() {
+            return Err(StoreError::PullRequestHidden);
+        }
+        if !access.can_write_repository() {
+            return Err(StoreError::PullRequestDenied);
+        }
+        let actor_id = access
+            .active_actor_id
+            .ok_or(StoreError::PullRequestDenied)?;
+        transaction.execute(
+            "INSERT INTO repository_counter (repository_id)
+             VALUES (?1) ON CONFLICT (repository_id) DO NOTHING",
+            [&access.repository.id],
+        )?;
+        let number = transaction.query_row(
+            "UPDATE repository_counter
+             SET next_pull_request_number = next_pull_request_number + 1
+             WHERE repository_id = ?1
+             RETURNING next_pull_request_number - 1",
+            [&access.repository.id],
+            |row| row.get(0),
+        )?;
+        insert_pull_request_intent(
+            &transaction,
+            intent,
+            &access.repository.id,
+            actor_id,
+            number,
+            1,
+            None,
+            "open",
+        )?;
+        transaction.commit()?;
+        Ok(PullRequestRefIntentRecord::from_new(
+            intent,
+            access.repository.id,
+            actor_id,
+            number,
+            1,
+            None,
+            "open",
+        ))
+    }
+
+    pub(crate) fn begin_pull_request_revision(
+        &mut self,
+        number: i64,
+        intent: &NewPullRequestRefIntent<'_>,
+    ) -> Result<PullRequestRefIntentRecord, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let access = repository_issue_access(
+            &transaction,
+            intent.owner,
+            intent.repository,
+            Some(intent.actor),
+        )?;
+        if !access.can_read() {
+            return Err(StoreError::PullRequestHidden);
+        }
+        if !access.can_write_repository() {
+            return Err(StoreError::PullRequestDenied);
+        }
+        let actor_id = access
+            .active_actor_id
+            .ok_or(StoreError::PullRequestDenied)?;
+        let stored = transaction
+            .query_row(
+                "SELECT id, title, body, state, base_ref, head_ref, head_object_id,
+                        (SELECT COALESCE(MAX(number), 0) + 1
+                         FROM pull_request_revision
+                         WHERE pull_request_id = pull_request.id)
+                 FROM pull_request
+                 WHERE repository_id = ?1 AND number = ?2",
+                rusqlite::params![access.repository.id, number],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::PullRequestNotFound(
+                    intent.owner.to_owned(),
+                    intent.repository.to_owned(),
+                    number,
+                )
+            })?;
+        let (pull_request_id, title, body, state, base_ref, head_ref, old_head, revision) = stored;
+        if state != "open" {
+            return Err(StoreError::PullRequestState);
+        }
+        if pull_request_id != intent.pull_request_id
+            || title != intent.title
+            || body != intent.body
+            || base_ref != intent.base_ref
+            || head_ref != intent.head_ref
+        {
+            return Err(StoreError::PullRequestIntentState(intent.id.to_owned()));
+        }
+        insert_pull_request_intent(
+            &transaction,
+            intent,
+            &access.repository.id,
+            actor_id,
+            number,
+            revision,
+            Some(&old_head),
+            "revise",
+        )?;
+        transaction.commit()?;
+        Ok(PullRequestRefIntentRecord::from_new(
+            intent,
+            access.repository.id,
+            actor_id,
+            number,
+            revision,
+            Some(old_head),
+            "revise",
+        ))
+    }
+
+    pub(crate) fn complete_pull_request_ref_intent(&mut self, id: &str) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let intent = pull_request_intent(&transaction, id)?;
+        if intent.state != "pending" {
+            return Err(StoreError::PullRequestIntentState(id.to_owned()));
+        }
+        if intent.operation == "open" {
+            transaction.execute(
+                "INSERT INTO pull_request
+                 (id, repository_id, number, title, body, state, author_account_id,
+                  base_ref, head_ref, base_object_id, head_object_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                rusqlite::params![
+                    intent.pull_request_id,
+                    intent.repository_id,
+                    intent.pull_request_number,
+                    intent.title,
+                    intent.body,
+                    intent.author_account_id,
+                    intent.base_ref,
+                    intent.head_ref,
+                    intent.base_object_id,
+                    intent.head_object_id,
+                    intent.created_at,
+                ],
+            )?;
+        } else {
+            let changed = transaction.execute(
+                "UPDATE pull_request
+                 SET base_object_id = ?2, head_object_id = ?3, updated_at = ?4
+                 WHERE id = ?1 AND state = 'open' AND head_object_id = ?5",
+                rusqlite::params![
+                    intent.pull_request_id,
+                    intent.base_object_id,
+                    intent.head_object_id,
+                    intent.created_at,
+                    intent.old_head_object_id,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::PullRequestIntentState(id.to_owned()));
+            }
+        }
+        let revision_id: String =
+            transaction.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+        transaction.execute(
+            "INSERT INTO pull_request_revision
+             (id, pull_request_id, number, author_account_id, base_object_id,
+              head_object_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                revision_id,
+                intent.pull_request_id,
+                intent.revision_number,
+                intent.author_account_id,
+                intent.base_object_id,
+                intent.head_object_id,
+                intent.created_at,
+            ],
+        )?;
+        let kind = if intent.operation == "open" {
+            event::EventKind::PullRequestCreated
+        } else {
+            event::EventKind::PullRequestRevised
+        };
+        let event = event::pull_request(
+            kind,
+            &intent.pull_request_id,
+            intent.pull_request_number,
+            intent.revision_number,
+            &intent.title,
+            &intent.base_ref,
+            &intent.head_ref,
+            &intent.base_object_id,
+            &intent.head_object_id,
+        );
+        insert_domain_event(
+            &transaction,
+            &NewDomainEvent {
+                repository_id: &intent.repository_id,
+                source_intent_id: None,
+                source_ordinal: None,
+                issue_id: None,
+                pull_request_id: Some(&intent.pull_request_id),
+                event: &event,
+                actor: &intent.actor,
+                ref_name: None,
+                old_target: None,
+                new_target: None,
+                created_at: intent.created_at,
+            },
+        )?;
+        transaction.execute(
+            "UPDATE pull_request_ref_intent SET state = 'completed'
+             WHERE id = ?1 AND state = 'pending'",
+            [id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn abandon_pull_request_ref_intent(&self, id: &str) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE pull_request_ref_intent SET state = 'abandoned'
+             WHERE id = ?1 AND state = 'pending'",
+            [id],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::PullRequestIntentState(id.to_owned()))
+        }
+    }
+
+    pub(crate) fn incomplete_pull_request_ref_intents(
+        &self,
+    ) -> Result<Vec<PullRequestRefIntentRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, repository_id, pull_request_id, pull_request_number,
+                    revision_number, operation, title, body, author_account_id, actor,
+                    base_ref, head_ref, base_object_id, old_head_object_id,
+                    head_object_id, state, created_at
+             FROM pull_request_ref_intent WHERE state = 'pending'
+             ORDER BY created_at, id",
+        )?;
+        statement
+            .query_map([], pull_request_intent_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn pull_request(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        actor: Option<&str>,
+    ) -> Result<PullRequestDetail, StoreError> {
+        let access = repository_issue_access(&self.connection, owner, repository, actor)?;
+        if !access.can_read() {
+            return Err(StoreError::PullRequestHidden);
+        }
+        let pull_request = self
+            .connection
+            .query_row(
+                "SELECT pull_request.id, pull_request.number, pull_request.title,
+                        pull_request.body, pull_request.state, author.username,
+                        pull_request.base_ref, pull_request.head_ref,
+                        pull_request.base_object_id, pull_request.head_object_id,
+                        pull_request.created_at, pull_request.updated_at
+                 FROM pull_request
+                 JOIN account AS author ON author.id = pull_request.author_account_id
+                 WHERE pull_request.repository_id = ?1 AND pull_request.number = ?2",
+                rusqlite::params![access.repository.id, number],
+                pull_request_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::PullRequestNotFound(owner.to_owned(), repository.to_owned(), number)
+            })?;
+        let mut statement = self.connection.prepare(
+            "SELECT pull_request_revision.id, pull_request_revision.number,
+                    author.username, pull_request_revision.base_object_id,
+                    pull_request_revision.head_object_id, pull_request_revision.created_at
+             FROM pull_request_revision
+             JOIN account AS author ON author.id = pull_request_revision.author_account_id
+             WHERE pull_request_revision.pull_request_id = ?1
+             ORDER BY pull_request_revision.number",
+        )?;
+        let revisions = statement
+            .query_map([&pull_request.id], |row| {
+                Ok(PullRequestRevisionRecord {
+                    id: row.get(0)?,
+                    number: row.get(1)?,
+                    author: row.get(2)?,
+                    base_object_id: row.get(3)?,
+                    head_object_id: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let can_revise = access.can_write_repository();
+        Ok(PullRequestDetail {
+            repository: access.repository,
+            pull_request,
+            revisions,
+            can_revise,
+        })
+    }
+
+    pub(crate) fn pull_requests(
+        &self,
+        owner: &str,
+        repository: &str,
+        actor: Option<&str>,
+    ) -> Result<(RepositoryRecord, Vec<PullRequestRecord>, bool), StoreError> {
+        let access = repository_issue_access(&self.connection, owner, repository, actor)?;
+        if !access.can_read() {
+            return Err(StoreError::PullRequestHidden);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT pull_request.id, pull_request.number, pull_request.title,
+                    pull_request.body, pull_request.state, author.username,
+                    pull_request.base_ref, pull_request.head_ref,
+                    pull_request.base_object_id, pull_request.head_object_id,
+                    pull_request.created_at, pull_request.updated_at
+             FROM pull_request
+             JOIN account AS author ON author.id = pull_request.author_account_id
+             WHERE pull_request.repository_id = ?1
+             ORDER BY pull_request.number DESC",
+        )?;
+        let pull_requests = statement
+            .query_map([&access.repository.id], pull_request_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let can_create = access.can_write_repository();
+        Ok((access.repository, pull_requests, can_create))
     }
 
     pub(crate) fn edit_issue(
@@ -2639,6 +3017,108 @@ pub(crate) struct NewIssue<'a> {
     pub(crate) created_at: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PullRequestRecord {
+    pub(crate) id: String,
+    pub(crate) number: i64,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) state: String,
+    pub(crate) author: String,
+    pub(crate) base_ref: String,
+    pub(crate) head_ref: String,
+    pub(crate) base_object_id: String,
+    pub(crate) head_object_id: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PullRequestRevisionRecord {
+    pub(crate) id: String,
+    pub(crate) number: i64,
+    pub(crate) author: String,
+    pub(crate) base_object_id: String,
+    pub(crate) head_object_id: String,
+    pub(crate) created_at: i64,
+}
+
+pub(crate) struct PullRequestDetail {
+    pub(crate) repository: RepositoryRecord,
+    pub(crate) pull_request: PullRequestRecord,
+    pub(crate) revisions: Vec<PullRequestRevisionRecord>,
+    pub(crate) can_revise: bool,
+}
+
+pub(crate) struct NewPullRequestRefIntent<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) pull_request_id: &'a str,
+    pub(crate) owner: &'a str,
+    pub(crate) repository: &'a str,
+    pub(crate) actor: &'a str,
+    pub(crate) title: &'a str,
+    pub(crate) body: &'a str,
+    pub(crate) base_ref: &'a str,
+    pub(crate) head_ref: &'a str,
+    pub(crate) base_object_id: &'a str,
+    pub(crate) head_object_id: &'a str,
+    pub(crate) created_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PullRequestRefIntentRecord {
+    pub(crate) id: String,
+    pub(crate) repository_id: String,
+    pub(crate) pull_request_id: String,
+    pub(crate) pull_request_number: i64,
+    pub(crate) revision_number: i64,
+    pub(crate) operation: String,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) author_account_id: i64,
+    pub(crate) actor: String,
+    pub(crate) base_ref: String,
+    pub(crate) head_ref: String,
+    pub(crate) base_object_id: String,
+    pub(crate) old_head_object_id: Option<String>,
+    pub(crate) head_object_id: String,
+    pub(crate) state: String,
+    pub(crate) created_at: i64,
+}
+
+impl PullRequestRefIntentRecord {
+    #[allow(clippy::too_many_arguments)]
+    fn from_new(
+        intent: &NewPullRequestRefIntent<'_>,
+        repository_id: String,
+        author_account_id: i64,
+        pull_request_number: i64,
+        revision_number: i64,
+        old_head_object_id: Option<String>,
+        operation: &str,
+    ) -> Self {
+        Self {
+            id: intent.id.to_owned(),
+            repository_id,
+            pull_request_id: intent.pull_request_id.to_owned(),
+            pull_request_number,
+            revision_number,
+            operation: operation.to_owned(),
+            title: intent.title.to_owned(),
+            body: intent.body.to_owned(),
+            author_account_id,
+            actor: intent.actor.to_owned(),
+            base_ref: intent.base_ref.to_owned(),
+            head_ref: intent.head_ref.to_owned(),
+            base_object_id: intent.base_object_id.to_owned(),
+            old_head_object_id,
+            head_object_id: intent.head_object_id.to_owned(),
+            state: "pending".to_owned(),
+            created_at: intent.created_at,
+        }
+    }
+}
+
 pub(crate) struct IssueChange<'a> {
     pub(crate) owner: &'a str,
     pub(crate) repository: &'a str,
@@ -2825,6 +3305,14 @@ impl RepositoryIssueAccess {
     fn can_maintain(&self) -> bool {
         self.can_read() && matches!(self.role.as_deref(), Some("owner" | "maintainer"))
     }
+
+    fn can_write_repository(&self) -> bool {
+        self.can_read()
+            && matches!(
+                self.role.as_deref(),
+                Some("owner" | "maintainer" | "writer")
+            )
+    }
 }
 
 struct StoredIssue {
@@ -2872,6 +3360,105 @@ fn repository_issue_access(
         )),
         Err(error) => Err(error.into()),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_pull_request_intent(
+    transaction: &rusqlite::Transaction<'_>,
+    intent: &NewPullRequestRefIntent<'_>,
+    repository_id: &str,
+    author_account_id: i64,
+    pull_request_number: i64,
+    revision_number: i64,
+    old_head_object_id: Option<&str>,
+    operation: &str,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO pull_request_ref_intent
+         (id, repository_id, pull_request_id, pull_request_number, revision_number,
+          operation, title, body, author_account_id, actor, base_ref, head_ref,
+          base_object_id, old_head_object_id, head_object_id, state, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                 ?13, ?14, ?15, 'pending', ?16)",
+        rusqlite::params![
+            intent.id,
+            repository_id,
+            intent.pull_request_id,
+            pull_request_number,
+            revision_number,
+            operation,
+            intent.title,
+            intent.body,
+            author_account_id,
+            intent.actor,
+            intent.base_ref,
+            intent.head_ref,
+            intent.base_object_id,
+            old_head_object_id,
+            intent.head_object_id,
+            intent.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn pull_request_intent(
+    connection: &Connection,
+    id: &str,
+) -> Result<PullRequestRefIntentRecord, StoreError> {
+    connection
+        .query_row(
+            "SELECT id, repository_id, pull_request_id, pull_request_number,
+                    revision_number, operation, title, body, author_account_id, actor,
+                    base_ref, head_ref, base_object_id, old_head_object_id,
+                    head_object_id, state, created_at
+             FROM pull_request_ref_intent WHERE id = ?1",
+            [id],
+            pull_request_intent_from_row,
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::PullRequestIntentState(id.to_owned()))
+}
+
+fn pull_request_intent_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PullRequestRefIntentRecord> {
+    Ok(PullRequestRefIntentRecord {
+        id: row.get(0)?,
+        repository_id: row.get(1)?,
+        pull_request_id: row.get(2)?,
+        pull_request_number: row.get(3)?,
+        revision_number: row.get(4)?,
+        operation: row.get(5)?,
+        title: row.get(6)?,
+        body: row.get(7)?,
+        author_account_id: row.get(8)?,
+        actor: row.get(9)?,
+        base_ref: row.get(10)?,
+        head_ref: row.get(11)?,
+        base_object_id: row.get(12)?,
+        old_head_object_id: row.get(13)?,
+        head_object_id: row.get(14)?,
+        state: row.get(15)?,
+        created_at: row.get(16)?,
+    })
+}
+
+fn pull_request_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PullRequestRecord> {
+    Ok(PullRequestRecord {
+        id: row.get(0)?,
+        number: row.get(1)?,
+        title: row.get(2)?,
+        body: row.get(3)?,
+        state: row.get(4)?,
+        author: row.get(5)?,
+        base_ref: row.get(6)?,
+        head_ref: row.get(7)?,
+        base_object_id: row.get(8)?,
+        head_object_id: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
 }
 
 fn validate_feed_scope(scope: &str, repository: Option<(&str, &str)>) -> Result<(), StoreError> {
@@ -3171,6 +3758,7 @@ fn insert_issue_event(
             source_intent_id: None,
             source_ordinal: None,
             issue_id: Some(issue_id),
+            pull_request_id: None,
             event,
             actor,
             ref_name: None,
@@ -3186,6 +3774,7 @@ struct NewDomainEvent<'a> {
     source_intent_id: Option<&'a str>,
     source_ordinal: Option<i64>,
     issue_id: Option<&'a str>,
+    pull_request_id: Option<&'a str>,
     event: &'a event::VersionedEvent,
     actor: &'a str,
     ref_name: Option<&'a [u8]>,
@@ -3201,20 +3790,22 @@ fn insert_domain_event(
     transaction.execute(
         "INSERT INTO repository_event
          (event_id, repository_id, sequence, source_intent_id, source_ordinal,
-          issue_id, kind, actor, ref_name, old_target, new_target, payload_version, payload,
+          issue_id, pull_request_id, kind, actor, ref_name, old_target, new_target,
+          payload_version, payload,
           created_at)
          VALUES (
              lower(hex(randomblob(16))),
              ?1,
              (SELECT COALESCE(MAX(sequence), 0) + 1
               FROM repository_event WHERE repository_id = ?1),
-             ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+             ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
          )",
         rusqlite::params![
             event.repository_id,
             event.source_intent_id,
             event.source_ordinal,
             event.issue_id,
+            event.pull_request_id,
             event.event.kind.as_str(),
             event.actor,
             event.ref_name,
@@ -3277,6 +3868,7 @@ fn insert_push_events(
             source_intent_id: Some(intent_id),
             source_ordinal: Some(0),
             issue_id: None,
+            pull_request_id: None,
             event: &push,
             actor,
             ref_name: None,
@@ -3330,6 +3922,7 @@ fn insert_push_events(
                 source_intent_id: Some(intent_id),
                 source_ordinal: Some(ordinal),
                 issue_id: None,
+                pull_request_id: None,
                 event: &event,
                 actor,
                 ref_name: Some(&old_name),

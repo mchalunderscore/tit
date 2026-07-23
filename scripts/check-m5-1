@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+./scripts/check
+cargo test --locked --release --test pull_requests
+cargo test --locked --release --test public_routes runs_the_complete_issue_workflow_without_javascript
+cargo test --locked --release --test sqlite migrates_each_committed_historical_fixture

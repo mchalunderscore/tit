@@ -2,6 +2,7 @@ mod feeds;
 mod issues;
 mod metadata_search;
 mod public;
+mod pull_requests;
 mod watches;
 
 use std::net::SocketAddr;
@@ -26,6 +27,7 @@ use crate::auth::validate_username;
 use crate::domain::repository::validate_slug;
 use crate::feed_token::FeedTokenService;
 use crate::issue::IssueService;
+use crate::pull_request::PullRequestService;
 use crate::repository::{RepositoryService, RepositoryServiceError};
 use crate::search::MetadataSearchService;
 use crate::session::{SessionError, WebLoginService};
@@ -51,6 +53,7 @@ struct WebState {
     login: Option<WebLoginService>,
     repositories: Option<RepositoryService>,
     issues: Option<IssueService>,
+    pull_requests: Option<PullRequestService>,
     feeds: Option<FeedTokenService>,
     search: Option<MetadataSearchService>,
     watches: Option<WatchService>,
@@ -87,6 +90,7 @@ impl RunningWebServer {
                 login: None,
                 repositories: None,
                 issues: None,
+                pull_requests: None,
                 feeds: None,
                 search: None,
                 watches: None,
@@ -126,6 +130,7 @@ impl RunningWebServer {
         let public = PublicWeb::open(config, Arc::clone(&jobs))?;
         let repositories = RepositoryService::new(public.database(), public.repository_root());
         let issues = IssueService::new(public.database());
+        let pull_requests = PullRequestService::new(public.database(), public.repository_root());
         let feeds = FeedTokenService::new(public.database());
         let search = MetadataSearchService::new(public.database());
         let watches = WatchService::new(public.database());
@@ -139,6 +144,7 @@ impl RunningWebServer {
                 login: Some(login),
                 repositories: Some(repositories),
                 issues: Some(issues),
+                pull_requests: Some(pull_requests),
                 feeds: Some(feeds),
                 search: Some(search),
                 watches: Some(watches),
@@ -186,6 +192,7 @@ pub(crate) fn router() -> Router {
         login: None,
         repositories: None,
         issues: None,
+        pull_requests: None,
         feeds: None,
         search: None,
         watches: None,
@@ -197,6 +204,7 @@ fn router_with_state(state: WebState) -> Router {
     let repository_routes = metadata_search::routes()
         .merge(watches::routes())
         .merge(issues::routes())
+        .merge(pull_requests::routes())
         .merge(public::routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),

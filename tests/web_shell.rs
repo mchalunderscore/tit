@@ -40,6 +40,9 @@ mod markdown;
 #[allow(dead_code, reason = "the Web shell test has no repository catalog")]
 #[path = "../src/policy.rs"]
 mod policy;
+#[allow(dead_code, reason = "the Web shell test does not use pull requests")]
+#[path = "../src/pull_request.rs"]
+mod pull_request;
 #[allow(dead_code, reason = "the Web shell test does not create repositories")]
 #[path = "../src/repository.rs"]
 mod repository;

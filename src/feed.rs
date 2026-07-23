@@ -255,9 +255,13 @@ fn activity_link(base_url: &str, record: &ActivityEventRecord) -> String {
         "{}/{}/{}",
         base_url, record.repository.owner, record.repository.slug
     );
-    let number = issue_payload(&record.event).and_then(|payload| payload.get("number")?.as_i64());
+    let number = event_payload(&record.event).and_then(|payload| payload.get("number")?.as_i64());
     number.map_or(repository_url.clone(), |number| {
-        format!("{repository_url}/issues/{number}")
+        if record.event.kind.starts_with("pull-request-") {
+            format!("{repository_url}/pulls/{number}")
+        } else {
+            format!("{repository_url}/issues/{number}")
+        }
     })
 }
 
@@ -290,6 +294,8 @@ fn event_title(event: &RepositoryEventRecord) -> String {
         "issue-unlabeled" => issue_value_title(event, "removed label", "label"),
         "issue-assigned" => issue_value_title(event, "assigned", "assignee"),
         "issue-unassigned" => issue_value_title(event, "unassigned", "assignee"),
+        "pull-request-created" => pull_request_title(event, "opened"),
+        "pull-request-revised" => pull_request_title(event, "revised"),
         _ => "Repository event".to_owned(),
     }
 }
@@ -319,6 +325,18 @@ fn issue_value_title(event: &RepositoryEventRecord, action: &str, field: &str) -
 }
 
 fn issue_payload(event: &RepositoryEventRecord) -> Option<serde_json::Value> {
+    event_payload(event)
+}
+
+fn pull_request_title(event: &RepositoryEventRecord, action: &str) -> String {
+    let number = event_payload(event)
+        .and_then(|payload| payload.get("number")?.as_i64())
+        .map(|number| format!("#{number}"))
+        .unwrap_or_else(|| "pull request".to_owned());
+    format!("{} {action} {number}", event.actor)
+}
+
+fn event_payload(event: &RepositoryEventRecord) -> Option<serde_json::Value> {
     (event.payload_version == 1)
         .then(|| serde_json::from_str(&event.payload).ok())
         .flatten()

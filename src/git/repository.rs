@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use gix::hash::{Kind, ObjectId};
 use gix::objs::{Data, Kind as ObjectKind, tree::EntryKind};
+use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+use gix::refs::{FullName, Target};
 use gix_pack::data::Version;
 use gix_pack::data::output::{Count, Entry, bytes::FromEntriesIter};
 use thiserror::Error;
@@ -128,6 +130,69 @@ impl GitRepository {
             );
         }
         Ok(references)
+    }
+
+    pub(crate) fn resolve_branch(&self, name: &str) -> Result<ObjectId, GitRepositoryError> {
+        if !name.starts_with("refs/heads/") || name.len() > 1024 {
+            return Err(GitRepositoryError::InvalidBranch);
+        }
+        let reference = self
+            .repository
+            .try_find_reference(name)
+            .map_err(|error| GitRepositoryError::References(error.to_string()))?
+            .ok_or_else(|| GitRepositoryError::MissingReference(name.to_owned()))?;
+        let target = reference
+            .try_id()
+            .map(gix::Id::detach)
+            .ok_or_else(|| GitRepositoryError::MissingReference(name.to_owned()))?;
+        if self.find_object(target)?.kind != ObjectKind::Commit {
+            return Err(GitRepositoryError::BranchNotCommit);
+        }
+        Ok(target)
+    }
+
+    pub(crate) fn reference_target(
+        &self,
+        name: &str,
+    ) -> Result<Option<ObjectId>, GitRepositoryError> {
+        self.repository
+            .try_find_reference(name)
+            .map(|reference| {
+                reference.and_then(|reference| reference.try_id().map(gix::Id::detach))
+            })
+            .map_err(|error| GitRepositoryError::References(error.to_string()))
+    }
+
+    pub(crate) fn update_reference(
+        &self,
+        name: &str,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+    ) -> Result<(), GitRepositoryError> {
+        if new.kind() != self.object_format() {
+            return Err(GitRepositoryError::WrongObjectFormat);
+        }
+        let name = FullName::try_from(name)
+            .map_err(|_| GitRepositoryError::InvalidReference(name.to_owned()))?;
+        let edit = RefEdit {
+            name,
+            deref: false,
+            change: Change::Update {
+                expected: expected.map_or(PreviousValue::MustNotExist, |id| {
+                    PreviousValue::MustExistAndMatch(Target::Object(id))
+                }),
+                new: Target::Object(new),
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: "pull request revision".into(),
+                },
+            },
+        };
+        self.repository
+            .edit_references_as([edit], None)
+            .map_err(|error| GitRepositoryError::RefTransaction(error.to_string()))?;
+        Ok(())
     }
 
     pub(crate) fn make_pack(
@@ -299,6 +364,16 @@ pub(crate) enum GitRepositoryError {
     NotBare(PathBuf),
     #[error("cannot read Git references: {0}")]
     References(String),
+    #[error("Git branch name is not valid")]
+    InvalidBranch,
+    #[error("Git reference name is not valid: {0}")]
+    InvalidReference(String),
+    #[error("Git reference does not exist: {0}")]
+    MissingReference(String),
+    #[error("Git branch does not point to a commit")]
+    BranchNotCommit,
+    #[error("cannot update Git references: {0}")]
+    RefTransaction(String),
     #[error("cannot read Git object {id}: {reason}")]
     Object { id: ObjectId, reason: String },
     #[error("Git object does not exist: {0}")]

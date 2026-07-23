@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Pull requests · {{ owner }}/{{ repository }} · tit{% endblock %}
+{% block content %}
+  <header class="repository-header">
+    <h1><a href="/{{ owner }}/{{ repository }}">{{ owner }}/{{ repository }}</a></h1>
+    <nav aria-label="Repository">
+      <a href="/{{ owner }}/{{ repository }}">Summary</a>
+      <a href="/{{ owner }}/{{ repository }}/refs">Refs</a>
+      <a href="/{{ owner }}/{{ repository }}/issues">Issues</a>
+      <a href="/{{ owner }}/{{ repository }}/pulls">Pull requests</a>
+      <a href="/{{ owner }}/{{ repository }}/watch">Watch</a>
+    </nav>
+  </header>
+
+  <h2>Pull requests</h2>
+{% if pull_requests.is_empty() %}
+  <p>This repository has no pull requests.</p>
+{% else %}
+  <ol class="issue-list">
+{% for pull_request in pull_requests %}
+    <li><a href="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}">#{{ pull_request.number }} {{ pull_request.title }}</a> — {{ pull_request.state }}, opened by {{ pull_request.author }}, updated <time>{{ pull_request.updated_at }}</time></li>
+{% endfor %}
+  </ol>
+{% endif %}
+
+{% if can_create %}
+  <section aria-labelledby="new-pull-request-heading">
+    <h2 id="new-pull-request-heading">Open a pull request</h2>
+    <form method="post" action="/{{ owner }}/{{ repository }}/pulls">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="field">
+        <label for="pull-request-title">Title</label>
+        <input id="pull-request-title" name="title" maxlength="200" required>
+      </div>
+      <div class="field">
+        <label for="pull-request-body">Description (Markdown)</label>
+        <textarea id="pull-request-body" name="body" maxlength="262144" rows="10"></textarea>
+      </div>
+      <div class="field">
+        <label for="pull-request-base">Base branch</label>
+        <input id="pull-request-base" name="base-ref" maxlength="1024" value="refs/heads/main" required>
+      </div>
+      <div class="field">
+        <label for="pull-request-head">Head branch</label>
+        <input id="pull-request-head" name="head-ref" maxlength="1024" placeholder="refs/heads/feature" required>
+      </div>
+      <button type="submit">Open pull request</button>
+    </form>
+  </section>
+{% else %}
+  <p>You need write access to open a pull request.</p>
+{% endif %}
+{% endblock %}

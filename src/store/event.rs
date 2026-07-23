@@ -22,6 +22,8 @@ pub(super) enum EventKind {
     IssueUnlabeled,
     IssueAssigned,
     IssueUnassigned,
+    PullRequestCreated,
+    PullRequestRevised,
 }
 
 impl EventKind {
@@ -45,7 +47,45 @@ impl EventKind {
             Self::IssueUnlabeled => "issue-unlabeled",
             Self::IssueAssigned => "issue-assigned",
             Self::IssueUnassigned => "issue-unassigned",
+            Self::PullRequestCreated => "pull-request-created",
+            Self::PullRequestRevised => "pull-request-revised",
         }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the event payload stores the complete immutable pull-request revision"
+)]
+pub(super) fn pull_request(
+    kind: EventKind,
+    pull_request_id: &str,
+    number: i64,
+    revision: i64,
+    title: &str,
+    base_ref: &str,
+    head_ref: &str,
+    base_object_id: &str,
+    head_object_id: &str,
+) -> VersionedEvent {
+    debug_assert!(matches!(
+        kind,
+        EventKind::PullRequestCreated | EventKind::PullRequestRevised
+    ));
+    VersionedEvent {
+        kind,
+        payload: json!({
+            "version": PAYLOAD_VERSION,
+            "pull_request_id": pull_request_id,
+            "number": number,
+            "revision": revision,
+            "title": title,
+            "base_ref": base_ref,
+            "head_ref": head_ref,
+            "base_object_id": base_object_id,
+            "head_object_id": head_object_id,
+        })
+        .to_string(),
     }
 }
 

@@ -20,6 +20,7 @@ mod instance;
 mod issue;
 mod markdown;
 mod policy;
+mod pull_request;
 mod repository;
 mod search;
 mod serve;

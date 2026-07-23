@@ -44,6 +44,12 @@ mod markdown;
 mod policy;
 #[allow(
     dead_code,
+    reason = "the public-route test does not mutate pull requests"
+)]
+#[path = "../src/pull_request.rs"]
+mod pull_request;
+#[allow(
+    dead_code,
     reason = "the public route test does not create repositories through forms"
 )]
 #[path = "../src/repository.rs"]
@@ -729,6 +735,89 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     assert!(final_text.contains("Assignees: <span>alice</span>"));
     assert!(final_text.contains("issue-created"));
     assert!(final_text.contains("issue-reopened"));
+
+    let anonymous_pull_requests =
+        request(server.address(), "GET", "/alice/example/pulls", &[], &[]);
+    assert_eq!(anonymous_pull_requests.status, 200);
+    assert!(
+        anonymous_pull_requests
+            .text()
+            .contains("This repository has no pull requests.")
+    );
+    assert!(
+        !anonymous_pull_requests
+            .text()
+            .contains("Open a pull request</h2>")
+    );
+    let open_pull_request = form(&[
+        ("csrf", csrf.as_str()),
+        ("title", "Review the feature"),
+        ("body", "Keep **each revision**."),
+        ("base-ref", "refs/heads/main"),
+        ("head-ref", "refs/heads/feature"),
+    ]);
+    let opened_pull_request = request(
+        server.address(),
+        "POST",
+        "/alice/example/pulls",
+        &headers,
+        open_pull_request.as_bytes(),
+    );
+    assert_eq!(opened_pull_request.status, 303);
+    assert_eq!(
+        opened_pull_request.header("location"),
+        "/alice/example/pulls/1"
+    );
+    let pull_request_page = request(server.address(), "GET", "/alice/example/pulls/1", &[], &[]);
+    assert_eq!(pull_request_page.status, 200);
+    assert!(pull_request_page.text().contains("#1 Review the feature"));
+    assert!(
+        pull_request_page
+            .text()
+            .contains("<strong>each revision</strong>")
+    );
+    assert!(
+        pull_request_page
+            .text()
+            .contains("git fetch origin refs/pull/1/head")
+    );
+    let worktree = fixture.instance.path().join("worktree");
+    run(Command::new("git")
+        .arg("-C")
+        .arg(&worktree)
+        .args(["switch", "-q", "feature"]));
+    fs::write(worktree.join("pull-request.txt"), b"new revision\n")
+        .expect("write a pull-request revision");
+    commit_all(&worktree, "pull-request revision");
+    let bare = fixture
+        .instance
+        .path()
+        .join("repositories")
+        .join(format!("{}.git", fixture.repository_id));
+    run(Command::new("git")
+        .arg("-C")
+        .arg(&worktree)
+        .args(["push", "-q"])
+        .arg(&bare)
+        .arg("feature"));
+    let revision = form(&[("csrf", csrf.as_str())]);
+    let revised_pull_request = request(
+        server.address(),
+        "POST",
+        "/alice/example/pulls/1/revisions",
+        &headers,
+        revision.as_bytes(),
+    );
+    assert_eq!(revised_pull_request.status, 303);
+    let revised_pull_request_page =
+        request(server.address(), "GET", "/alice/example/pulls/1", &[], &[]);
+    assert_eq!(
+        revised_pull_request_page
+            .text()
+            .matches("recorded <code>")
+            .count(),
+        2
+    );
     let search_page = request(server.address(), "GET", "/search", &[], &[]);
     assert_eq!(search_page.status, 200);
     assert!(
@@ -1142,6 +1231,10 @@ impl Fixture {
         .expect("update the text file");
         commit_all(&worktree, "<script>alert(3)</script>");
         let head = rev_parse(&worktree, "HEAD");
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["branch", "feature"]));
 
         run(Command::new("git")
             .args(["init", "-q", "--bare", "--object-format", format])
@@ -1159,7 +1252,7 @@ impl Fixture {
             .arg(&worktree)
             .args(["push", "-q"])
             .arg(&bare)
-            .arg("main"));
+            .args(["main", "feature"]));
 
         let database = instance.path().join(store::DATABASE_FILE);
         let mut store = Store::open(&database).expect("open the fixture database");

@@ -15,6 +15,7 @@ use crate::git::transport::{GitRepositories, RepositoryPathError};
 use crate::http::{PublicWebConfig, RunningWebServer, WebError};
 use crate::instance::{InstanceError, InstanceLock, prepare_database, prepare_repository_root};
 use crate::policy::PolicyError;
+use crate::pull_request::{PullRequestError, PullRequestService};
 use crate::ssh::{AuthorizedSshKeys, RunningSshServer, SshServerError};
 use crate::store::{Store, StoreError};
 
@@ -22,6 +23,7 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
     let _lock = InstanceLock::acquire(&config.instance_dir)?;
     let database = prepare_database(&config.instance_dir)?;
     let repository_root = prepare_repository_root(&config.instance_dir)?;
+    PullRequestService::new(&database, &repository_root).recover()?;
     let store = Store::open(&database)?;
     let keys = active_ssh_identities(&store)?;
     let git = GitRepositories::new_managed_authorized(&repository_root, &database)?;
@@ -213,6 +215,8 @@ pub(crate) enum ServeError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Policy(#[from] PolicyError),
+    #[error(transparent)]
+    PullRequest(#[from] PullRequestError),
     #[error(transparent)]
     Authentication(#[from] AuthError),
     #[error(transparent)]

@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}#{{ pull_request.number }} {{ pull_request.title }} · {{ owner }}/{{ repository }} · tit{% endblock %}
+{% block content %}
+  <header class="repository-header">
+    <h1><a href="/{{ owner }}/{{ repository }}">{{ owner }}/{{ repository }}</a></h1>
+    <nav aria-label="Repository">
+      <a href="/{{ owner }}/{{ repository }}">Summary</a>
+      <a href="/{{ owner }}/{{ repository }}/refs">Refs</a>
+      <a href="/{{ owner }}/{{ repository }}/issues">Issues</a>
+      <a href="/{{ owner }}/{{ repository }}/pulls">Pull requests</a>
+      <a href="/{{ owner }}/{{ repository }}/watch">Watch</a>
+    </nav>
+  </header>
+
+  <article>
+    <h2>#{{ pull_request.number }} {{ pull_request.title }}</h2>
+    <p>{{ pull_request.state }} · opened by {{ pull_request.author }} at <time>{{ pull_request.created_at }}</time> · updated <time>{{ pull_request.updated_at }}</time></p>
+    <p>Base: <code>{{ pull_request.base_ref }}</code> at <code>{{ pull_request.base_object_id }}</code></p>
+    <p>Head: <code>{{ pull_request.head_ref }}</code> at <code>{{ pull_request.head_object_id }}</code></p>
+    <p>Fetch: <code>git fetch origin refs/pull/{{ pull_request.number }}/head</code></p>
+    <div class="markdown">{{ body_html|safe }}</div>
+  </article>
+
+  <section aria-labelledby="revisions-heading">
+    <h2 id="revisions-heading">Revisions</h2>
+    <ol>
+{% for revision in revisions %}
+      <li value="{{ revision.number }}">{{ revision.author }} recorded <code>{{ revision.head_object_id }}</code> against <code>{{ revision.base_object_id }}</code> at <time>{{ revision.created_at }}</time>.</li>
+{% endfor %}
+    </ol>
+  </section>
+
+{% if can_revise %}
+  <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/revisions">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit">Record current branch heads</button>
+  </form>
+{% endif %}
+{% endblock %}

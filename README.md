@@ -376,3 +376,17 @@ tests owner and reader permission, hidden private repositories, suspended
 account access, invalid input, raw Markdown storage, and atomic issue events.
 Read the [SSH issue command architectural decision record](docs/adr/0021-ssh-issue-commands.md)
 for the input, output, authorization, and error contracts.
+
+## Milestone 5.1 gate
+
+Install stock Git. Then, run the pull-request ref gate:
+
+```text
+./scripts/check-m5-1
+```
+
+This command tests increasing pull-request numbers, SHA-1 and SHA-256 refs,
+immutable revision object IDs, concurrent opens, intent recovery before and
+after a ref change, the Web forms, and historical schema migration. Read the
+[pull-request ref architectural decision record](docs/adr/0022-pull-request-refs.md)
+for the record, ref, permission, and recovery contracts.

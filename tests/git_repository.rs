@@ -1,3 +1,4 @@
+#[allow(dead_code, reason = "the repository test exercises selected Git APIs")]
 #[path = "../src/git/repository.rs"]
 mod repository;
 
