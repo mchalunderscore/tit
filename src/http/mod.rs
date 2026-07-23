@@ -775,6 +775,7 @@ async fn complete_login(
     login_csrf: String,
 ) -> Response {
     let display_username = username.clone();
+    let challenge = normalize_browser_newlines(challenge);
     let secure = state.secure_cookies;
     let correlation_id = request_id.to_owned();
     let result = login_job(state, move |login| {
@@ -827,6 +828,14 @@ async fn complete_login(
             &display_username,
             "The signature is not valid or the challenge has expired.",
         ),
+    }
+}
+
+fn normalize_browser_newlines(value: String) -> String {
+    if value.contains("\r\n") {
+        value.replace("\r\n", "\n")
+    } else {
+        value
     }
 }
 

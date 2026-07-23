@@ -19,8 +19,10 @@ SSHSIG namespace and pastes the complete SSHSIG envelope into the Web UI.
 
 The server verifies the origin, username, key fingerprint, time, namespace,
 signature algorithm, and signature. The user can paste the envelope or upload
-the signature file. In one SQLite transaction, the server consumes the nonce
-and creates a seven-day session. The response stores an opaque session
+the signature file. An HTML form changes challenge line endings to CRLF. The
+HTTP interface changes these line endings back to LF before signature
+verification. In one SQLite transaction, the server consumes the nonce and
+creates a seven-day session. The response stores an opaque session
 token in an `HttpOnly` cookie and a CSRF token in a second cookie. Both cookies
 use `SameSite=Strict`. HTTPS responses also use `Secure`. SQLite stores only
 SHA-256 hashes of both values.
@@ -57,8 +59,9 @@ The session test signs with stock `ssh-keygen`, restarts the login service
 between issue and verification, rejects challenge replay and a bad CSRF token,
 checks the stored hashes, invalidates a session after key addition, and tests
 the function that ends all sessions. The executable test completes login and
-logout through HTTP. It rejects an incorrect upload content type and malformed
-multipart content. It also confirms CSRF rejection and session invalidation.
+logout through HTTP with browser CRLF line endings. It rejects an incorrect
+upload content type and malformed multipart content. It also confirms CSRF
+rejection and session invalidation.
 
 ## Consequences
 

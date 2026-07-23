@@ -177,6 +177,8 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         "</textarea>",
     );
     let signature = sign_challenge(instance.path(), &private_key, challenge);
+    let browser_challenge = challenge.replace('\n', "\r\n");
+    let browser_signature = signature.replace('\n', "\r\n");
     let login_csrf_cookies = response_cookies(&login_challenge);
     let login_csrf = cookie_value(&login_csrf_cookies, "tit-login-csrf");
     let rejected_login = http_form_with_headers(
@@ -185,8 +187,8 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         &[
             ("username", "alice"),
             ("public-key", public_key.trim()),
-            ("challenge", challenge),
-            ("signature", &signature),
+            ("challenge", &browser_challenge),
+            ("signature", &browser_signature),
             ("login-csrf", &"0".repeat(64)),
         ],
         &[("Cookie", &login_csrf_cookies)],
@@ -199,8 +201,8 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         &[
             ("username", "alice"),
             ("public-key", public_key.trim()),
-            ("challenge", challenge),
-            ("signature", &signature),
+            ("challenge", &browser_challenge),
+            ("signature", &browser_signature),
             ("login-csrf", login_csrf),
         ],
         &[("Cookie", &login_csrf_cookies)],
@@ -265,6 +267,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         "</textarea>",
     );
     let upload_signature = sign_challenge(instance.path(), &private_key, upload_challenge);
+    let browser_upload_challenge = upload_challenge.replace('\n', "\r\n");
     let upload_csrf_cookies = response_cookies(&upload_challenge_page);
     let upload_csrf = cookie_value(&upload_csrf_cookies, "tit-login-csrf");
     let wrong_upload_type = http_form_with_headers(
@@ -288,7 +291,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         &[
             ("username", "alice"),
             ("public-key", public_key.trim()),
-            ("challenge", upload_challenge),
+            ("challenge", &browser_upload_challenge),
             ("signature-file", &upload_signature),
             ("login-csrf", upload_csrf),
         ],
