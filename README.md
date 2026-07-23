@@ -2,7 +2,7 @@
 
 `tit` is a small, self-hosted collaborative development environment (CDE) for
 Git. The current implementation has a read-only Web UI, HTTP and SSH clone
-services, public feeds, and bounded source search.
+services, authenticated SSH push, public feeds, and bounded source search.
 
 Read [PLAN.md](PLAN.md) for the product design and implementation gates. Read
 [CONTRIBUTING.md](CONTRIBUTING.md) before you change code.
@@ -54,7 +54,10 @@ tit --config /srv/tit/config.toml admin repository collaborator-remove alice exa
 The policy permits a reader to read and a writer to write. It permits a
 maintainer to change repository settings and collaborators. Only the owner can
 change ownership. An owner or collaborator can read a private repository in the
-Web UI after login. Authenticated Git enforcement starts in Milestone 3.4.
+Web UI after login. The built-in SSH server binds the supplied key to its
+account. The SSH username does not select the account. An owner, maintainer, or
+writer can push branches and tags. A reader cannot push. HTTP Git access stays
+read-only.
 
 ## Quality gate
 
@@ -200,3 +203,16 @@ This command tests public and private visibility, each collaborator role,
 suspended accounts, archived repositories, and anonymous HTTP routes. Read the
 [repository authorization architectural decision record](docs/adr/0012-repository-authorization.md)
 for the complete access matrix.
+
+## Milestone 3.4 gate
+
+Install stock Git and OpenSSH. Then, run the authenticated Git gate:
+
+```text
+./scripts/check-m3-4
+```
+
+This command tests account-bound SSH keys, each repository role, key revocation,
+account suspension, role removal, push permission, and ref policy. Read the
+[authenticated Git architectural decision record](docs/adr/0013-authenticated-git.md)
+for the service and ref-update checks.

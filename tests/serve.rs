@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -347,7 +347,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
 }
 
 #[test]
-fn hides_a_private_repository_from_http_and_ssh_discovery() {
+fn keeps_private_git_hidden_from_http_but_allows_its_owner_over_ssh() {
     let instance = TempDir::new().expect("create an instance directory");
     let http = free_address();
     let ssh = free_address();
@@ -422,7 +422,192 @@ fn hides_a_private_repository_from_http_and_ssh_discovery() {
         .env("GIT_SSH_COMMAND", ssh_command)
         .output()
         .expect("query the private repository through SSH");
-    assert!(!ssh_discovery.status.success());
+    assert!(ssh_discovery.status.success());
+
+    let unknown_key = instance.path().join("unknown");
+    create_ssh_key_fixture(&unknown_key);
+    assert!(!ssh_clone_repository_succeeds(
+        ssh,
+        &unknown_key,
+        "alice",
+        "private",
+        &instance.path().join("unknown-clone")
+    ));
+    server.terminate();
+}
+
+#[test]
+fn enforces_account_roles_and_ref_policy_through_the_production_ssh_server() {
+    let instance = TempDir::new().expect("create an instance directory");
+    let http = free_address();
+    let ssh = free_address();
+    let config = instance.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "version = 1\npublic_url = \"http://{http}/\"\n\n[http]\nlisten = \"{http}\"\n\n[ssh]\nlisten = \"{ssh}\"\npublic_host = \"127.0.0.1\"\npublic_port = {}\n",
+            ssh.port()
+        ),
+    )
+    .expect("write the server configuration");
+    let config_text = config.to_str().expect("a UTF-8 configuration path");
+    let owner_key = instance.path().join("owner");
+    create_ssh_key_fixture(&owner_key);
+    let owner_public =
+        fs::read_to_string(owner_key.with_extension("pub")).expect("read the owner public key");
+    command(
+        instance.path(),
+        [
+            "--config",
+            config_text,
+            "setup",
+            "admin",
+            "alice",
+            owner_public.trim(),
+        ],
+    );
+
+    let source = create_source_repository(instance.path());
+    for repository in ["private", "public"] {
+        command(
+            instance.path(),
+            [
+                "--config",
+                config_text,
+                "admin",
+                "repository",
+                "import",
+                "alice",
+                repository,
+                source.to_str().expect("a UTF-8 source path"),
+            ],
+        );
+    }
+    command(
+        instance.path(),
+        [
+            "--config",
+            config_text,
+            "admin",
+            "repository",
+            "visibility",
+            "alice",
+            "private",
+            "private",
+        ],
+    );
+
+    let maintainer_key = provision_account(instance.path(), "maintainer", "active", false);
+    let writer_key = provision_account(instance.path(), "writer", "active", false);
+    let reader_key = provision_account(instance.path(), "reader", "active", false);
+    let outsider_key = provision_account(instance.path(), "outsider", "active", false);
+    let suspended_key = provision_account(instance.path(), "suspended", "active", false);
+    let revoked_key = provision_account(instance.path(), "revoked", "active", true);
+    for (username, role) in [
+        ("maintainer", "maintainer"),
+        ("writer", "writer"),
+        ("reader", "reader"),
+        ("suspended", "writer"),
+        ("revoked", "writer"),
+    ] {
+        command(
+            instance.path(),
+            [
+                "--config",
+                config_text,
+                "admin",
+                "repository",
+                "collaborator-set",
+                "alice",
+                "private",
+                username,
+                role,
+            ],
+        );
+    }
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the repository database");
+    database
+        .execute(
+            "UPDATE account SET state = 'suspended' WHERE username = 'suspended'",
+            [],
+        )
+        .expect("suspend an account fixture");
+    drop(database);
+
+    let mut server = spawn_server(&config);
+    wait_for_listener(http, &mut server);
+    wait_for_listener(ssh, &mut server);
+    for (name, key) in [
+        ("owner", &owner_key),
+        ("maintainer", &maintainer_key),
+        ("writer", &writer_key),
+        ("reader", &reader_key),
+    ] {
+        assert!(ssh_clone_repository_succeeds(
+            ssh,
+            key,
+            "alice",
+            "private",
+            &instance.path().join(format!("{name}-private"))
+        ));
+    }
+    for (name, key) in [
+        ("outsider", &outsider_key),
+        ("suspended", &suspended_key),
+        ("revoked", &revoked_key),
+    ] {
+        assert!(!ssh_clone_repository_succeeds(
+            ssh,
+            key,
+            "alice",
+            "private",
+            &instance.path().join(format!("{name}-private"))
+        ));
+    }
+    assert!(ssh_clone_repository_succeeds(
+        ssh,
+        &outsider_key,
+        "alice",
+        "public",
+        &instance.path().join("outsider-public")
+    ));
+
+    let writer_clone = instance.path().join("writer-private");
+    fs::write(writer_clone.join("writer.txt"), b"writer update\n").expect("write a writer change");
+    git_commit(&writer_clone, "writer update");
+    assert!(git_push(&writer_key, &writer_clone, &["main"]).success());
+    assert!(!git_push(&writer_key, &writer_clone, &["HEAD:refs/notes/test"]).success());
+    command(&writer_clone, ["reset", "--hard", "HEAD~1"]);
+    assert!(!git_push(&writer_key, &writer_clone, &["--force", "main"]).success());
+
+    let reader_clone = instance.path().join("reader-write-private");
+    assert!(ssh_clone_repository_succeeds(
+        ssh,
+        &reader_key,
+        "alice",
+        "private",
+        &reader_clone
+    ));
+    fs::write(reader_clone.join("reader.txt"), b"reader update\n").expect("write a reader change");
+    git_commit(&reader_clone, "reader update");
+    assert!(!git_push(&reader_key, &reader_clone, &["main"]).success());
+
+    command(&writer_clone, ["reset", "--hard", "origin/main"]);
+    fs::write(writer_clone.join("removed-role.txt"), b"removed role\n")
+        .expect("write a change before role removal");
+    git_commit(&writer_clone, "change before role removal");
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the repository database");
+    database
+        .execute(
+            "DELETE FROM repository_collaborator
+             WHERE account_id = (SELECT id FROM account WHERE username = 'writer')",
+            [],
+        )
+        .expect("remove the writer role");
+    drop(database);
+    assert!(!git_push(&writer_key, &writer_clone, &["main"]).success());
     server.terminate();
 }
 
@@ -696,6 +881,16 @@ fn between<'a>(value: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 fn ssh_clone_succeeds(address: SocketAddr, private_key: &Path, target: &Path) -> bool {
+    ssh_clone_repository_succeeds(address, private_key, "alice", "example", target)
+}
+
+fn ssh_clone_repository_succeeds(
+    address: SocketAddr,
+    private_key: &Path,
+    owner: &str,
+    repository: &str,
+    target: &Path,
+) -> bool {
     let ssh_command = format!(
         "ssh -F /dev/null -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
         private_key.display()
@@ -705,8 +900,8 @@ fn ssh_clone_succeeds(address: SocketAddr, private_key: &Path, target: &Path) ->
             "clone",
             "-q",
             &format!(
-                "ssh://ignored@127.0.0.1:{}/alice/example.git",
-                address.port()
+                "ssh://ignored@127.0.0.1:{}/{owner}/{repository}.git",
+                address.port(),
             ),
         ])
         .arg(target)
@@ -715,6 +910,91 @@ fn ssh_clone_succeeds(address: SocketAddr, private_key: &Path, target: &Path) ->
         .expect("clone through the tit SSH server")
         .status
         .success()
+}
+
+fn provision_account(
+    instance: &Path,
+    username: &str,
+    state: &str,
+    revoked: bool,
+) -> std::path::PathBuf {
+    let private_key = instance.join(username);
+    create_ssh_key_fixture(&private_key);
+    let public_key =
+        fs::read_to_string(private_key.with_extension("pub")).expect("read an account public key");
+    let mut fields = public_key.split_whitespace();
+    let canonical = format!(
+        "{} {}",
+        fields.next().expect("read the key algorithm"),
+        fields.next().expect("read the key data")
+    );
+    let fingerprint_output = Command::new("ssh-keygen")
+        .args(["-E", "sha256", "-lf"])
+        .arg(private_key.with_extension("pub"))
+        .output()
+        .expect("read an SSH key fingerprint");
+    assert!(fingerprint_output.status.success());
+    let fingerprint_text =
+        String::from_utf8(fingerprint_output.stdout).expect("read a UTF-8 SSH key fingerprint");
+    let fingerprint = fingerprint_text
+        .split_whitespace()
+        .nth(1)
+        .expect("read the SSH key fingerprint");
+    let database = rusqlite::Connection::open(instance.join("tit.sqlite3"))
+        .expect("open the repository database");
+    database
+        .execute(
+            "INSERT INTO account (username, is_administrator, state, created_at)
+             VALUES (?1, 0, ?2, 1)",
+            rusqlite::params![username, state],
+        )
+        .expect("create an account fixture");
+    let account_id = database.last_insert_rowid();
+    database
+        .execute(
+            "INSERT INTO ssh_public_key
+             (account_id, canonical_key, fingerprint, created_at, label, revoked_at)
+             VALUES (?1, ?2, ?3, 1, 'initial', ?4)",
+            rusqlite::params![account_id, canonical, fingerprint, revoked.then_some(2)],
+        )
+        .expect("create an SSH key fixture");
+    private_key
+}
+
+fn git_commit(worktree: &Path, message: &str) {
+    command(worktree, ["add", "."]);
+    let output = Command::new("git")
+        .args(["commit", "-q", "-m", message])
+        .env("GIT_AUTHOR_NAME", "Tit Test")
+        .env("GIT_AUTHOR_EMAIL", "tit@example.test")
+        .env("GIT_COMMITTER_NAME", "Tit Test")
+        .env("GIT_COMMITTER_EMAIL", "tit@example.test")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .current_dir(worktree)
+        .output()
+        .expect("commit a Git change");
+    assert!(
+        output.status.success(),
+        "Git commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_push(private_key: &Path, worktree: &Path, refspecs: &[&str]) -> ExitStatus {
+    let ssh_command = format!(
+        "ssh -F /dev/null -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+        private_key.display()
+    );
+    Command::new("git")
+        .arg("push")
+        .arg("origin")
+        .args(refspecs)
+        .env("GIT_SSH_COMMAND", ssh_command)
+        .current_dir(worktree)
+        .status()
+        .expect("push through the tit SSH server")
 }
 
 struct ChildGuard(Option<Child>);

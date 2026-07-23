@@ -6,12 +6,15 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
+use crate::policy::{RepositoryOperation, RepositoryPolicy};
+
 const MAX_BLOCKING_GIT_JOBS: usize = 4;
 
 #[derive(Clone)]
 pub(crate) struct GitRepositories {
     root: PathBuf,
     managed_public: Option<Arc<HashMap<(String, String), String>>>,
+    policy: Option<RepositoryPolicy>,
     push_database: Option<PathBuf>,
     push_jobs: std::sync::Arc<Semaphore>,
     blocking_jobs: std::sync::Arc<Semaphore>,
@@ -26,6 +29,7 @@ impl GitRepositories {
         Ok(Self {
             root,
             managed_public: None,
+            policy: None,
             push_database: None,
             push_jobs: std::sync::Arc::new(Semaphore::new(1)),
             blocking_jobs: std::sync::Arc::new(Semaphore::new(MAX_BLOCKING_GIT_JOBS)),
@@ -60,10 +64,30 @@ impl GitRepositories {
         Ok(service)
     }
 
+    pub(crate) fn new_managed_authorized(
+        root: &Path,
+        database: &Path,
+    ) -> Result<Self, RepositoryPathError> {
+        let mut service = Self::new(root)?;
+        service.push_database = Some(database.to_owned());
+        service.policy = Some(RepositoryPolicy::new(database));
+        Ok(service)
+    }
+
     pub(crate) fn resolve(
         &self,
         owner: &str,
         repository: &str,
+    ) -> Result<PathBuf, RepositoryPathError> {
+        self.resolve_for(None, owner, repository, RepositoryOperation::Read)
+    }
+
+    fn resolve_for(
+        &self,
+        actor: Option<&str>,
+        owner: &str,
+        repository: &str,
+        operation: RepositoryOperation,
     ) -> Result<PathBuf, RepositoryPathError> {
         if !valid_name(owner, 40) {
             return Err(RepositoryPathError::InvalidName);
@@ -72,20 +96,27 @@ impl GitRepositories {
         if !valid_name(repository, 100) {
             return Err(RepositoryPathError::InvalidName);
         }
-        let candidate = match &self.managed_public {
-            Some(repositories) => {
-                let id = repositories
-                    .get(&(owner.to_owned(), repository.to_owned()))
-                    .ok_or_else(|| RepositoryPathError::Repository {
-                        path: self.root.join(owner).join(repository),
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "repository is not public and active",
-                        ),
-                    })?;
-                self.root.join(format!("{id}.git"))
+        let candidate = if let Some(policy) = &self.policy {
+            let record = policy
+                .authorize(actor, owner, repository, operation)
+                .map_err(|_| RepositoryPathError::Unauthorized)?;
+            self.root.join(format!("{}.git", record.id))
+        } else {
+            match &self.managed_public {
+                Some(repositories) => {
+                    let id = repositories
+                        .get(&(owner.to_owned(), repository.to_owned()))
+                        .ok_or_else(|| RepositoryPathError::Repository {
+                            path: self.root.join(owner).join(repository),
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "repository is not public and active",
+                            ),
+                        })?;
+                    self.root.join(format!("{id}.git"))
+                }
+                None => self.root.join(owner).join(format!("{repository}.git")),
             }
-            None => self.root.join(owner).join(format!("{repository}.git")),
         };
         let candidate =
             fs::canonicalize(&candidate).map_err(|source| RepositoryPathError::Repository {
@@ -129,30 +160,48 @@ impl GitRepositories {
         &self,
         command: &[u8],
     ) -> Result<GitSshService, RepositoryPathError> {
+        self.resolve_ssh_service_for(None, command)
+    }
+
+    pub(crate) fn resolve_ssh_service_for(
+        &self,
+        actor: Option<&str>,
+        command: &[u8],
+    ) -> Result<GitSshService, RepositoryPathError> {
         if command.starts_with(b"git-upload-pack ") {
-            return self.resolve_ssh_command(command).map(GitSshService::Upload);
+            let (owner, repository) = parse_ssh_repository(command, "git-upload-pack '")?;
+            let path = self.resolve_for(actor, &owner, &repository, RepositoryOperation::Read)?;
+            return Ok(GitSshService::Upload {
+                path,
+                owner,
+                repository,
+            });
         }
-        let command =
-            std::str::from_utf8(command).map_err(|_| RepositoryPathError::InvalidCommand)?;
-        let path = command
-            .strip_prefix("git-receive-pack '")
-            .and_then(|value| value.strip_suffix('\''))
-            .ok_or(RepositoryPathError::InvalidCommand)?;
-        if path.contains('\'') {
-            return Err(RepositoryPathError::InvalidCommand);
-        }
-        let path = path.strip_prefix('/').unwrap_or(path);
-        let mut components = path.split('/');
-        let owner = components
-            .next()
-            .ok_or(RepositoryPathError::InvalidCommand)?;
-        let repository = components
-            .next()
-            .ok_or(RepositoryPathError::InvalidCommand)?;
-        if components.next().is_some() {
-            return Err(RepositoryPathError::InvalidCommand);
-        }
-        self.resolve(owner, repository).map(GitSshService::Receive)
+        let (owner, repository) = parse_ssh_repository(command, "git-receive-pack '")?;
+        let path = self.resolve_for(actor, &owner, &repository, RepositoryOperation::Write)?;
+        Ok(GitSshService::Receive {
+            path,
+            owner,
+            repository,
+        })
+    }
+
+    pub(crate) fn authorize(
+        &self,
+        actor: &str,
+        owner: &str,
+        repository: &str,
+        operation: RepositoryOperation,
+    ) -> bool {
+        self.policy.as_ref().is_none_or(|policy| {
+            policy
+                .authorize(Some(actor), owner, repository, operation)
+                .is_ok()
+        })
+    }
+
+    pub(crate) fn uses_policy(&self) -> bool {
+        self.policy.is_some()
     }
 
     pub(crate) fn push_database(&self) -> Option<&Path> {
@@ -176,8 +225,43 @@ fn valid_managed_id(value: &str) -> bool {
 }
 
 pub(crate) enum GitSshService {
-    Upload(PathBuf),
-    Receive(PathBuf),
+    Upload {
+        path: PathBuf,
+        owner: String,
+        repository: String,
+    },
+    Receive {
+        path: PathBuf,
+        owner: String,
+        repository: String,
+    },
+}
+
+fn parse_ssh_repository(
+    command: &[u8],
+    prefix: &str,
+) -> Result<(String, String), RepositoryPathError> {
+    let command = std::str::from_utf8(command).map_err(|_| RepositoryPathError::InvalidCommand)?;
+    let path = command
+        .strip_prefix(prefix)
+        .and_then(|value| value.strip_suffix('\''))
+        .ok_or(RepositoryPathError::InvalidCommand)?;
+    if path.contains('\'') {
+        return Err(RepositoryPathError::InvalidCommand);
+    }
+    let path = path.strip_prefix('/').unwrap_or(path);
+    let mut components = path.split('/');
+    let owner = components
+        .next()
+        .ok_or(RepositoryPathError::InvalidCommand)?;
+    let repository = components
+        .next()
+        .ok_or(RepositoryPathError::InvalidCommand)?;
+    if components.next().is_some() {
+        return Err(RepositoryPathError::InvalidCommand);
+    }
+    let repository = repository.strip_suffix(".git").unwrap_or(repository);
+    Ok((owner.to_owned(), repository.to_owned()))
 }
 
 fn valid_name(value: &str, maximum: usize) -> bool {
@@ -212,6 +296,8 @@ pub(crate) enum RepositoryPathError {
     OutsideRoot,
     #[error("managed repository catalog is not valid")]
     InvalidCatalog,
+    #[error("repository access is not authorized")]
+    Unauthorized,
 }
 
 #[cfg(test)]
@@ -240,7 +326,7 @@ mod tests {
             repositories
                 .resolve_ssh_service(b"git-receive-pack '/alice/example.git'")
                 .expect("resolve receive-pack"),
-            GitSshService::Receive(path) if path == fs::canonicalize(&repository).expect("canonicalize the repository")
+            GitSshService::Receive { path, .. } if path == fs::canonicalize(&repository).expect("canonicalize the repository")
         ));
         assert_eq!(
             repositories

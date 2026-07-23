@@ -4,5 +4,5 @@ set -eu
 ./scripts/check
 cargo test --locked --release --test repository_policy
 cargo test --locked --release --test public_routes browses_and_clones_public_repositories_for_both_hash_formats
-cargo test --locked --release --test serve hides_a_private_repository_from_http_and_ssh_discovery
+cargo test --locked --release --test serve keeps_private_git_hidden_from_http_but_allows_its_owner_over_ssh
 cargo test --locked --release --test cli administers_repository_visibility_and_collaborators

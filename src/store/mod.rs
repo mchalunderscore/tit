@@ -1186,6 +1186,31 @@ impl Store {
 
     #[allow(
         dead_code,
+        reason = "some integration tests compile storage without the production SSH server"
+    )]
+    pub(crate) fn active_ssh_identities(&self) -> Result<Vec<ActiveSshIdentity>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT account.username, ssh_public_key.canonical_key,
+                    ssh_public_key.fingerprint
+             FROM ssh_public_key
+             JOIN account ON account.id = ssh_public_key.account_id
+             WHERE account.state = 'active' AND ssh_public_key.revoked_at IS NULL
+             ORDER BY ssh_public_key.id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(ActiveSshIdentity {
+                    username: row.get(0)?,
+                    canonical_key: row.get(1)?,
+                    fingerprint: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    #[allow(
+        dead_code,
         reason = "some integration tests import storage without the server"
     )]
     pub(crate) fn active_public_repositories(&self) -> Result<Vec<RepositoryRecord>, StoreError> {
@@ -1398,6 +1423,16 @@ pub(crate) struct RepositoryRecord {
 pub(crate) struct RepositoryAuthorizationRecord {
     pub(crate) repository: RepositoryRecord,
     pub(crate) role: Option<String>,
+}
+
+#[allow(
+    dead_code,
+    reason = "some integration tests compile storage without the production SSH server"
+)]
+pub(crate) struct ActiveSshIdentity {
+    pub(crate) username: String,
+    pub(crate) canonical_key: String,
+    pub(crate) fingerprint: String,
 }
 
 #[allow(

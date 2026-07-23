@@ -9,6 +9,12 @@ mod auth;
 mod git;
 #[allow(
     dead_code,
+    reason = "the SSH identity test does not use repository policy"
+)]
+#[path = "../src/policy.rs"]
+mod policy;
+#[allow(
+    dead_code,
     reason = "the SSH identity test does not start a Git service"
 )]
 #[path = "../src/ssh.rs"]

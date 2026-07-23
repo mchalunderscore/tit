@@ -14,7 +14,7 @@ use crate::control::{ControlError, RunningControlServer};
 use crate::git::transport::{GitRepositories, RepositoryPathError};
 use crate::http::{PublicWebConfig, RunningWebServer, WebError};
 use crate::instance::{InstanceError, InstanceLock, prepare_database, prepare_repository_root};
-use crate::policy::{PolicyError, RepositoryPolicy};
+use crate::policy::PolicyError;
 use crate::ssh::{AuthorizedSshKeys, RunningSshServer, SshServerError};
 use crate::store::{Store, StoreError};
 
@@ -23,34 +23,22 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
     let database = prepare_database(&config.instance_dir)?;
     let repository_root = prepare_repository_root(&config.instance_dir)?;
     let store = Store::open(&database)?;
-    let keys = store
-        .active_ssh_public_keys()?
-        .into_iter()
-        .map(|key| SshPublicKey::parse(&key))
-        .collect::<Result<Vec<_>, _>>()?;
-    let policy = RepositoryPolicy::new(&database);
-    let repositories = policy
-        .public_repositories()?
-        .into_iter()
-        .map(|repository| (repository.owner, repository.slug, repository.id));
-    let git = GitRepositories::new_managed_public(&repository_root, repositories)?;
+    let keys = active_ssh_identities(&store)?;
+    let git = GitRepositories::new_managed_authorized(&repository_root, &database)?;
     drop(store);
 
     let accounts = AccountService::new(database);
     let control = RunningControlServer::start(&config.instance_dir, accounts.clone())?;
-    let authorized_keys = AuthorizedSshKeys::new(&keys);
+    let authorized_keys = AuthorizedSshKeys::for_accounts(keys);
 
     let (http_clone_base, ssh_clone_base) = clone_bases(config)?;
     let host_key = load_or_create_host_key(&config.instance_dir)?;
     let reload_keys = {
         let authorized_keys = authorized_keys.clone();
         std::sync::Arc::new(move |accounts: &AccountService| {
-            let active = Store::open(accounts.database())?
-                .active_ssh_public_keys()?
-                .into_iter()
-                .map(|key| SshPublicKey::parse(&key))
-                .collect::<Result<Vec<_>, _>>()?;
-            authorized_keys.replace(&active);
+            let store = Store::open(accounts.database())?;
+            let active = active_ssh_identities(&store)?;
+            authorized_keys.replace_accounts(active);
             Ok(())
         })
     };
@@ -87,6 +75,24 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
     web_result?;
     control_result?;
     signal.map_err(ServeError::Signal)
+}
+
+fn active_ssh_identities(store: &Store) -> Result<Vec<(String, SshPublicKey)>, StoreError> {
+    store
+        .active_ssh_identities()?
+        .into_iter()
+        .map(|identity| {
+            let key = SshPublicKey::parse(&identity.canonical_key)
+                .map_err(|error| StoreError::Integrity(error.to_string()))?;
+            if key.fingerprint() != identity.fingerprint {
+                return Err(StoreError::Integrity(format!(
+                    "SSH key fingerprint does not match for account {}",
+                    identity.username
+                )));
+            }
+            Ok((identity.username, key))
+        })
+        .collect()
 }
 
 const HOST_KEY_FILE: &str = "ssh_host_ed25519_key";

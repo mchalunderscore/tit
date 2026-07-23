@@ -33,10 +33,9 @@ repository metadata or Git objects. An owner or collaborator can use the Web
 UI to read a private repository. Private raw responses and feeds use a private
 no-store cache policy.
 
-The SSH repository catalog also comes from the policy. Thus, an anonymous HTTP
-request and an anonymous SSH Git request use the same read rule. Milestone 3.4
-will supply the authenticated SSH actor and operation to this service before it
-starts a Git service.
+The SSH repository catalog also comes from the policy. Thus, an HTTP request
+and an SSH Git request use the same read rule. Authenticated SSH Git supplies
+the account and operation to this service before it starts a Git service.
 
 Offline administrator commands set visibility, set a collaborator role, and
 remove a collaborator. The instance lock requires the administrator to stop
@@ -67,5 +66,5 @@ Git discovery routes.
 ## Consequences
 
 Role and visibility changes take effect on the next policy query. The policy
-does not cache authorization state. Authenticated Git and ref policy stay in
-Milestone 3.4.
+does not cache authorization state. Architectural decision record 0013 applies
+this policy to authenticated Git and ref updates.

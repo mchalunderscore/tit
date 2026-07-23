@@ -20,6 +20,7 @@ use crate::git::packetline::{MAX_REQUEST_BYTES, Packet, decode, encode_data, fir
 use crate::git::receive_pack::{ReceivePack, ReceivePackError};
 use crate::git::transport::{GitRepositories, GitSshService};
 use crate::git::upload_pack::{ProtocolVersion, UploadPack, UploadPackError};
+use crate::policy::RepositoryOperation;
 
 const VERSION_COMMAND: &[u8] = b"tit --version";
 const GIT_PROTOCOL_VARIABLE: &str = "GIT_PROTOCOL";
@@ -34,7 +35,13 @@ pub(crate) struct RunningSshServer {
 
 #[derive(Clone)]
 pub(crate) struct AuthorizedSshKeys {
-    keys: Arc<RwLock<HashMap<PublicKey, String>>>,
+    keys: Arc<RwLock<HashMap<PublicKey, SshIdentity>>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SshIdentity {
+    username: String,
+    fingerprint: String,
 }
 
 impl AuthorizedSshKeys {
@@ -44,13 +51,19 @@ impl AuthorizedSshKeys {
         }
     }
 
-    pub(crate) fn replace(&self, keys: &[SshPublicKey]) {
-        if let Ok(mut current) = self.keys.write() {
-            *current = key_map(keys);
+    pub(crate) fn for_accounts(keys: Vec<(String, SshPublicKey)>) -> Self {
+        Self {
+            keys: Arc::new(RwLock::new(account_key_map(keys))),
         }
     }
 
-    fn actor(&self, key: &PublicKey) -> Option<String> {
+    pub(crate) fn replace_accounts(&self, keys: Vec<(String, SshPublicKey)>) {
+        if let Ok(mut current) = self.keys.write() {
+            *current = account_key_map(keys);
+        }
+    }
+
+    fn identity(&self, key: &PublicKey) -> Option<SshIdentity> {
         self.keys.read().ok()?.get(key).cloned()
     }
 
@@ -59,9 +72,32 @@ impl AuthorizedSshKeys {
     }
 }
 
-fn key_map(keys: &[SshPublicKey]) -> HashMap<PublicKey, String> {
+fn key_map(keys: &[SshPublicKey]) -> HashMap<PublicKey, SshIdentity> {
     keys.iter()
-        .map(|key| (key.public_key().clone(), key.fingerprint().to_owned()))
+        .map(|key| {
+            let fingerprint = key.fingerprint().to_owned();
+            (
+                key.public_key().clone(),
+                SshIdentity {
+                    username: fingerprint.clone(),
+                    fingerprint,
+                },
+            )
+        })
+        .collect()
+}
+
+fn account_key_map(keys: Vec<(String, SshPublicKey)>) -> HashMap<PublicKey, SshIdentity> {
+    keys.into_iter()
+        .map(|(username, key)| {
+            (
+                key.public_key().clone(),
+                SshIdentity {
+                    username,
+                    fingerprint: key.fingerprint().to_owned(),
+                },
+            )
+        })
         .collect()
 }
 
@@ -98,6 +134,7 @@ impl RunningSshServer {
         repositories: GitRepositories,
         host_key: PrivateKey,
     ) -> Result<Self, SshServerError> {
+        recover_pushes(&repositories).await?;
         Self::start_inner_with_keys(address, authorized_keys, &[], Some(repositories), host_key)
             .await
     }
@@ -108,16 +145,7 @@ impl RunningSshServer {
         writable_keys: &[SshPublicKey],
         repositories: GitRepositories,
     ) -> Result<Self, SshServerError> {
-        let database = repositories
-            .push_database()
-            .ok_or_else(|| SshServerError::Recovery("push storage is not configured".to_owned()))?
-            .to_owned();
-        tokio::task::spawn_blocking(move || {
-            crate::git::receive_pack::recover_incomplete_pushes(&database)
-        })
-        .await
-        .map_err(|_| SshServerError::Join)?
-        .map_err(|error| SshServerError::Recovery(error.to_string()))?;
+        recover_pushes(&repositories).await?;
         let host_key = PrivateKey::random(&mut rng(), Algorithm::Ed25519)?;
         Self::start_inner(
             address,
@@ -220,6 +248,19 @@ impl RunningSshServer {
     }
 }
 
+async fn recover_pushes(repositories: &GitRepositories) -> Result<(), SshServerError> {
+    let database = repositories
+        .push_database()
+        .ok_or_else(|| SshServerError::Recovery("push storage is not configured".to_owned()))?
+        .to_owned();
+    tokio::task::spawn_blocking(move || {
+        crate::git::receive_pack::recover_incomplete_pushes(&database)
+    })
+    .await
+    .map_err(|_| SshServerError::Join)?
+    .map_err(|error| SshServerError::Recovery(error.to_string()))
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum SshServerError {
     #[error("SSH listener error: {0}")]
@@ -253,7 +294,8 @@ impl Server for SshServer {
             repositories: self.repositories.clone(),
             protocol: ProtocolVersion::V0,
             git_channels: HashMap::new(),
-            authenticated_actor: None,
+            authenticated_identity: None,
+            authenticated_key: None,
             authenticated_writer: false,
         }
     }
@@ -266,7 +308,8 @@ struct SshSession {
     repositories: Option<Arc<GitRepositories>>,
     protocol: ProtocolVersion,
     git_channels: HashMap<ChannelId, GitChannel>,
-    authenticated_actor: Option<String>,
+    authenticated_identity: Option<SshIdentity>,
+    authenticated_key: Option<PublicKey>,
     authenticated_writer: bool,
 }
 
@@ -282,6 +325,11 @@ struct UploadChannel {
 
 struct ReceiveChannel {
     service: ReceivePack,
+    owner: String,
+    repository: String,
+    identity: SshIdentity,
+    public_key: PublicKey,
+    authorized_keys: AuthorizedSshKeys,
     commands: Vec<u8>,
     commands_complete: bool,
     pack: tokio::fs::File,
@@ -304,8 +352,9 @@ impl Handler for SshSession {
         _user: &str,
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        if let Some(actor) = self.authorized_keys.actor(public_key) {
-            self.authenticated_actor = Some(actor);
+        if let Some(identity) = self.authorized_keys.identity(public_key) {
+            self.authenticated_identity = Some(identity);
+            self.authenticated_key = Some(public_key.clone());
             self.authenticated_writer = self.writable_keys.contains(public_key);
             Ok(Auth::Accept)
         } else {
@@ -459,10 +508,15 @@ impl Handler for SshSession {
                             })),
                         );
                     }
-                    InitialGitService::Receive {
-                        service,
-                        advertisement,
-                    } => {
+                    InitialGitService::Receive(receive) => {
+                        let InitialReceiveService {
+                            service,
+                            advertisement,
+                            owner,
+                            repository,
+                            identity,
+                            public_key,
+                        } = *receive;
                         session.data(channel, advertisement)?;
                         let pack = tokio::fs::File::create(service.incoming_pack()).await;
                         match pack {
@@ -470,7 +524,12 @@ impl Handler for SshSession {
                                 self.git_channels.insert(
                                     channel,
                                     GitChannel::Receive(Box::new(ReceiveChannel {
-                                        service,
+                                        service: *service,
+                                        owner,
+                                        repository,
+                                        identity,
+                                        public_key,
+                                        authorized_keys: self.authorized_keys.clone(),
                                         commands: Vec::new(),
                                         commands_complete: false,
                                         pack,
@@ -666,9 +725,12 @@ impl SshSession {
 
     async fn open_git_service(&mut self, command: &[u8]) -> Option<InitialGitService> {
         let repositories = self.repositories.as_ref()?;
-        let service = repositories.resolve_ssh_service(command).ok()?;
+        let identity = self.active_identity()?;
+        let service = repositories
+            .resolve_ssh_service_for(Some(&identity.username), command)
+            .ok()?;
         match service {
-            GitSshService::Upload(path) => {
+            GitSshService::Upload { path, .. } => {
                 let permit = repositories.blocking_permit().await.ok()?;
                 let protocol = self.protocol;
                 tokio::task::spawn_blocking(move || {
@@ -684,27 +746,45 @@ impl SshSession {
                 .ok()?
                 .ok()
             }
-            GitSshService::Receive(path) => {
-                if !self.authenticated_writer {
+            GitSshService::Receive {
+                path,
+                owner,
+                repository,
+            } => {
+                if !repositories.uses_policy() && !self.authenticated_writer {
                     return None;
                 }
                 let database = repositories.push_database()?.to_owned();
-                let actor = self.authenticated_actor.clone()?;
+                let actor = identity.username.clone();
+                let public_key = self.authenticated_key.clone()?;
                 let permit = repositories.blocking_permit().await.ok()?;
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     let service = ReceivePack::open(&path, &database, actor)?;
                     let advertisement = service.advertisement()?;
-                    Ok::<_, ReceivePackError>(InitialGitService::Receive {
-                        service,
-                        advertisement,
-                    })
+                    Ok::<_, ReceivePackError>(InitialGitService::Receive(Box::new(
+                        InitialReceiveService {
+                            service: Box::new(service),
+                            advertisement,
+                            owner,
+                            repository,
+                            identity,
+                            public_key,
+                        },
+                    )))
                 })
                 .await
                 .ok()?
                 .ok()
             }
         }
+    }
+
+    fn active_identity(&self) -> Option<SshIdentity> {
+        let public_key = self.authenticated_key.as_ref()?;
+        let authenticated = self.authenticated_identity.as_ref()?;
+        let current = self.authorized_keys.identity(public_key)?;
+        (current == *authenticated).then_some(current)
     }
 }
 
@@ -713,10 +793,16 @@ enum InitialGitService {
         service: Box<UploadPack>,
         advertisement: Vec<u8>,
     },
-    Receive {
-        service: ReceivePack,
-        advertisement: Vec<u8>,
-    },
+    Receive(Box<InitialReceiveService>),
+}
+
+struct InitialReceiveService {
+    service: Box<ReceivePack>,
+    advertisement: Vec<u8>,
+    owner: String,
+    repository: String,
+    identity: SshIdentity,
+    public_key: PublicKey,
 }
 
 async fn receive_data(git: &mut ReceiveChannel, data: &[u8]) -> Result<(), ()> {
@@ -751,6 +837,11 @@ async fn finish_receive(
 ) -> ReceiveResult {
     let ReceiveChannel {
         mut service,
+        owner,
+        repository,
+        identity,
+        public_key,
+        authorized_keys,
         commands,
         mut pack,
         ..
@@ -764,16 +855,27 @@ async fn finish_receive(
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _push_permit = push_permit;
-        match service.finish(&commands) {
+        if authorized_keys.identity(&public_key).as_ref() != Some(&identity)
+            || !repositories.authorize(
+                &identity.username,
+                &owner,
+                &repository,
+                RepositoryOperation::Write,
+            )
+        {
+            return None;
+        }
+        Some(match service.finish(&commands) {
             Ok(response) => Ok(response),
             Err(error) => {
                 let response = service.rejection_response(&commands, &error);
                 Err((error, response))
             }
-        }
+        })
     })
     .await
     .ok()
+    .flatten()
 }
 
 fn send_receive_result(

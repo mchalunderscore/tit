@@ -10,6 +10,9 @@ mod auth;
 )]
 #[path = "../src/git/mod.rs"]
 mod git;
+#[allow(dead_code, reason = "the SSH Git test does not use repository policy")]
+#[path = "../src/policy.rs"]
+mod policy;
 #[allow(
     dead_code,
     reason = "the SSH Git test does not inspect the request audit"

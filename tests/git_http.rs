@@ -6,12 +6,18 @@ mod http;
 )]
 #[path = "../src/git/packetline.rs"]
 mod packetline;
+#[allow(dead_code, reason = "the HTTP test does not use repository policy")]
+#[path = "../src/policy.rs"]
+mod policy;
 #[allow(
     dead_code,
     reason = "the HTTP test does not inspect repository internals"
 )]
 #[path = "../src/git/repository.rs"]
 mod repository;
+#[allow(dead_code, reason = "the HTTP test does not use the intent store")]
+#[path = "../src/store/mod.rs"]
+mod store;
 #[allow(
     dead_code,
     reason = "the HTTP test uses transport resolution through HTTP"

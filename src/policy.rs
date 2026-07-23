@@ -32,6 +32,10 @@ impl RepositoryPolicy {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "policy tests verify anonymous catalog behavior independently"
+    )]
     pub(crate) fn public_repositories(&self) -> Result<Vec<RepositoryRecord>, PolicyError> {
         Store::open(&self.database)?
             .active_repositories()?
