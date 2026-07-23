@@ -12,7 +12,7 @@
 {% else %}
   <ol class="issue-list">
 {% for pull_request in pull_requests %}
-    <li><a href="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}">#{{ pull_request.number }} {{ pull_request.title }}</a> — {{ pull_request.state }}, opened by {{ pull_request.author }}, updated <time>{{ pull_request.updated_at }}</time></li>
+    <li><a href="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}">#{{ pull_request.number }} {{ pull_request.title }}</a> — {{ pull_request.state }}, opened by {{ pull_request.author }}, updated <time datetime="{{ pull_request.updated_at }}">{{ pull_request.updated_at|human_time }}</time></li>
 {% endfor %}
   </ol>
 {% endif %}
@@ -32,12 +32,17 @@
       </div>
       <div class="field">
         <label for="pull-request-base">Base branch</label>
-        <input id="pull-request-base" name="base-ref" maxlength="1024" value="refs/heads/main" required>
+        <input id="pull-request-base" name="base-ref" list="repository-branches" maxlength="1024" value="refs/heads/main" required>
       </div>
       <div class="field">
         <label for="pull-request-head">Head branch</label>
-        <input id="pull-request-head" name="head-ref" maxlength="1024" placeholder="refs/heads/feature" required>
+        <input id="pull-request-head" name="head-ref" list="repository-branches" maxlength="1024" placeholder="refs/heads/feature" required>
       </div>
+      <datalist id="repository-branches">
+{% for branch in branches %}
+        <option value="{{ branch }}"></option>
+{% endfor %}
+      </datalist>
       <button type="submit">Open pull request</button>
     </form>
   </section>

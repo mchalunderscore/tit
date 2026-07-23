@@ -16,7 +16,7 @@
     <dl>
       <dt>HTTP</dt><dd><code>{{ http_clone_url }}</code></dd>
       <dt>SSH</dt><dd><code>{{ ssh_clone_url }}</code></dd>
-      <dt>Created</dt><dd><time>{{ created_at }}</time></dd>
+      <dt>Created</dt><dd><time datetime="{{ created_at }}">{{ created_at|human_time }}</time></dd>
     </dl>
   </section>
 {% if has_head %}
@@ -24,7 +24,7 @@
     <h2 id="history-heading">Recent commits</h2>
     <ol class="commit-list">
 {% for item in history %}
-      <li><a href="/{{ owner }}/{{ repository }}/commit/{{ item.id }}"><code>{{ item.id }}</code></a> {{ item.summary }} — {{ item.author_name }}</li>
+      <li><a href="/{{ owner }}/{{ repository }}/commit/{{ item.id }}" aria-label="Commit {{ item.id }}"><code title="{{ item.id }}">{{ item.id|short_id }}</code></a> {{ item.summary }} — {{ item.author_name }}</li>
 {% endfor %}
     </ol>
     <p><a href="/{{ owner }}/{{ repository }}/commits">View all commits</a></p>
@@ -49,9 +49,19 @@
 {% if has_head %}
   <ol class="commit-list">
 {% for item in history %}
-    <li><a href="/{{ owner }}/{{ repository }}/commit/{{ item.id }}"><code>{{ item.id }}</code></a> {{ item.summary }} — {{ item.author_name }}</li>
+    <li><a href="/{{ owner }}/{{ repository }}/commit/{{ item.id }}" aria-label="Commit {{ item.id }}"><code title="{{ item.id }}">{{ item.id|short_id }}</code></a> {{ item.summary }} — {{ item.author_name }}</li>
 {% endfor %}
   </ol>
+{% if has_previous_page || has_next_page %}
+  <nav class="pagination" aria-label="Commit pages">
+{% if has_previous_page %}
+    <a href="/{{ owner }}/{{ repository }}/commits?page={{ previous_page }}">Newer commits</a>
+{% endif %}
+{% if has_next_page %}
+    <a href="/{{ owner }}/{{ repository }}/commits?page={{ next_page }}">Older commits</a>
+{% endif %}
+  </nav>
+{% endif %}
 {% else %}
   <p>This repository has no commits.</p>
 {% endif %}
@@ -59,34 +69,34 @@
 
 {% if page_kind == "refs" %}
   <h2>Refs</h2>
-  <table>
+  <div class="table-scroll"><table>
     <thead><tr><th scope="col">Name</th><th scope="col">Target</th><th scope="col">Details</th></tr></thead>
     <tbody>
 {% for item in refs %}
       <tr>
         <th scope="row">{{ item.name }}</th>
-        <td><a href="/{{ owner }}/{{ repository }}/commit/{{ item.href }}"><code>{{ item.target }}</code></a></td>
-        <td>{% if item.symbolic != "" %}→ {{ item.symbolic }}{% endif %}{% if item.peeled != "" %}peeled <code>{{ item.peeled }}</code>{% endif %}</td>
+        <td><a href="/{{ owner }}/{{ repository }}/commit/{{ item.href }}" aria-label="Commit {{ item.target }}"><code title="{{ item.target }}">{{ item.target|short_id }}</code></a></td>
+        <td>{% if item.symbolic != "" %}→ {{ item.symbolic }}{% endif %}{% if item.peeled != "" %}peeled <code title="{{ item.peeled }}">{{ item.peeled|short_id }}</code>{% endif %}</td>
       </tr>
 {% endfor %}
     </tbody>
-  </table>
+  </table></div>
 {% endif %}
 
 {% if page_kind == "tree" %}
   <h2>Tree{% if path != "" %}: {{ path }}{% endif %}</h2>
-  <table>
+  <div class="table-scroll"><table>
     <thead><tr><th scope="col">Mode</th><th scope="col">Type</th><th scope="col">Name</th><th scope="col">Object</th></tr></thead>
     <tbody>
 {% for item in entries %}
       <tr>
         <td><code>{{ item.mode }}</code></td><td>{{ item.kind }}</td>
         <th scope="row"><a href="/{{ owner }}/{{ repository }}/{{ item.href }}">{{ item.name }}</a></th>
-        <td><code>{{ item.id }}</code></td>
+        <td><code title="{{ item.id }}">{{ item.id|short_id }}</code></td>
       </tr>
 {% endfor %}
     </tbody>
-  </table>
+  </table></div>
 {% endif %}
 
 {% if page_kind == "blob" %}
@@ -101,13 +111,13 @@
 
 {% if page_kind == "commit" %}
   <article>
-    <h2>Commit <code>{{ commit.id }}</code></h2>
+    <h2>Commit <code title="{{ commit.id }}">{{ commit.id|short_id }}</code></h2>
     <dl>
       <dt>Author</dt><dd>{{ commit.author_name }} &lt;{{ commit.author_email }}&gt;</dd>
-      <dt>Committed</dt><dd><time>{{ commit.committed_at }}</time></dd>
-      <dt>Tree</dt><dd><a href="/{{ owner }}/{{ repository }}/tree/{{ commit.id }}"><code>{{ commit.tree }}</code></a></dd>
+      <dt>Committed</dt><dd><time datetime="{{ commit.committed_at }}">{{ commit.committed_at|human_time }}</time></dd>
+      <dt>Tree</dt><dd><a href="/{{ owner }}/{{ repository }}/tree/{{ commit.id }}"><code title="{{ commit.tree }}">{{ commit.tree|short_id }}</code></a></dd>
 {% for parent in commit.parents %}
-      <dt>Parent</dt><dd><a href="/{{ owner }}/{{ repository }}/commit/{{ parent }}"><code>{{ parent }}</code></a> · <a href="/{{ owner }}/{{ repository }}/diff/{{ parent }}/{{ commit.id }}">Diff</a></dd>
+      <dt>Parent</dt><dd><a href="/{{ owner }}/{{ repository }}/commit/{{ parent }}"><code title="{{ parent }}">{{ parent|short_id }}</code></a> · <a href="/{{ owner }}/{{ repository }}/diff/{{ parent }}/{{ commit.id }}">Diff</a></dd>
 {% endfor %}
     </dl>
     <pre>{{ commit.message }}</pre>
@@ -116,11 +126,11 @@
 
 {% if page_kind == "diff" %}
   <h2>Diff</h2>
-  <p><code>{{ secondary_id }}</code> → <code>{{ commit_id }}</code></p>
+  <p><code title="{{ secondary_id }}">{{ secondary_id|short_id }}</code> → <code title="{{ commit_id }}">{{ commit_id|short_id }}</code></p>
 {% for file in diffs %}
   <section>
     <h3>{{ file.path }}</h3>
-    <p>Mode <code>{{ file.old_mode }}</code> → <code>{{ file.new_mode }}</code>; object <code>{{ file.old_id }}</code> → <code>{{ file.new_id }}</code></p>
+    <p>Mode <code>{{ file.old_mode }}</code> → <code>{{ file.new_mode }}</code>; object <code title="{{ file.old_id }}">{{ file.old_id|short_id }}</code> → <code title="{{ file.new_id }}">{{ file.new_id|short_id }}</code></p>
 {% if file.binary %}
     <p>Binary content changed.</p>
 {% else %}
@@ -138,7 +148,7 @@
 {% else %}
   <ol class="blame-list">
 {% for item in blame %}
-    <li value="{{ item.start_line }}"><a href="/{{ owner }}/{{ repository }}/commit/{{ item.commit_id }}"><code>{{ item.commit_id }}</code></a> lines {{ item.source_start_line }}–{{ item.end_line }}{% if item.source_path != "" %} from {{ item.source_path }}{% endif %}<pre>{{ item.content }}</pre></li>
+    <li value="{{ item.start_line }}"><a href="/{{ owner }}/{{ repository }}/commit/{{ item.commit_id }}"><code title="{{ item.commit_id }}">{{ item.commit_id|short_id }}</code></a> current lines {{ item.start_line }}–{{ item.current_end_line }}; source lines {{ item.source_start_line }}–{{ item.source_end_line }}{% if item.source_path != "" %} from {{ item.source_path }}{% endif %}<pre>{{ item.content }}</pre></li>
 {% endfor %}
   </ol>
 {% endif %}

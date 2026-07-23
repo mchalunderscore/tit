@@ -246,6 +246,12 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     assert!(!signed_in_home.contains("<a href=\"/signup\">Create account</a>"));
     assert!(!signed_in_home.contains("<a href=\"/recover\">Recover account</a>"));
     assert!(!signed_in_home.contains("<a href=\"/login\">Log in</a>"));
+    let signed_in_missing =
+        http_get_with_headers(http, "/this-page-does-not-exist", &[("Cookie", &cookies)]);
+    assert!(signed_in_missing.starts_with("HTTP/1.1 404"));
+    assert!(signed_in_missing.contains("<a href=\"/account\">Account</a>"));
+    assert!(signed_in_missing.contains("<a href=\"/logout\">Log out</a>"));
+    assert!(!signed_in_missing.contains("<a href=\"/login\">Log in</a>"));
     let csrf = cookie_value(&cookies, "tit-csrf");
     let logout_page = http_get_with_headers(http, "/logout", &[("Cookie", &cookies)]);
     assert!(logout_page.starts_with("HTTP/1.1 200"));
@@ -278,8 +284,24 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         &[("Cookie", &cookies)],
     );
     assert!(rejected_logout.starts_with("HTTP/1.1 403"));
-    let logout =
-        http_form_with_headers(http, "/logout", &[("csrf", csrf)], &[("Cookie", &cookies)]);
+    let cancelled_logout = http_form_with_headers(
+        http,
+        "/logout",
+        &[("csrf", csrf), ("confirm", "no")],
+        &[("Cookie", &cookies)],
+    );
+    assert!(cancelled_logout.starts_with("HTTP/1.1 303"));
+    assert_eq!(response_header(&cancelled_logout, "location"), "/account");
+    assert!(
+        http_get_with_headers(http, "/account", &[("Cookie", &cookies)])
+            .starts_with("HTTP/1.1 200")
+    );
+    let logout = http_form_with_headers(
+        http,
+        "/logout",
+        &[("csrf", csrf), ("confirm", "yes")],
+        &[("Cookie", &cookies)],
+    );
     assert!(logout.starts_with("HTTP/1.1 303"));
     let ended = http_get_with_headers(http, "/account", &[("Cookie", &cookies)]);
     assert!(ended.starts_with("HTTP/1.1 303"));

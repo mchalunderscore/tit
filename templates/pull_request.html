@@ -8,9 +8,9 @@
 
   <article>
     <h2>#{{ pull_request.number }} {{ pull_request.title }}</h2>
-    <p>{{ pull_request.state }} · opened by {{ pull_request.author }} at <time>{{ pull_request.created_at }}</time> · updated <time>{{ pull_request.updated_at }}</time></p>
-    <p>Base: <code>{{ pull_request.base_ref }}</code> at <code>{{ pull_request.base_object_id }}</code></p>
-    <p>Head: <code>{{ pull_request.head_ref }}</code> at <code>{{ pull_request.head_object_id }}</code></p>
+    <p>{{ pull_request.state }} · opened by {{ pull_request.author }} at <time datetime="{{ pull_request.created_at }}">{{ pull_request.created_at|human_time }}</time> · updated <time datetime="{{ pull_request.updated_at }}">{{ pull_request.updated_at|human_time }}</time></p>
+    <p>Base: <code>{{ pull_request.base_ref }}</code> at <code title="{{ pull_request.base_object_id }}">{{ pull_request.base_object_id|short_id }}</code></p>
+    <p>Head: <code>{{ pull_request.head_ref }}</code> at <code title="{{ pull_request.head_object_id }}">{{ pull_request.head_object_id|short_id }}</code></p>
     <p>Fetch: <code>git fetch origin refs/pull/{{ pull_request.number }}/head</code></p>
     <div class="markdown">{{ body_html|safe }}</div>
   </article>
@@ -20,7 +20,7 @@
     <ol>
 {% for revision in revisions %}
       <li value="{{ revision.number }}">
-        {{ revision.author }} recorded <code>{{ revision.head_object_id }}</code> against <code>{{ revision.base_object_id }}</code> at <time>{{ revision.created_at }}</time>.
+        {{ revision.author }} recorded <code title="{{ revision.head_object_id }}">{{ revision.head_object_id|short_id }}</code> against <code title="{{ revision.base_object_id }}">{{ revision.base_object_id|short_id }}</code> at <time datetime="{{ revision.created_at }}">{{ revision.created_at|human_time }}</time>.
 {% if revision.number == selected_revision %}
         <strong>Selected</strong>
 {% else %}
@@ -37,11 +37,11 @@
     <p>This pull request has no review activity.</p>
 {% else %}
 {% for review in reviews %}
-    <article id="review-{{ review.id }}">
-      <h3>{{ review.author }}: {{ review.kind }} at <time>{{ review.created_at }}</time></h3>
+    <article class="comment-card" id="review-{{ review.id }}">
+      <h3>{{ review.author }}: {{ review.kind|event_name }} at <time datetime="{{ review.created_at }}">{{ review.created_at|human_time }}</time></h3>
       <p>Revision {{ review.revision }}
 {% if review.kind == "line-comment" %}
-        · <code>{{ review.commit_object_id }}</code> · <code>{{ review.path }}</code> · {{ review.side }} line {{ review.line }}
+        · <code title="{{ review.commit_object_id }}">{{ review.commit_object_id|short_id }}</code> · <code>{{ review.path }}</code> · {{ review.side }} line {{ review.line }}
 {% if review.outdated %}
         · <strong>Outdated</strong>
 {% endif %}
@@ -59,14 +59,14 @@
     <h2 id="timeline-heading">Timeline</h2>
     <ol>
 {% for event in timeline %}
-      <li value="{{ event.sequence }}">{{ event.actor }}: {{ event.kind }} at <time>{{ event.created_at }}</time></li>
+      <li value="{{ event.sequence }}">{{ event.actor }} {{ event.kind|event_name }} at <time datetime="{{ event.created_at }}">{{ event.created_at|human_time }}</time></li>
 {% endfor %}
     </ol>
   </section>
 
   <section aria-labelledby="comparison-heading">
     <h2 id="comparison-heading">Comparison for revision {{ selected_revision }}</h2>
-    <p>Merge base: <code>{{ comparison.merge_base }}</code></p>
+    <p>Merge base: <code title="{{ comparison.merge_base }}">{{ comparison.merge_base|short_id }}</code></p>
     <p>Mergeability: {{ comparison.mergeability }}</p>
 
     <h3>Commits</h3>
@@ -75,7 +75,7 @@
 {% else %}
     <ol>
 {% for commit in comparison.commits %}
-      <li><code>{{ commit.id }}</code> <span class="preserve-whitespace">{{ commit.message }}</span></li>
+      <li><code title="{{ commit.id }}">{{ commit.id|short_id }}</code> <span class="preserve-whitespace">{{ commit.message }}</span></li>
 {% endfor %}
     </ol>
 {% endif %}
@@ -119,6 +119,7 @@
         <div class="field">
           <label for="review-line-{{ file.path_hex }}">Line</label>
           <input id="review-line-{{ file.path_hex }}" name="line" type="number" min="1" required>
+          <p class="field-help">Enter a line number from the selected side in the diff above.</p>
         </div>
         <div class="field">
           <label for="review-body-{{ file.path_hex }}">Line comment (Markdown)</label>
@@ -139,6 +140,11 @@
     <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/merge">
       <input type="hidden" name="csrf" value="{{ csrf }}">
       <input type="hidden" name="method" value="fast-forward">
+      <fieldset class="confirmation">
+        <legend>Merge this pull request?</legend>
+        <label><input type="radio" name="confirm" value="no" checked> No</label>
+        <label><input type="radio" name="confirm" value="yes"> Yes</label>
+      </fieldset>
       <button type="submit">Fast-forward {{ pull_request.base_ref }}</button>
     </form>
   </section>
@@ -148,6 +154,11 @@
     <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/merge">
       <input type="hidden" name="csrf" value="{{ csrf }}">
       <input type="hidden" name="method" value="merge-commit">
+      <fieldset class="confirmation">
+        <legend>Merge this pull request?</legend>
+        <label><input type="radio" name="confirm" value="no" checked> No</label>
+        <label><input type="radio" name="confirm" value="yes"> Yes</label>
+      </fieldset>
       <button type="submit">Create a merge commit on {{ pull_request.base_ref }}</button>
     </form>
   </section>

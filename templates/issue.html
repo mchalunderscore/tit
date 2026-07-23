@@ -8,7 +8,7 @@
 
   <article>
     <h2>#{{ number }} {{ title }}</h2>
-    <p>{{ state }} · opened by {{ author }} at <time>{{ created_at }}</time> · updated <time>{{ updated_at }}</time></p>
+    <p>{{ state }} · opened by {{ author }} at <time datetime="{{ created_at }}">{{ created_at|human_time }}</time> · updated <time datetime="{{ updated_at }}">{{ updated_at|human_time }}</time></p>
 {% if labels.is_empty() %}{% else %}
     <p>Labels:{% for label in labels %} <span>{{ label }}</span>{% endfor %}</p>
 {% endif %}
@@ -24,8 +24,8 @@
     <p>This issue has no comments.</p>
 {% else %}
 {% for comment in comments %}
-    <article id="comment-{{ comment.id }}">
-      <h3>{{ comment.author }} commented at <time>{{ comment.created_at }}</time></h3>
+    <article class="comment-card" id="comment-{{ comment.id }}">
+      <h3>{{ comment.author }} commented at <time datetime="{{ comment.created_at }}">{{ comment.created_at|human_time }}</time></h3>
       <div class="markdown">{{ comment.body_html|safe }}</div>
     </article>
 {% endfor %}
@@ -36,7 +36,7 @@
     <h2 id="timeline-heading">Timeline</h2>
     <ol>
 {% for event in timeline %}
-      <li value="{{ event.sequence }}">{{ event.actor }}: {{ event.kind }} at <time>{{ event.created_at }}</time></li>
+      <li value="{{ event.sequence }}">{{ event.actor }} {{ event.kind|event_name }} at <time datetime="{{ event.created_at }}">{{ event.created_at|human_time }}</time></li>
 {% endfor %}
     </ol>
   </section>

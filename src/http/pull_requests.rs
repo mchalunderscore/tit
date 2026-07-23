@@ -11,6 +11,7 @@ use crate::markdown::{self, RenderedMarkdown};
 use crate::pull_request::PullRequestError;
 use crate::store::StoreError;
 
+use super::filters;
 use super::{
     CSRF_COOKIE, RequestActor, RequestId, WebState, authenticate_mutation, cookie,
     parse_named_form, render, render_error,
@@ -56,13 +57,22 @@ async fn pull_request_list(
     let owner = path.owner.clone();
     let repository = path.repository.clone();
     let signed_in = actor.0.is_some();
-    let result = job(state, move || {
-        service.list(&owner, &repository, actor.0.as_deref())
+    let actor_name = actor.0;
+    let actor_for_list = actor_name.clone();
+    let result = job(state.clone(), move || {
+        service.list(&owner, &repository, actor_for_list.as_deref())
     })
     .await;
     match result {
         Ok((record, pull_requests, can_create)) => {
             let csrf = cookie(&headers, CSRF_COOKIE).unwrap_or_default();
+            let branches = match state.public.as_ref() {
+                Some(public) => public
+                    .branch_names(actor_name, record.owner.clone(), record.slug.clone())
+                    .await
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
             render(
                 StatusCode::OK,
                 &PullRequestListTemplate {
@@ -82,6 +92,7 @@ async fn pull_request_list(
                         .collect(),
                     csrf: &csrf,
                     can_create: can_create && !csrf.is_empty(),
+                    branches,
                 },
             )
         }
@@ -187,7 +198,7 @@ async fn merge_pull_request(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let fields = match parse_named_form(&headers, &body, &["csrf", "method"]) {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "method", "confirm"]) {
         Ok(fields) => fields,
         Err(()) => return bad_request(&request_id.0),
     };
@@ -196,6 +207,9 @@ async fn merge_pull_request(
             Ok(actor) => actor,
             Err(response) => return response,
         };
+    if fields[2] != "yes" {
+        return redirect(&path.owner, &path.repository, path.number);
+    }
     let Some(service) = state.pull_requests.clone() else {
         return internal(&request_id.0);
     };
@@ -515,6 +529,7 @@ struct PullRequestListTemplate<'a> {
     pull_requests: Vec<PullRequestListItem<'a>>,
     csrf: &'a str,
     can_create: bool,
+    branches: Vec<String>,
 }
 
 struct PullRequestListItem<'a> {

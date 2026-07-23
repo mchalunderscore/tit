@@ -56,6 +56,48 @@ const SESSION_COOKIE: &str = "tit-session";
 const CSRF_COOKIE: &str = "tit-csrf";
 const LOGIN_CSRF_COOKIE: &str = "tit-login-csrf";
 
+mod filters {
+    use askama::{Result, Values};
+
+    #[askama::filter_fn]
+    pub fn human_time<T: std::borrow::Borrow<i64>>(timestamp: T, _: &dyn Values) -> Result<String> {
+        Ok(
+            jiff::Timestamp::from_second(*timestamp.borrow()).map_or_else(
+                |_| "Invalid time".to_owned(),
+                |timestamp| timestamp.strftime("%Y-%m-%d %H:%M UTC").to_string(),
+            ),
+        )
+    }
+
+    #[askama::filter_fn]
+    pub fn short_id<T: AsRef<str>>(id: T, _: &dyn Values) -> Result<String> {
+        Ok(id.as_ref().chars().take(12).collect())
+    }
+
+    #[askama::filter_fn]
+    pub fn event_name<T: AsRef<str>>(kind: T, _: &dyn Values) -> Result<String> {
+        let name = match kind.as_ref() {
+            "issue-created" => "created the issue",
+            "issue-edited" => "edited the issue",
+            "issue-commented" => "added a comment",
+            "issue-opened" | "issue-reopened" => "reopened the issue",
+            "issue-closed" => "closed the issue",
+            "issue-labeled" => "added a label",
+            "issue-unlabeled" => "removed a label",
+            "issue-assigned" => "assigned the issue",
+            "issue-unassigned" => "removed an assignee",
+            "pull-request-opened" => "opened the pull request",
+            "pull-request-revised" => "recorded a new revision",
+            "pull-request-commented" => "added a review comment",
+            "pull-request-approved" => "approved the pull request",
+            "pull-request-changes-requested" => "requested changes",
+            "pull-request-merged" => "merged the pull request",
+            other => return Ok(other.replace('-', " ")),
+        };
+        Ok(name.to_owned())
+    }
+}
+
 #[derive(Clone)]
 struct WebState {
     public: Option<PublicWeb>,
@@ -1059,7 +1101,7 @@ async fn logout(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let fields = match parse_named_form(&headers, &body, &["csrf"]) {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "confirm"]) {
         Ok(fields) => fields,
         Err(()) => {
             return render_error(
@@ -1083,6 +1125,14 @@ async fn logout(
             "Forbidden",
             "The request is not authorized.",
         );
+    }
+    if fields[1] != "yes" {
+        return Response::builder()
+            .status(StatusCode::SEE_OTHER)
+            .header(header::LOCATION, "/account")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::empty())
+            .expect("the account redirect is valid");
     }
     let result = login_job(state, move |login| {
         let session = login.authenticate(&session_token, Some(&csrf))?;
@@ -1434,24 +1484,30 @@ async fn style() -> Response {
         .expect("the embedded CSS response is valid")
 }
 
-async fn not_found(Extension(request_id): Extension<RequestId>) -> Response {
-    render_error(
+async fn not_found(
+    Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
+) -> Response {
+    render_error_with_auth(
         StatusCode::NOT_FOUND,
         &request_id.0,
         "Page not found",
         "The requested page does not exist.",
+        actor.0.is_some(),
     )
 }
 
 async fn method_not_allowed(
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     OriginalUri(uri): OriginalUri,
 ) -> Response {
-    let mut response = render_error(
+    let mut response = render_error_with_auth(
         StatusCode::METHOD_NOT_ALLOWED,
         &request_id.0,
         "Method not allowed",
         "This page does not accept the request method.",
+        actor.0.is_some(),
     );
     let allow = match uri.path() {
         "/signup" | "/recover" | "/login" | "/logout" => "GET, HEAD, POST",
@@ -1580,13 +1636,23 @@ struct HomePage<'a> {
 }
 
 fn render_error(status: StatusCode, request_id: &str, heading: &str, message: &str) -> Response {
+    render_error_with_auth(status, request_id, heading, message, false)
+}
+
+fn render_error_with_auth(
+    status: StatusCode,
+    request_id: &str,
+    heading: &str,
+    message: &str,
+    signed_in: bool,
+) -> Response {
     render(
         status,
         &ErrorTemplate {
             request_id,
             status: heading,
             message,
-            signed_in: false,
+            signed_in,
         },
     )
 }

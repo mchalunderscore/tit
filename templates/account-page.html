@@ -20,8 +20,5 @@
   <h2>Feeds</h2>
   <p><a href="/feeds">Manage private feed tokens</a></p>
   <h2>Sessions</h2>
-  <form action="/logout" method="post">
-    <input type="hidden" name="csrf" value="{{ csrf }}">
-    <button type="submit">Log out all sessions</button>
-  </form>
+  <p><a href="/logout">Log out all sessions</a></p>
 {% endblock %}

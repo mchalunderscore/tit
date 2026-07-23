@@ -11,6 +11,7 @@ use crate::feed::{ActivityFeedPage, FeedFormat, PAGE_SIZE};
 use crate::feed_token::{FeedTokenError, IssuedFeedToken};
 use crate::store::{FeedTokenRecord, StoreError};
 
+use super::filters;
 use super::public::conditional_feed;
 use super::{
     CSRF_COOKIE, RequestId, SESSION_COOKIE, WebState, authenticate_mutation, cookie, login_job,
@@ -110,7 +111,7 @@ async fn rotate_token(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let fields = match parse_named_form(&headers, &body, &["csrf"]) {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "confirm"]) {
         Ok(fields) => fields,
         Err(()) => return feed_bad_request(&request_id.0),
     };
@@ -119,6 +120,9 @@ async fn rotate_token(
             Ok(actor) => actor,
             Err(response) => return response,
         };
+    if fields[1] != "yes" {
+        return feed_tokens_redirect();
+    }
     let Some(service) = state.feeds.clone() else {
         return feed_internal(&request_id.0);
     };
@@ -133,7 +137,7 @@ async fn revoke_token(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let fields = match parse_named_form(&headers, &body, &["csrf"]) {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "confirm"]) {
         Ok(fields) => fields,
         Err(()) => return feed_bad_request(&request_id.0),
     };
@@ -142,19 +146,26 @@ async fn revoke_token(
             Ok(actor) => actor,
             Err(response) => return response,
         };
+    if fields[1] != "yes" {
+        return feed_tokens_redirect();
+    }
     let Some(service) = state.feeds.clone() else {
         return feed_internal(&request_id.0);
     };
     let result = feed_job(state, move || service.revoke(&actor, &path.id)).await;
     match result {
-        Ok(()) => Response::builder()
-            .status(StatusCode::SEE_OTHER)
-            .header(header::LOCATION, "/feeds")
-            .header(header::CACHE_CONTROL, "no-store")
-            .body(axum::body::Body::empty())
-            .expect("the feed token redirect is valid"),
+        Ok(()) => feed_tokens_redirect(),
         Err(error) => feed_management_error(error, &request_id.0),
     }
+}
+
+fn feed_tokens_redirect() -> Response {
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(header::LOCATION, "/feeds")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(axum::body::Body::empty())
+        .expect("the feed token redirect is valid")
 }
 
 async fn atom_feed(

@@ -147,7 +147,43 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
                 .text()
                 .matches("<li><a href=\"/alice/example/commit/")
                 .count(),
-            12
+            100
+        );
+        assert!(
+            commits
+                .text()
+                .contains("/alice/example/commits?page=2\">Older commits</a>")
+        );
+        let older_commits = request(
+            server.address(),
+            "GET",
+            "/alice/example/commits?page=2",
+            &[],
+            &[],
+        );
+        assert_eq!(older_commits.status, 200);
+        assert_eq!(
+            older_commits
+                .text()
+                .matches("<li><a href=\"/alice/example/commit/")
+                .count(),
+            2
+        );
+        assert!(
+            older_commits
+                .text()
+                .contains("/alice/example/commits?page=1\">Newer commits</a>")
+        );
+        assert_eq!(
+            request(
+                server.address(),
+                "GET",
+                "/alice/example/commits?page=3",
+                &[],
+                &[],
+            )
+            .status,
+            400
         );
         let mut feed_entry_ids = Vec::new();
         for (path, content_type) in [
@@ -765,10 +801,11 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     assert!(final_text.contains("#1 Edited issue"));
     assert!(final_text.contains("<em>Markdown</em>"));
     assert!(final_text.contains("<strong>comment</strong>"));
+    assert!(final_text.contains("<article class=\"comment-card\""));
     assert!(final_text.contains("Labels: <span>bug</span>"));
     assert!(final_text.contains("Assignees: <span>alice</span>"));
-    assert!(final_text.contains("issue-created"));
-    assert!(final_text.contains("issue-reopened"));
+    assert!(final_text.contains("created the issue"));
+    assert!(final_text.contains("reopened the issue"));
 
     let anonymous_pull_requests =
         request(server.address(), "GET", "/alice/example/pulls", &[], &[]);
@@ -859,7 +896,7 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     assert_eq!(
         revised_pull_request_page
             .text()
-            .matches("recorded <code>")
+            .matches("recorded <code title=")
             .count(),
         2
     );
@@ -923,7 +960,8 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     }
     let reviewed = request(server.address(), "GET", "/alice/example/pulls/1", &[], &[]);
     assert!(reviewed.text().contains("<strong>general review</strong>"));
-    assert!(reviewed.text().contains("pull-request-approved"));
+    assert!(reviewed.text().contains("<article class=\"comment-card\""));
+    assert!(reviewed.text().contains("approved the pull request"));
     assert!(reviewed.text().contains("head line 1"));
     assert!(!reviewed.text().contains("<strong>Outdated</strong>"));
 
@@ -954,17 +992,39 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
         &[],
     );
     assert!(merge_page.text().contains("Fast-forward refs/heads/main"));
+    let cancelled_merge = request(
+        server.address(),
+        "POST",
+        "/alice/example/pulls/1/merge",
+        &headers,
+        form(&[
+            ("csrf", csrf.as_str()),
+            ("method", "fast-forward"),
+            ("confirm", "no"),
+        ])
+        .as_bytes(),
+    );
+    assert_eq!(cancelled_merge.status, 303);
+    assert_ne!(
+        rev_parse(&bare, "refs/heads/main"),
+        rev_parse(&bare, "refs/heads/feature")
+    );
     let merge = request(
         server.address(),
         "POST",
         "/alice/example/pulls/1/merge",
         &headers,
-        form(&[("csrf", csrf.as_str()), ("method", "fast-forward")]).as_bytes(),
+        form(&[
+            ("csrf", csrf.as_str()),
+            ("method", "fast-forward"),
+            ("confirm", "yes"),
+        ])
+        .as_bytes(),
     );
     assert_eq!(merge.status, 303);
     let merged = request(server.address(), "GET", "/alice/example/pulls/1", &[], &[]);
     assert!(merged.text().contains("merged · opened by alice"));
-    assert!(merged.text().contains("pull-request-merged"));
+    assert!(merged.text().contains("merged the pull request"));
     assert_eq!(
         rev_parse(&bare, "refs/heads/main"),
         rev_parse(&bare, "refs/heads/feature")
@@ -1165,7 +1225,20 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
         200
     );
 
-    let rotate = form(&[("csrf", csrf.as_str())]);
+    let cancelled_rotate = form(&[("csrf", csrf.as_str()), ("confirm", "no")]);
+    let cancelled_rotation = request(
+        server.address(),
+        "POST",
+        &format!("/feeds/tokens/{private_id}/rotate"),
+        &headers,
+        cancelled_rotate.as_bytes(),
+    );
+    assert_eq!(cancelled_rotation.status, 303);
+    assert_eq!(
+        request(server.address(), "GET", &private_path, &[], &[]).status,
+        200
+    );
+    let rotate = form(&[("csrf", csrf.as_str()), ("confirm", "yes")]);
     let rotated = request(
         server.address(),
         "POST",
@@ -1376,7 +1449,7 @@ impl Fixture {
             .expect("write malformed UTF-8 content");
         commit_all(&worktree, "first commit");
         let parent = rev_parse(&worktree, "HEAD");
-        for index in 1..=10 {
+        for index in 1..=100 {
             commit_empty(&worktree, &format!("intermediate commit {index}"));
         }
         fs::write(

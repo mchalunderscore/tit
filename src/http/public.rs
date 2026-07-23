@@ -33,10 +33,12 @@ use crate::markdown::{self, RenderedMarkdown};
 use crate::policy::{PolicyError, RepositoryOperation, RepositoryPolicy};
 use crate::store::{DATABASE_FILE, RepositoryRecord, Store, StoreError};
 
-use super::{PublicWebConfig, RequestActor, RequestId, WebState, render_error};
+use super::filters;
+use super::{PublicWebConfig, RequestActor, RequestId, WebState, render_error_with_auth};
 
 const MAX_HISTORY_COMMITS: usize = 10_000;
 const MAX_SUMMARY_COMMITS: usize = 10;
+const COMMITS_PER_PAGE: usize = 100;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
 
 #[derive(Clone)]
@@ -84,6 +86,24 @@ impl PublicWeb {
 
     pub(super) fn http_clone_base(&self) -> &str {
         &self.http_clone_base
+    }
+
+    pub(super) async fn branch_names(
+        &self,
+        actor: Option<String>,
+        owner: String,
+        repository: String,
+    ) -> Result<Vec<String>, RouteError> {
+        self.read(actor, owner, repository, |_record, service| {
+            let cancellation = ReadCancellation::default();
+            Ok(service
+                .references(&cancellation)?
+                .into_iter()
+                .filter(|reference| reference.name.starts_with(b"refs/heads/"))
+                .map(|reference| display_bytes(&reference.name))
+                .collect())
+        })
+        .await
     }
 
     async fn read<T, F>(
@@ -491,11 +511,16 @@ async fn refs(
     };
     let signed_in = actor.0.is_some();
     let result = web
-        .read(actor.0, path.owner, path.repository, |record, service| {
-            let cancellation = ReadCancellation::default();
-            let references = service.references(&cancellation)?;
-            Ok(RepositoryPage::refs(record, references))
-        })
+        .read(
+            actor.0,
+            path.owner,
+            path.repository,
+            move |record, service| {
+                let cancellation = ReadCancellation::default();
+                let references = service.references(&cancellation)?;
+                Ok(RepositoryPage::refs(record, references))
+            },
+        )
         .await;
     render_page(result, &request_id.0, signed_in)
 }
@@ -505,25 +530,35 @@ async fn commits(
     Extension(request_id): Extension<RequestId>,
     Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<RepositoryPath>,
+    Query(query): Query<CommitQuery>,
 ) -> Response {
     let Some(web) = state.public else {
         return route_error(RouteError::NotFound, &request_id.0);
     };
     let signed_in = actor.0.is_some();
+    let page = query.page.unwrap_or(1);
+    if page == 0 {
+        return route_error(RouteError::InvalidRequest, &request_id.0);
+    }
     let result = web
-        .read(actor.0, path.owner, path.repository, |record, service| {
-            let cancellation = ReadCancellation::default();
-            let references = service.references(&cancellation)?;
-            let head = references
-                .iter()
-                .find(|reference| reference.name == b"HEAD")
-                .map(|reference| reference.target);
-            let history = match head {
-                Some(head) => service.history(head, &cancellation)?,
-                None => Vec::new(),
-            };
-            Ok(RepositoryPage::commits(record, head, history))
-        })
+        .read(
+            actor.0,
+            path.owner,
+            path.repository,
+            move |record, service| {
+                let cancellation = ReadCancellation::default();
+                let references = service.references(&cancellation)?;
+                let head = references
+                    .iter()
+                    .find(|reference| reference.name == b"HEAD")
+                    .map(|reference| reference.target);
+                let history = match head {
+                    Some(head) => service.history(head, &cancellation)?,
+                    None => Vec::new(),
+                };
+                RepositoryPage::commits(record, head, history, page)
+            },
+        )
         .await;
     render_page(result, &request_id.0, signed_in)
 }
@@ -949,10 +984,10 @@ fn render_page(
                     .header(header::CACHE_CONTROL, "no-store")
                     .body(Body::from(body))
                     .expect("the repository HTML response is valid"),
-                Err(_) => route_error(RouteError::Internal, request_id),
+                Err(_) => route_error_with_auth(RouteError::Internal, request_id, signed_in),
             }
         }
-        Err(error) => route_error(error, request_id),
+        Err(error) => route_error_with_auth(error, request_id, signed_in),
     }
 }
 
@@ -1027,30 +1062,38 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn route_error(error: RouteError, request_id: &str) -> Response {
+    route_error_with_auth(error, request_id, false)
+}
+
+fn route_error_with_auth(error: RouteError, request_id: &str, signed_in: bool) -> Response {
     match error {
-        RouteError::NotFound => render_error(
+        RouteError::NotFound => render_error_with_auth(
             StatusCode::NOT_FOUND,
             request_id,
             "Repository content not found",
             "The requested repository content does not exist.",
+            signed_in,
         ),
-        RouteError::Unavailable => render_error(
+        RouteError::Unavailable => render_error_with_auth(
             StatusCode::SERVICE_UNAVAILABLE,
             request_id,
             "Repository service unavailable",
             "The repository service cannot complete this request now.",
+            signed_in,
         ),
-        RouteError::Internal => render_error(
+        RouteError::Internal => render_error_with_auth(
             StatusCode::INTERNAL_SERVER_ERROR,
             request_id,
             "Repository service error",
             "The repository service cannot complete this request.",
+            signed_in,
         ),
-        RouteError::InvalidRequest => render_error(
+        RouteError::InvalidRequest => render_error_with_auth(
             StatusCode::BAD_REQUEST,
             request_id,
             "Invalid repository request",
             "The repository request is not valid.",
+            signed_in,
         ),
     }
 }
@@ -1248,6 +1291,12 @@ struct SearchQuery {
     reference: Option<String>,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommitQuery {
+    page: Option<usize>,
+}
+
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 struct CommitPath {
     owner: String,
@@ -1307,6 +1356,10 @@ struct RepositoryPage {
     search_files: usize,
     search_bytes: usize,
     search_matches: Vec<SearchMatchView>,
+    has_previous_page: bool,
+    has_next_page: bool,
+    previous_page: usize,
+    next_page: usize,
 }
 
 impl RepositoryPage {
@@ -1346,6 +1399,10 @@ impl RepositoryPage {
             search_files: 0,
             search_bytes: 0,
             search_matches: Vec::new(),
+            has_previous_page: false,
+            has_next_page: false,
+            previous_page: 0,
+            next_page: 0,
         }
     }
 
@@ -1405,12 +1462,34 @@ impl RepositoryPage {
         page
     }
 
-    fn commits(record: RepositoryRecord, head: Option<ObjectId>, history: Vec<CommitInfo>) -> Self {
+    fn commits(
+        record: RepositoryRecord,
+        head: Option<ObjectId>,
+        history: Vec<CommitInfo>,
+        page_number: usize,
+    ) -> Result<Self, RouteError> {
+        let start = page_number
+            .saturating_sub(1)
+            .checked_mul(COMMITS_PER_PAGE)
+            .ok_or(RouteError::InvalidRequest)?;
+        if !history.is_empty() && start >= history.len() {
+            return Err(RouteError::InvalidRequest);
+        }
+        let has_next_page = start.saturating_add(COMMITS_PER_PAGE) < history.len();
         let mut page = Self::base(record, "commits", "Commits".to_owned());
         page.has_head = head.is_some();
         page.commit_id = head.map(|id| id.to_string()).unwrap_or_default();
-        page.history = history.into_iter().map(CommitView::from).collect();
-        page
+        page.history = history
+            .into_iter()
+            .skip(start)
+            .take(COMMITS_PER_PAGE)
+            .map(CommitView::from)
+            .collect();
+        page.has_previous_page = page_number > 1;
+        page.has_next_page = has_next_page;
+        page.previous_page = page_number.saturating_sub(1);
+        page.next_page = page_number.saturating_add(1);
+        Ok(page)
     }
 
     fn commit(record: RepositoryRecord, commit: CommitInfo) -> Self {
@@ -1644,7 +1723,8 @@ struct BlameView {
     start_line: u32,
     source_start_line: u32,
     line_count: u32,
-    end_line: u32,
+    current_end_line: u32,
+    source_end_line: u32,
     commit_id: String,
     source_path: String,
     content: String,
@@ -1674,7 +1754,10 @@ impl BlameView {
             start_line: hunk.start_line,
             source_start_line: hunk.source_start_line,
             line_count: hunk.line_count,
-            end_line: hunk
+            current_end_line: hunk
+                .start_line
+                .saturating_add(hunk.line_count.saturating_sub(1)),
+            source_end_line: hunk
                 .source_start_line
                 .saturating_add(hunk.line_count.saturating_sub(1)),
             commit_id: hunk.commit_id.to_string(),
@@ -1688,7 +1771,7 @@ impl BlameView {
 }
 
 #[derive(Debug)]
-enum RouteError {
+pub(super) enum RouteError {
     NotFound,
     InvalidRequest,
     Unavailable,

@@ -7,15 +7,23 @@
   <h2>Create token</h2>
   <form method="post" action="/feeds/tokens">
     <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="owner" value="">
+    <input type="hidden" name="repository" value="">
     <div class="field">
       <label for="feed-scope">Scope</label>
       <select id="feed-scope" name="scope">
         <option value="watched">Watched activity</option>
         <option value="assignments">Assignments</option>
         <option value="mentions">Mentions</option>
-        <option value="repository">One repository</option>
       </select>
     </div>
+    <button type="submit">Create feed token</button>
+  </form>
+
+  <h2>Create a repository token</h2>
+  <form method="post" action="/feeds/tokens">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="scope" value="repository">
     <div class="field">
       <label for="feed-owner">Repository owner</label>
       <input id="feed-owner" name="owner" autocomplete="off" autocapitalize="none" spellcheck="false">
@@ -24,8 +32,7 @@
       <label for="feed-repository">Repository name</label>
       <input id="feed-repository" name="repository" autocomplete="off" autocapitalize="none" spellcheck="false">
     </div>
-    <p>Supply the owner and repository name only for a one-repository token.</p>
-    <button type="submit">Create feed token</button>
+    <button type="submit">Create repository token</button>
   </form>
 
   <h2>Existing tokens</h2>
@@ -35,14 +42,24 @@
   <ul>
 {% for token in tokens %}
     <li>
-      <strong>{{ token.scope }}</strong> for {{ token.target }}, created at {{ token.created_at }}.
+      <strong>{{ token.scope }}</strong> for {{ token.target }}, created at <time datetime="{{ token.created_at }}">{{ token.created_at|human_time }}</time>.
 {% if token.active %}
       <form method="post" action="/feeds/tokens/{{ token.id }}/rotate">
         <input type="hidden" name="csrf" value="{{ csrf }}">
+        <fieldset class="confirmation">
+          <legend>Rotate this token?</legend>
+          <label><input type="radio" name="confirm" value="no" checked> No</label>
+          <label><input type="radio" name="confirm" value="yes"> Yes</label>
+        </fieldset>
         <button type="submit">Rotate</button>
       </form>
       <form method="post" action="/feeds/tokens/{{ token.id }}/revoke">
         <input type="hidden" name="csrf" value="{{ csrf }}">
+        <fieldset class="confirmation">
+          <legend>Revoke this token?</legend>
+          <label><input type="radio" name="confirm" value="no" checked> No</label>
+          <label><input type="radio" name="confirm" value="yes"> Yes</label>
+        </fieldset>
         <button type="submit">Revoke</button>
       </form>
 {% else %}

@@ -5,6 +5,12 @@
   <p>Log out of all browser sessions for this account?</p>
   <form method="post" action="/logout">
     <input type="hidden" name="csrf" value="{{ csrf }}">
+    <fieldset class="confirmation">
+      <legend>Log out all sessions?</legend>
+      <label><input type="radio" name="confirm" value="no" checked> No</label>
+      <label><input type="radio" name="confirm" value="yes"> Yes</label>
+    </fieldset>
     <button type="submit">Log out</button>
+    <a href="/account">Cancel</a>
   </form>
 {% endblock %}

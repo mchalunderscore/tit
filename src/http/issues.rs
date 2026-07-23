@@ -11,6 +11,7 @@ use crate::issue::{IssueError, IssueService};
 use crate::markdown::{self, RenderedMarkdown};
 use crate::store::{IssueDetail, StoreError};
 
+use super::filters;
 use super::{
     CSRF_COOKIE, RequestActor, RequestId, WebState, authenticate_mutation, cookie,
     parse_named_form, render, render_error,

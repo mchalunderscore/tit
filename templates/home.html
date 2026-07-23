@@ -13,7 +13,7 @@
 {% else %}
   <ul>
   {% for item in repositories %}
-    <li><a href="/{{ item.owner }}/{{ item.slug }}">{{ item.owner }}/{{ item.slug }}</a> · {{ item.visibility }} · updated <time>{{ item.updated_at }}</time></li>
+    <li><a href="/{{ item.owner }}/{{ item.slug }}">{{ item.owner }}/{{ item.slug }}</a> · {{ item.visibility }} · updated <time datetime="{{ item.updated_at }}">{{ item.updated_at|human_time }}</time></li>
   {% endfor %}
   </ul>
 {% endif %}

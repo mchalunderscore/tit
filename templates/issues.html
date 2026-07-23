@@ -13,7 +13,7 @@
 {% else %}
   <ol class="issue-list">
 {% for issue in issues %}
-    <li><a href="/{{ owner }}/{{ repository }}/issues/{{ issue.number }}">#{{ issue.number }} {{ issue.title }}</a> — {{ issue.state }}, opened by {{ issue.author }}, updated <time>{{ issue.updated_at }}</time></li>
+    <li><a href="/{{ owner }}/{{ repository }}/issues/{{ issue.number }}">#{{ issue.number }} {{ issue.title }}</a> — {{ issue.state }}, opened by {{ issue.author }}, updated <time datetime="{{ issue.updated_at }}">{{ issue.updated_at|human_time }}</time></li>
 {% endfor %}
   </ol>
 {% endif %}
