@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use crate::account::{AccountError, AccountService};
 use crate::auth::validate_username;
 use crate::domain::repository::validate_slug;
+use crate::repository::{RepositoryService, RepositoryServiceError};
 use crate::session::{SessionError, WebLoginService};
 use crate::store::StoreError;
 
@@ -40,6 +41,7 @@ struct WebState {
     jobs: Arc<Semaphore>,
     key_reloader: Option<AccountKeyReloader>,
     login: Option<WebLoginService>,
+    repositories: Option<RepositoryService>,
     secure_cookies: bool,
 }
 
@@ -71,6 +73,7 @@ impl RunningWebServer {
                 jobs: Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS)),
                 key_reloader: None,
                 login: None,
+                repositories: None,
                 secure_cookies: false,
             },
         )
@@ -105,6 +108,7 @@ impl RunningWebServer {
         let secure_cookies = public_url.scheme() == "https";
         let login = WebLoginService::new(database, &public_url)?;
         let public = PublicWeb::open(config, Arc::clone(&jobs))?;
+        let repositories = RepositoryService::new(public.database(), public.repository_root());
         Self::start_with_state(
             address,
             WebState {
@@ -113,6 +117,7 @@ impl RunningWebServer {
                 jobs,
                 key_reloader,
                 login: Some(login),
+                repositories: Some(repositories),
                 secure_cookies,
             },
         )
@@ -155,6 +160,7 @@ pub(crate) fn router() -> Router {
         jobs: Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS)),
         key_reloader: None,
         login: None,
+        repositories: None,
         secure_cookies: false,
     })
 }
@@ -194,6 +200,10 @@ fn router_with_state(state: WebState) -> Router {
             axum::routing::post(login_verify_file).layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route("/account", get(account_page))
+        .route(
+            "/account/repositories",
+            axum::routing::post(create_repository).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
         .route(
             "/logout",
             axum::routing::post(logout).layer(DefaultBodyLimit::max(1024)),
@@ -603,6 +613,101 @@ async fn account_page(
     }
 }
 
+async fn create_repository(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "name", "object-format"]) {
+        Ok(fields) => fields,
+        Err(()) => {
+            return repository_form_error(
+                &request_id.0,
+                StatusCode::BAD_REQUEST,
+                "The repository request is not valid.",
+            );
+        }
+    };
+    let Some(session_token) = cookie(&headers, SESSION_COOKIE) else {
+        return login_redirect(false);
+    };
+    let Some(csrf) = cookie(&headers, CSRF_COOKIE) else {
+        return login_redirect(true);
+    };
+    if fields[0] != csrf {
+        return repository_form_error(
+            &request_id.0,
+            StatusCode::FORBIDDEN,
+            "The request is not authorized.",
+        );
+    }
+    let object_format = match fields[2].as_str() {
+        "sha1" => gix::hash::Kind::Sha1,
+        "sha256" => gix::hash::Kind::Sha256,
+        _ => {
+            return repository_form_error(
+                &request_id.0,
+                StatusCode::BAD_REQUEST,
+                "The repository request is not valid.",
+            );
+        }
+    };
+    let csrf_for_auth = csrf.clone();
+    let session = match login_job(state.clone(), move |login| {
+        login.authenticate(&session_token, Some(&csrf_for_auth))
+    })
+    .await
+    {
+        Ok(session) => session,
+        Err(_) => return login_redirect(true),
+    };
+    let owner = session.username;
+    let slug = fields[1].clone();
+    let correlation_id = request_id.0.clone();
+    let owner_for_job = owner.clone();
+    let slug_for_job = slug.clone();
+    let result = repository_job(state, move |repositories| {
+        repositories.create_for_account(
+            &owner_for_job,
+            &slug_for_job,
+            object_format,
+            &correlation_id,
+        )
+    })
+    .await;
+    match result {
+        Ok(_) => Response::builder()
+            .status(StatusCode::SEE_OTHER)
+            .header(header::LOCATION, format!("/{owner}/{slug}"))
+            .body(Body::empty())
+            .expect("the repository redirect is valid"),
+        Err(RepositoryServiceError::Auth(_)) | Err(RepositoryServiceError::RepositoryName(_)) => {
+            repository_form_error(
+                &request_id.0,
+                StatusCode::BAD_REQUEST,
+                "The repository name is not valid.",
+            )
+        }
+        Err(RepositoryServiceError::Store(StoreError::RepositoryExists(_, _))) => {
+            repository_form_error(
+                &request_id.0,
+                StatusCode::CONFLICT,
+                "A repository with this name already exists.",
+            )
+        }
+        Err(_) => repository_form_error(
+            &request_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The repository could not be created.",
+        ),
+    }
+}
+
+fn repository_form_error(request_id: &str, status: StatusCode, message: &str) -> Response {
+    render_error(status, request_id, "Repository error", message)
+}
+
 async fn logout(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
@@ -661,6 +766,30 @@ async fn login_job<T: Send + 'static>(
     })
     .await
     .map_err(|_| SessionError::Unavailable)?
+}
+
+async fn repository_job<T: Send + 'static>(
+    state: WebState,
+    operation: impl FnOnce(RepositoryService) -> Result<T, RepositoryServiceError> + Send + 'static,
+) -> Result<T, RepositoryServiceError> {
+    let repositories = state.repositories.ok_or_else(|| {
+        RepositoryServiceError::Store(StoreError::Integrity(
+            "repository service is unavailable".to_owned(),
+        ))
+    })?;
+    let permit = state.jobs.acquire_owned().await.map_err(|_| {
+        RepositoryServiceError::Store(StoreError::Integrity(
+            "repository worker pool is unavailable".to_owned(),
+        ))
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation(repositories)
+    })
+    .await
+    .map_err(|_| {
+        RepositoryServiceError::Store(StoreError::Integrity("repository worker failed".to_owned()))
+    })?
 }
 
 fn parse_named_form(

@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -60,7 +60,6 @@ fn serves_an_imported_repository_through_http_and_ssh() {
             source.to_str().expect("a UTF-8 source path"),
         ],
     );
-
     let mut server = spawn_server(&config);
     wait_for_listener(http, &mut server);
     wait_for_listener(ssh, &mut server);
@@ -120,7 +119,36 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     let account = http_get_with_headers(http, "/account", &[("Cookie", &cookies)]);
     assert!(account.starts_with("HTTP/1.1 200"));
     assert!(account.contains("<dd>alice</dd>"));
+    assert!(account.contains("action=\"/account/repositories\""));
     let csrf = cookie_value(&cookies, "tit-csrf");
+    let rejected_repository = http_form_with_headers(
+        http,
+        "/account/repositories",
+        &[
+            ("csrf", &"0".repeat(64)),
+            ("name", "web-created"),
+            ("object-format", "sha1"),
+        ],
+        &[("Cookie", &cookies)],
+    );
+    assert!(rejected_repository.starts_with("HTTP/1.1 403"));
+    let created_repository = http_form_with_headers(
+        http,
+        "/account/repositories",
+        &[
+            ("csrf", csrf),
+            ("name", "web-created"),
+            ("object-format", "sha256"),
+        ],
+        &[("Cookie", &cookies)],
+    );
+    assert!(created_repository.starts_with("HTTP/1.1 303"));
+    assert_eq!(
+        response_header(&created_repository, "location"),
+        "/alice/web-created"
+    );
+    let web_create_id = response_header(&created_repository, "x-request-id").to_owned();
+    assert!(http_get(http, "/alice/web-created").starts_with("HTTP/1.1 200"));
     let rejected_logout = http_form_with_headers(
         http,
         "/logout",
@@ -318,6 +346,13 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     assert!(audits.iter().any(|event| {
         event.0 == "account.recover" && event.3 == "success" && event.4 == recovery_id
     }));
+    assert!(audits.iter().any(|event| {
+        event.0 == "repository.create"
+            && event.1 == "alice"
+            && event.2 == "alice/web-created"
+            && event.3 == "success"
+            && event.4 == web_create_id
+    }));
     for event in &audits {
         let visible = format!(
             "{} {} {} {} {}",
@@ -450,7 +485,6 @@ fn keeps_private_git_hidden_from_http_but_allows_its_owner_over_ssh() {
             "private",
         ],
     );
-
     let mut server = spawn_server(&config);
     wait_for_listener(http, &mut server);
     wait_for_listener(ssh, &mut server);
@@ -481,6 +515,172 @@ fn keeps_private_git_hidden_from_http_but_allows_its_owner_over_ssh() {
         &instance.path().join("unknown-clone")
     ));
     server.terminate();
+}
+
+#[test]
+fn creates_owned_repositories_with_stable_ssh_command_output() {
+    let instance = TempDir::new().expect("create an instance directory");
+    let http = free_address();
+    let ssh = free_address();
+    let config = instance.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "version = 1\npublic_url = \"http://{http}/\"\n\n[http]\nlisten = \"{http}\"\n\n[ssh]\nlisten = \"{ssh}\"\npublic_host = \"127.0.0.1\"\npublic_port = {}\n",
+            ssh.port()
+        ),
+    )
+    .expect("write the server configuration");
+    let private_key = instance.path().join("administrator");
+    create_ssh_key_fixture(&private_key);
+    let public_key = fs::read_to_string(private_key.with_extension("pub"))
+        .expect("read the administrator public key");
+    let config_text = config.to_str().expect("a UTF-8 configuration path");
+    command(
+        instance.path(),
+        [
+            "--config",
+            config_text,
+            "setup",
+            "admin",
+            "alice",
+            public_key.trim(),
+        ],
+    );
+    let member_key = provision_account(instance.path(), "bob", "active", false);
+
+    let mut server = spawn_server(&config);
+    wait_for_listener(http, &mut server);
+    wait_for_listener(ssh, &mut server);
+
+    let human = ssh_exec(ssh, &member_key, &["repo", "create", "example"]);
+    assert!(human.status.success());
+    assert_eq!(
+        String::from_utf8(human.stdout).expect("read human command output"),
+        "Created repository bob/example.\nObject format: sha1\n"
+    );
+    assert!(human.stderr.is_empty());
+    assert!(ssh_clone_repository_succeeds(
+        ssh,
+        &member_key,
+        "bob",
+        "example",
+        &instance.path().join("created-clone")
+    ));
+
+    let machine = ssh_exec(
+        ssh,
+        &private_key,
+        &[
+            "repo",
+            "create",
+            "hash-agile",
+            "--object-format",
+            "sha256",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(machine.status.success());
+    assert_eq!(
+        String::from_utf8(machine.stdout).expect("read machine command output"),
+        "{\"version\":1,\"status\":\"success\",\"repository\":{\"owner\":\"alice\",\"name\":\"hash-agile\",\"object_format\":\"sha256\"}}\n"
+    );
+    assert!(machine.stderr.is_empty());
+
+    let duplicate = ssh_exec(
+        ssh,
+        &member_key,
+        &["repo", "create", "example", "--output", "json"],
+    );
+    assert!(!duplicate.status.success());
+    assert_eq!(
+        String::from_utf8(duplicate.stdout).expect("read machine error output"),
+        "{\"version\":1,\"status\":\"error\",\"error\":{\"code\":\"repository-exists\"}}\n"
+    );
+    assert!(duplicate.stderr.is_empty());
+
+    let invalid = ssh_exec(ssh, &member_key, &["repo", "create", "../bad"]);
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(invalid.stderr).expect("read human error output"),
+        "tit: The repository name is not valid.\n"
+    );
+    let malformed = ssh_exec(ssh, &member_key, &["repo", "create", "--output", "json"]);
+    assert!(!malformed.status.success());
+    assert_eq!(
+        String::from_utf8(malformed.stdout).expect("read invalid command output"),
+        "{\"version\":1,\"status\":\"error\",\"error\":{\"code\":\"invalid-command\"}}\n"
+    );
+    assert!(malformed.stderr.is_empty());
+
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the account database");
+    database
+        .execute(
+            "UPDATE account SET state = 'suspended' WHERE username = 'bob'",
+            [],
+        )
+        .expect("suspend the command account");
+    drop(database);
+    let suspended = ssh_exec(
+        ssh,
+        &member_key,
+        &["repo", "create", "blocked", "--output", "json"],
+    );
+    assert!(!suspended.status.success());
+    assert_eq!(
+        String::from_utf8(suspended.stdout).expect("read suspended account output"),
+        "{\"version\":1,\"status\":\"error\",\"error\":{\"code\":\"account-unavailable\"}}\n"
+    );
+    assert!(suspended.stderr.is_empty());
+    server.terminate();
+
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the repository database");
+    let repositories: Vec<(String, String, String)> = database
+        .prepare(
+            "SELECT account.username, repository.slug, repository.object_format
+             FROM repository JOIN account ON account.id = repository.owner_account_id
+             ORDER BY repository.slug",
+        )
+        .expect("prepare the repository query")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("query created repositories")
+        .collect::<Result<_, _>>()
+        .expect("read created repositories");
+    assert_eq!(
+        repositories,
+        vec![
+            ("bob".to_owned(), "example".to_owned(), "sha1".to_owned()),
+            (
+                "alice".to_owned(),
+                "hash-agile".to_owned(),
+                "sha256".to_owned()
+            ),
+        ]
+    );
+    let audit: Vec<(String, String)> = database
+        .prepare(
+            "SELECT target, outcome FROM audit_event
+             WHERE action = 'repository.create' AND actor IN ('alice', 'bob')
+             ORDER BY id",
+        )
+        .expect("prepare the repository audit query")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query repository audit events")
+        .collect::<Result<_, _>>()
+        .expect("read repository audit events");
+    assert_eq!(
+        audit,
+        vec![
+            ("bob/example".to_owned(), "success".to_owned()),
+            ("alice/hash-agile".to_owned(), "success".to_owned()),
+            ("bob/example".to_owned(), "failure".to_owned()),
+            ("bob/blocked".to_owned(), "failure".to_owned()),
+        ]
+    );
 }
 
 #[test]
@@ -986,6 +1186,31 @@ fn ssh_clone_repository_succeeds(
         .expect("clone through the tit SSH server")
         .status
         .success()
+}
+
+fn ssh_exec(address: SocketAddr, private_key: &Path, command: &[&str]) -> Output {
+    Command::new("ssh")
+        .args([
+            "-F",
+            "/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "-i",
+        ])
+        .arg(private_key)
+        .args(["-p", &address.port().to_string()])
+        .arg(format!("ignored@{}", address.ip()))
+        .args(command)
+        .output()
+        .expect("run an SSH repository command")
 }
 
 fn provision_account(

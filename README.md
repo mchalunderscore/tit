@@ -69,6 +69,32 @@ Each event shows its action, actor, target, outcome, time, and correlation ID.
 The history does not store recovery credentials, login challenges, signatures,
 session tokens, or SSH private keys.
 
+An authenticated account can create a repository with SSH:
+
+```text
+ssh -p 2222 tit.example repo create project
+```
+
+The account that owns the SSH key becomes the repository owner. The SSH login
+name does not select the owner. New repositories use SHA-1 unless the command
+selects SHA-256:
+
+```text
+ssh -p 2222 tit.example repo create project --object-format sha256
+```
+
+Use the versioned JSON mode for scripts:
+
+```text
+ssh -p 2222 tit.example repo create project --output json
+```
+
+The complete command is `repo create NAME [--object-format sha1|sha256]
+[--output human|json]`. Human output can change in a later release. The JSON
+object has `version`, `status`, and `repository` fields after success. It has
+`version`, `status`, and `error.code` fields after failure. The command returns
+zero after success and nonzero after failure.
+
 ## Quality gate
 
 Install `cargo-deny` version 0.20.2. Then, run this command from the repository
@@ -240,3 +266,17 @@ collaborator, and ref audit events. It also tests correlation IDs and secret
 exclusion. Read the
 [audit history architectural decision record](docs/adr/0014-audit-history.md)
 for the transaction and recovery rules.
+
+## Milestone 3.6 gate
+
+Run the SSH repository command gate:
+
+```text
+./scripts/check-m3-6
+```
+
+This command tests repository creation from the Web UI and SSH. It tests
+account ownership, both object formats, human output, JSON output, failure
+codes, audit events, and clone access. Read the
+[SSH repository command architectural decision record](docs/adr/0015-ssh-repository-commands.md)
+for the command and authorization rules.

@@ -208,6 +208,10 @@ impl GitRepositories {
         self.push_database.as_deref()
     }
 
+    pub(crate) fn repository_root(&self) -> &Path {
+        &self.root
+    }
+
     pub(crate) async fn push_permit(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
         self.push_jobs.clone().acquire_owned().await
     }

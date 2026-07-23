@@ -1,6 +1,9 @@
 #[allow(dead_code, reason = "the SSH test uses only the shared key boundary")]
 #[path = "../src/auth.rs"]
 mod auth;
+#[allow(dead_code, reason = "the SSH identity test does not use domain models")]
+#[path = "../src/domain/mod.rs"]
+mod domain;
 #[allow(
     dead_code,
     reason = "the SSH identity test does not use each Git service API"
@@ -13,6 +16,12 @@ mod git;
 )]
 #[path = "../src/policy.rs"]
 mod policy;
+#[allow(
+    dead_code,
+    reason = "the SSH identity test does not create repositories"
+)]
+#[path = "../src/repository.rs"]
+mod repository;
 #[allow(
     dead_code,
     reason = "the SSH identity test does not start a Git service"

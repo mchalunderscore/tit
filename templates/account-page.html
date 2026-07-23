@@ -8,6 +8,23 @@
     <dt>Administrator</dt>
     <dd>{% if administrator %}Yes{% else %}No{% endif %}</dd>
   </dl>
+  <h2>Create repository</h2>
+  <form action="/account/repositories" method="post">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <p>
+      <label for="repository-name">Name</label>
+      <input id="repository-name" name="name" required maxlength="100" pattern="([a-z0-9]|[a-z0-9][a-z0-9._-]*[a-z0-9])">
+    </p>
+    <p>
+      <label for="object-format">Object format</label>
+      <select id="object-format" name="object-format">
+        <option value="sha1">SHA-1</option>
+        <option value="sha256">SHA-256</option>
+      </select>
+    </p>
+    <button type="submit">Create repository</button>
+  </form>
+  <h2>Sessions</h2>
   <form action="/logout" method="post">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <button type="submit">Log out all sessions</button>

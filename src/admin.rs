@@ -10,6 +10,7 @@ use crate::auth::{AuthError, validate_username};
 use crate::domain::repository::{RepositoryNameError, validate_slug};
 use crate::git::repository::{GitRepository, GitRepositoryError};
 use crate::instance::{InstanceError, InstanceLock, prepare_database, prepare_repository_root};
+use crate::repository::{RepositoryService, RepositoryServiceError};
 use crate::store::{
     AuditContext, NewRepository, NewRepositoryReference, RepositoryOrigin, RepositoryRecord, Store,
     StoreError,
@@ -23,17 +24,12 @@ pub(crate) fn create_repository(
     slug: &str,
     object_format: Kind,
 ) -> Result<RepositoryRecord, AdminError> {
-    validate_names(owner, slug)?;
-    administer_repository(
-        instance_dir,
-        owner,
-        slug,
-        RepositoryOrigin::Created,
-        |path| {
-            GitRepository::create_bare(path, object_format)?;
-            Ok(object_format)
-        },
-    )
+    let _lock = InstanceLock::acquire(instance_dir)?;
+    let database = prepare_database(instance_dir)?;
+    let root = prepare_repository_root(instance_dir)?;
+    RepositoryService::new(&database, &root)
+        .create_for_administrator(owner, slug, object_format, &random_id()?)
+        .map_err(Into::into)
 }
 
 pub(crate) fn import_repository(
@@ -409,6 +405,8 @@ pub(crate) enum AdminError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Git(#[from] GitRepositoryError),
+    #[error(transparent)]
+    RepositoryService(#[from] RepositoryServiceError),
     #[error("cannot canonicalize path {path}: {source}")]
     Canonicalize {
         path: PathBuf,

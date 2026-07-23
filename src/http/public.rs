@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -72,6 +72,14 @@ impl PublicWeb {
             jobs,
             policy,
         })
+    }
+
+    pub(super) fn database(&self) -> &Path {
+        &self.database
+    }
+
+    pub(super) fn repository_root(&self) -> &Path {
+        &self.repositories
     }
 
     async fn read<T, F>(

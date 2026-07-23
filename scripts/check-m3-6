@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+./scripts/check
+cargo test --locked --release --test cli administers_repositories_with_immutable_canonical_paths
+cargo test --locked --release --test ssh
+cargo test --locked --release --test serve serves_an_imported_repository_through_http_and_ssh
+cargo test --locked --release --test serve creates_owned_repositories_with_stable_ssh_command_output

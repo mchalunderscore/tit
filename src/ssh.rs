@@ -21,10 +21,14 @@ use crate::git::receive_pack::{ReceivePack, ReceivePackError};
 use crate::git::transport::{GitRepositories, GitSshService};
 use crate::git::upload_pack::{ProtocolVersion, UploadPack, UploadPackError};
 use crate::policy::RepositoryOperation;
+use crate::repository::{RepositoryService, RepositoryServiceError};
 
 const VERSION_COMMAND: &[u8] = b"tit --version";
 const GIT_PROTOCOL_VARIABLE: &str = "GIT_PROTOCOL";
 const MAX_RECEIVE_PACK_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_REPOSITORY_COMMAND_BYTES: usize = 512;
+const REPOSITORY_CREATE_USAGE: &str =
+    "repo create NAME [--object-format sha1|sha256] [--output human|json]";
 
 pub(crate) struct RunningSshServer {
     address: SocketAddr,
@@ -489,6 +493,25 @@ impl Handler for SshSession {
             session.exit_status_request(channel, 0)?;
             session.eof(channel)?;
             session.close(channel)?;
+        } else if is_repository_command(command) {
+            self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
+            session.channel_success(channel)?;
+            let machine_requested = requests_json(command);
+            let result = match parse_repository_command(command) {
+                Ok(command) => match self.active_identity() {
+                    Some(identity) => {
+                        run_repository_command(
+                            self.repositories.clone(),
+                            identity.username.clone(),
+                            command,
+                        )
+                        .await
+                    }
+                    None => Err(RepositoryCommandError::Unavailable),
+                },
+                Err(()) => Err(RepositoryCommandError::Usage),
+            };
+            send_repository_command_result(channel, result, machine_requested, session)?;
         } else {
             let service = self.open_git_service(command).await;
             if let Some(service) = service {
@@ -711,6 +734,198 @@ impl Handler for SshSession {
     ) -> Result<bool, Self::Error> {
         self.audit.rejected_forward.fetch_add(1, Ordering::Relaxed);
         Ok(false)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RepositoryCommandOutput {
+    Human,
+    Json,
+}
+
+struct RepositoryCreateCommand {
+    slug: String,
+    object_format: gix::hash::Kind,
+    output: RepositoryCommandOutput,
+}
+
+fn is_repository_command(command: &[u8]) -> bool {
+    command == b"repo" || command.starts_with(b"repo ")
+}
+
+fn requests_json(command: &[u8]) -> bool {
+    std::str::from_utf8(command).is_ok_and(|command| {
+        let tokens = command.split_ascii_whitespace().collect::<Vec<_>>();
+        tokens
+            .windows(2)
+            .any(|tokens| tokens == ["--output", "json"])
+    })
+}
+
+fn parse_repository_command(command: &[u8]) -> Result<RepositoryCreateCommand, ()> {
+    if command.len() > MAX_REPOSITORY_COMMAND_BYTES || !command.is_ascii() {
+        return Err(());
+    }
+    let command = std::str::from_utf8(command).map_err(|_| ())?;
+    if command
+        .bytes()
+        .any(|byte| byte.is_ascii_control() && byte != b' ')
+    {
+        return Err(());
+    }
+    let mut tokens = command.split_ascii_whitespace();
+    if tokens.next() != Some("repo") || tokens.next() != Some("create") {
+        return Err(());
+    }
+    let slug = tokens.next().ok_or(())?.to_owned();
+    let mut object_format = None;
+    let mut output = None;
+    while let Some(option) = tokens.next() {
+        let value = tokens.next().ok_or(())?;
+        match option {
+            "--object-format" if object_format.is_none() => {
+                object_format = Some(match value {
+                    "sha1" => gix::hash::Kind::Sha1,
+                    "sha256" => gix::hash::Kind::Sha256,
+                    _ => return Err(()),
+                });
+            }
+            "--output" if output.is_none() => {
+                output = Some(match value {
+                    "human" => RepositoryCommandOutput::Human,
+                    "json" => RepositoryCommandOutput::Json,
+                    _ => return Err(()),
+                });
+            }
+            _ => return Err(()),
+        }
+    }
+    Ok(RepositoryCreateCommand {
+        slug,
+        object_format: object_format.unwrap_or(gix::hash::Kind::Sha1),
+        output: output.unwrap_or(RepositoryCommandOutput::Human),
+    })
+}
+
+enum RepositoryCommandError {
+    Usage,
+    Unavailable,
+    Create(RepositoryServiceError),
+}
+
+async fn run_repository_command(
+    repositories: Option<Arc<GitRepositories>>,
+    actor: String,
+    command: RepositoryCreateCommand,
+) -> Result<(crate::store::RepositoryRecord, RepositoryCommandOutput), RepositoryCommandError> {
+    let repositories = repositories.ok_or(RepositoryCommandError::Unavailable)?;
+    let database = repositories
+        .push_database()
+        .ok_or(RepositoryCommandError::Unavailable)?
+        .to_owned();
+    let root = repositories.repository_root().to_owned();
+    let permit = repositories
+        .blocking_permit()
+        .await
+        .map_err(|_| RepositoryCommandError::Unavailable)?;
+    let output = command.output;
+    let correlation_id = format!("{:032x}", rand::random::<u128>());
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        RepositoryService::new(&database, &root)
+            .create_for_account(
+                &actor,
+                &command.slug,
+                command.object_format,
+                &correlation_id,
+            )
+            .map(|repository| (repository, output))
+            .map_err(RepositoryCommandError::Create)
+    })
+    .await
+    .map_err(|_| RepositoryCommandError::Unavailable)?
+}
+
+fn send_repository_command_result(
+    channel: ChannelId,
+    result: Result<
+        (crate::store::RepositoryRecord, RepositoryCommandOutput),
+        RepositoryCommandError,
+    >,
+    machine_requested: bool,
+    session: &mut Session,
+) -> Result<(), russh::Error> {
+    match result {
+        Ok((repository, RepositoryCommandOutput::Human)) => {
+            session.data(
+                channel,
+                format!(
+                    "Created repository {}/{}.\nObject format: {}\n",
+                    repository.owner, repository.slug, repository.object_format
+                )
+                .into_bytes(),
+            )?;
+            finish_git_channel(channel, 0, session)
+        }
+        Ok((repository, RepositoryCommandOutput::Json)) => {
+            session.data(
+                channel,
+                format!(
+                    "{{\"version\":1,\"status\":\"success\",\"repository\":{{\"owner\":\"{}\",\"name\":\"{}\",\"object_format\":\"{}\"}}}}\n",
+                    repository.owner, repository.slug, repository.object_format
+                )
+                .into_bytes(),
+            )?;
+            finish_git_channel(channel, 0, session)
+        }
+        Err(error) => {
+            if machine_requested {
+                session.data(
+                    channel,
+                    format!(
+                        "{{\"version\":1,\"status\":\"error\",\"error\":{{\"code\":\"{}\"}}}}\n",
+                        repository_command_error_code(&error)
+                    )
+                    .into_bytes(),
+                )?;
+            } else {
+                session.extended_data(
+                    channel,
+                    1,
+                    format!("tit: {}\n", repository_command_error_message(&error)).into_bytes(),
+                )?;
+            }
+            finish_git_channel(channel, 1, session)
+        }
+    }
+}
+
+fn repository_command_error_code(error: &RepositoryCommandError) -> &'static str {
+    match error {
+        RepositoryCommandError::Usage => "invalid-command",
+        RepositoryCommandError::Unavailable => "service-unavailable",
+        RepositoryCommandError::Create(RepositoryServiceError::Store(
+            crate::store::StoreError::RepositoryExists(_, _),
+        )) => "repository-exists",
+        RepositoryCommandError::Create(RepositoryServiceError::Auth(_))
+        | RepositoryCommandError::Create(RepositoryServiceError::RepositoryName(_)) => {
+            "invalid-name"
+        }
+        RepositoryCommandError::Create(RepositoryServiceError::Store(
+            crate::store::StoreError::AccountNotFound(_),
+        )) => "account-unavailable",
+        RepositoryCommandError::Create(_) => "repository-create-failed",
+    }
+}
+
+fn repository_command_error_message(error: &RepositoryCommandError) -> String {
+    match repository_command_error_code(error) {
+        "invalid-command" => format!("usage: {REPOSITORY_CREATE_USAGE}"),
+        "repository-exists" => "A repository with this name already exists.".to_owned(),
+        "invalid-name" => "The repository name is not valid.".to_owned(),
+        "account-unavailable" => "The account is not active.".to_owned(),
+        "service-unavailable" => "The repository service is not available.".to_owned(),
+        _ => "The repository could not be created.".to_owned(),
     }
 }
 

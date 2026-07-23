@@ -37,6 +37,12 @@ mod markdown;
 #[allow(dead_code, reason = "the public-route test uses anonymous policy only")]
 #[path = "../src/policy.rs"]
 mod policy;
+#[allow(
+    dead_code,
+    reason = "the public route test does not create repositories through forms"
+)]
+#[path = "../src/repository.rs"]
+mod repository;
 #[allow(dead_code, reason = "the public-route test does not complete a login")]
 #[path = "../src/session.rs"]
 mod session;

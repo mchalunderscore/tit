@@ -4,6 +4,9 @@
 )]
 #[path = "../src/auth.rs"]
 mod auth;
+#[allow(dead_code, reason = "the SSH Git test does not use domain models")]
+#[path = "../src/domain/mod.rs"]
+mod domain;
 #[allow(
     dead_code,
     reason = "the SSH Git test does not use each Git service API"
@@ -13,6 +16,9 @@ mod git;
 #[allow(dead_code, reason = "the SSH Git test does not use repository policy")]
 #[path = "../src/policy.rs"]
 mod policy;
+#[allow(dead_code, reason = "the SSH Git test does not create repositories")]
+#[path = "../src/repository.rs"]
+mod repository;
 #[allow(
     dead_code,
     reason = "the SSH Git test does not inspect the request audit"

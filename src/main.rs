@@ -18,6 +18,7 @@ mod http;
 mod instance;
 mod markdown;
 mod policy;
+mod repository;
 mod serve;
 mod session;
 #[allow(dead_code, reason = "the server uses only part of the shared SSH API")]
