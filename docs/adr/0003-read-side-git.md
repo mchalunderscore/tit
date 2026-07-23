@@ -1,6 +1,6 @@
 # Architectural decision record 0003: read-side Git protocol
 
-Status: Provisional
+Status: Accepted
 
 Date: 2026-07-22
 
@@ -81,8 +81,11 @@ process gives the server a `git` sentinel that fails and records use. An
 absolute stock Git client clones through that server. The clone succeeds and
 the sentinel is not used.
 
-The stripped local arm64 macOS release executable is 2,863,648 bytes. This
-decision stays provisional until the Ubuntu and macOS hosted M1C gates pass.
+The stripped local arm64 macOS release executable is 2,863,648 bytes. Hosted
+[CI run 29968062175](https://github.com/mchalunderscore/tit/actions/runs/29968062175)
+passed on 2026-07-23. It used Cargo 1.96.0 on Ubuntu 24.04 and arm64 macOS 26.
+The release executables were 3,239,192 bytes on Ubuntu and 2,847,136 bytes on
+macOS.
 
 ## Consequences
 
