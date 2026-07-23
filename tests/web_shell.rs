@@ -15,6 +15,8 @@ mod auth;
 mod domain;
 #[path = "../src/feed.rs"]
 mod feed;
+#[path = "../src/feed_token.rs"]
+mod feed_token;
 #[allow(dead_code, reason = "the shell test does not use each shared Git API")]
 #[path = "../src/git/mod.rs"]
 mod git;

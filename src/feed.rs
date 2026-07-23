@@ -3,13 +3,19 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use thiserror::Error;
 
-use crate::store::{RepositoryEventRecord, RepositoryRecord};
+use crate::store::{ActivityEventRecord, RepositoryEventRecord, RepositoryRecord};
 
 pub(crate) const PAGE_SIZE: usize = 20;
 
 pub(crate) enum FeedFormat {
     Atom,
     Rss,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RepositoryFeedKind {
+    Activity,
+    Issues,
 }
 
 pub(crate) struct FeedPage<'a> {
@@ -19,6 +25,7 @@ pub(crate) struct FeedPage<'a> {
     pub(crate) self_url: &'a str,
     pub(crate) events: &'a [RepositoryEventRecord],
     pub(crate) next_before: Option<i64>,
+    pub(crate) kind: RepositoryFeedKind,
 }
 
 impl FeedPage<'_> {
@@ -103,11 +110,22 @@ impl FeedPage<'_> {
     }
 
     fn feed_id(&self) -> String {
-        format!("urn:tit:repository:{}:events", self.repository.id)
+        let suffix = match self.kind {
+            RepositoryFeedKind::Activity => "events",
+            RepositoryFeedKind::Issues => "issues",
+        };
+        format!("urn:tit:repository:{}:{suffix}", self.repository.id)
     }
 
     fn feed_title(&self) -> String {
-        format!("{}/{} events", self.repository.owner, self.repository.slug)
+        let suffix = match self.kind {
+            RepositoryFeedKind::Activity => "events",
+            RepositoryFeedKind::Issues => "issues",
+        };
+        format!(
+            "{}/{} {suffix}",
+            self.repository.owner, self.repository.slug
+        )
     }
 
     fn repository_url(&self) -> String {
@@ -121,6 +139,126 @@ impl FeedPage<'_> {
         self.next_before
             .map(|before| format!("{}?before={before}", self.feed_url))
     }
+}
+
+pub(crate) struct ActivityFeedPage<'a> {
+    pub(crate) base_url: &'a str,
+    pub(crate) self_url: &'a str,
+    pub(crate) scope: &'a str,
+    pub(crate) username: &'a str,
+    pub(crate) target: Option<&'a str>,
+    pub(crate) events: &'a [ActivityEventRecord],
+}
+
+impl ActivityFeedPage<'_> {
+    pub(crate) fn render(&self, format: FeedFormat) -> Result<String, FeedError> {
+        match format {
+            FeedFormat::Atom => self.atom(),
+            FeedFormat::Rss => self.rss(),
+        }
+    }
+
+    fn atom(&self) -> Result<String, FeedError> {
+        let mut output = String::from(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<feed xmlns=\"http://www.w3.org/2005/Atom\">\n",
+        );
+        element(&mut output, "id", &self.feed_id())?;
+        element(&mut output, "title", &self.feed_title())?;
+        element(&mut output, "updated", &atom_date(self.updated())?)?;
+        empty_link(&mut output, "self", self.self_url)?;
+        for record in self.events {
+            let link = activity_link(self.base_url, record);
+            output.push_str("<entry>\n");
+            element(&mut output, "id", &event_id(&record.event.event_id))?;
+            element(&mut output, "title", &activity_title(record))?;
+            element(&mut output, "updated", &atom_date(record.event.created_at)?)?;
+            empty_link(&mut output, "alternate", &link)?;
+            output.push_str("<author>");
+            element(&mut output, "name", &record.event.actor)?;
+            output.push_str("</author>\n<content type=\"text\">");
+            escape_xml(&event_description(&record.event), &mut output)?;
+            output.push_str("</content>\n</entry>\n");
+        }
+        output.push_str("</feed>\n");
+        Ok(output)
+    }
+
+    fn rss(&self) -> Result<String, FeedError> {
+        let mut output = String::from(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\">\n<channel>\n",
+        );
+        element(&mut output, "title", &self.feed_title())?;
+        element(&mut output, "link", self.base_url)?;
+        element(&mut output, "description", &self.feed_title())?;
+        element(&mut output, "lastBuildDate", &rss_date(self.updated())?)?;
+        atom_link(&mut output, "self", self.self_url)?;
+        for record in self.events {
+            let link = activity_link(self.base_url, record);
+            output.push_str("<item>\n");
+            element(&mut output, "title", &activity_title(record))?;
+            element(&mut output, "link", &link)?;
+            write!(output, "<guid isPermaLink=\"false\">")?;
+            escape_xml(&event_id(&record.event.event_id), &mut output)?;
+            output.push_str("</guid>\n");
+            element(&mut output, "pubDate", &rss_date(record.event.created_at)?)?;
+            element(
+                &mut output,
+                "description",
+                &event_description(&record.event),
+            )?;
+            output.push_str("</item>\n");
+        }
+        output.push_str("</channel>\n</rss>\n");
+        Ok(output)
+    }
+
+    fn feed_id(&self) -> String {
+        format!(
+            "urn:tit:account:{}:{}:{}",
+            self.username,
+            self.scope,
+            self.target.unwrap_or(self.username)
+        )
+    }
+
+    fn feed_title(&self) -> String {
+        let title = match self.scope {
+            "repository" => "repository activity",
+            "watched" => "watched activity",
+            "assignments" => "assignments",
+            "mentions" => "mentions",
+            _ => "activity",
+        };
+        format!("{} {title}", self.username)
+    }
+
+    fn updated(&self) -> i64 {
+        self.events
+            .iter()
+            .map(|record| record.event.created_at)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+fn activity_title(record: &ActivityEventRecord) -> String {
+    format!(
+        "{}/{}: {}",
+        record.repository.owner,
+        record.repository.slug,
+        event_title(&record.event)
+    )
+}
+
+fn activity_link(base_url: &str, record: &ActivityEventRecord) -> String {
+    let repository_url = format!(
+        "{}/{}/{}",
+        base_url, record.repository.owner, record.repository.slug
+    );
+    let number = issue_payload(&record.event).and_then(|payload| payload.get("number")?.as_i64());
+    number.map_or(repository_url.clone(), |number| {
+        format!("{repository_url}/issues/{number}")
+    })
 }
 
 fn event_id(event_id: &str) -> String {

@@ -334,3 +334,17 @@ This command tests granular push, issue, and pull-request preferences, the
 preference handling, CSRF checks, and forms that operate without JavaScript.
 Read the [repository watches architectural decision record](docs/adr/0018-repository-watches.md)
 for the storage and privacy contracts.
+
+## Milestone 4.4 gate
+
+Run the scoped feed gate:
+
+```text
+./scripts/check-m4-4
+```
+
+This command tests public issue feeds, hash-only feed tokens, one-time token
+display, repository and personalized scopes, current private-repository access,
+rotation, revocation, stable event selection, and Atom and RSS parsing. Read the
+[scoped feeds architectural decision record](docs/adr/0019-scoped-feeds.md) for
+the token, authorization, and ordering contracts.

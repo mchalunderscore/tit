@@ -11,6 +11,7 @@ mod config;
 mod control;
 mod domain;
 mod feed;
+mod feed_token;
 #[allow(dead_code, reason = "the server uses only part of the shared Git API")]
 mod git;
 #[allow(dead_code, reason = "the server uses only part of the shared HTTP API")]

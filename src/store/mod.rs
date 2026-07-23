@@ -11,7 +11,8 @@ mod event;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
-const SCHEMA_VERSION: i64 = 13;
+const MAX_ACTIVE_FEED_TOKENS: i64 = 32;
+const SCHEMA_VERSION: i64 = 14;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -21,7 +22,7 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 13] = [
+const MIGRATIONS: [&str; 14] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
@@ -35,6 +36,7 @@ const MIGRATIONS: [&str; 13] = [
     include_str!("migrations/011_domain_events.sql"),
     include_str!("migrations/012_issues.sql"),
     include_str!("migrations/013_watches.sql"),
+    include_str!("migrations/014_feed_tokens.sql"),
 ];
 
 #[allow(
@@ -133,6 +135,14 @@ pub(crate) enum StoreError {
     IssueAssigneeNotFound(String),
     #[error("repository watch access is not authorized")]
     WatchDenied,
+    #[error("feed token access is not authorized")]
+    FeedTokenDenied,
+    #[error("feed token is invalid or revoked")]
+    FeedTokenNotFound,
+    #[error("an account cannot have more than 32 active feed tokens")]
+    FeedTokenLimit,
+    #[error("feed token scope is not valid")]
+    InvalidFeedScope,
 }
 
 pub(crate) struct Store {
@@ -1938,6 +1948,198 @@ impl Store {
         Ok(Some(record))
     }
 
+    pub(crate) fn create_feed_token(
+        &mut self,
+        actor: &str,
+        scope: &str,
+        repository: Option<(&str, &str)>,
+        token_hash: &[u8; 32],
+        created_at: i64,
+    ) -> Result<FeedTokenRecord, StoreError> {
+        validate_feed_scope(scope, repository)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let account_id = active_account_id(&transaction, actor)?;
+        let active_tokens: i64 = transaction.query_row(
+            "SELECT count(*) FROM feed_token
+             WHERE account_id = ?1 AND revoked_at IS NULL",
+            [account_id],
+            |row| row.get(0),
+        )?;
+        if active_tokens >= MAX_ACTIVE_FEED_TOKENS {
+            return Err(StoreError::FeedTokenLimit);
+        }
+        let repository_id = match repository {
+            Some((owner, repository)) => {
+                let access = repository_issue_access(&transaction, owner, repository, Some(actor))?;
+                if !access.can_read() {
+                    return Err(StoreError::FeedTokenDenied);
+                }
+                Some(access.repository.id)
+            }
+            None => None,
+        };
+        transaction.execute(
+            "INSERT INTO feed_token
+             (id, token_hash, account_id, scope, repository_id, created_at, revoked_at)
+             VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, NULL)",
+            rusqlite::params![
+                token_hash.as_slice(),
+                account_id,
+                scope,
+                repository_id,
+                created_at
+            ],
+        )?;
+        let record = transaction.query_row(
+            "SELECT feed_token.id, feed_token.scope, owner.username, repository.slug,
+                    feed_token.created_at, feed_token.revoked_at
+             FROM feed_token
+             LEFT JOIN repository ON repository.id = feed_token.repository_id
+             LEFT JOIN account AS owner ON owner.id = repository.owner_account_id
+             WHERE feed_token.rowid = last_insert_rowid()",
+            [],
+            feed_token_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub(crate) fn feed_tokens(&self, actor: &str) -> Result<Vec<FeedTokenRecord>, StoreError> {
+        let account_id = active_account_id(&self.connection, actor)?;
+        let mut statement = self.connection.prepare(
+            "SELECT feed_token.id, feed_token.scope, owner.username, repository.slug,
+                    feed_token.created_at, feed_token.revoked_at
+             FROM feed_token
+             LEFT JOIN repository ON repository.id = feed_token.repository_id
+             LEFT JOIN account AS owner ON owner.id = repository.owner_account_id
+             WHERE feed_token.account_id = ?1
+             ORDER BY feed_token.created_at DESC, feed_token.id
+             LIMIT 100",
+        )?;
+        statement
+            .query_map([account_id], feed_token_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn rotate_feed_token(
+        &mut self,
+        actor: &str,
+        id: &str,
+        token_hash: &[u8; 32],
+        changed_at: i64,
+    ) -> Result<FeedTokenRecord, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let account_id = active_account_id(&transaction, actor)?;
+        let current = transaction
+            .query_row(
+                "SELECT scope, repository_id FROM feed_token
+                 WHERE id = ?1 AND account_id = ?2 AND revoked_at IS NULL",
+                rusqlite::params![id, account_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::FeedTokenNotFound)?;
+        transaction.execute(
+            "UPDATE feed_token SET revoked_at = ?3
+             WHERE id = ?1 AND account_id = ?2 AND revoked_at IS NULL",
+            rusqlite::params![id, account_id, changed_at],
+        )?;
+        transaction.execute(
+            "INSERT INTO feed_token
+             (id, token_hash, account_id, scope, repository_id, created_at, revoked_at)
+             VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, NULL)",
+            rusqlite::params![
+                token_hash.as_slice(),
+                account_id,
+                current.0,
+                current.1,
+                changed_at
+            ],
+        )?;
+        let record = transaction.query_row(
+            "SELECT feed_token.id, feed_token.scope, owner.username, repository.slug,
+                    feed_token.created_at, feed_token.revoked_at
+             FROM feed_token
+             LEFT JOIN repository ON repository.id = feed_token.repository_id
+             LEFT JOIN account AS owner ON owner.id = repository.owner_account_id
+             WHERE feed_token.rowid = last_insert_rowid()",
+            [],
+            feed_token_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub(crate) fn revoke_feed_token(
+        &mut self,
+        actor: &str,
+        id: &str,
+        revoked_at: i64,
+    ) -> Result<(), StoreError> {
+        let account_id = active_account_id(&self.connection, actor)?;
+        let changed = self.connection.execute(
+            "UPDATE feed_token SET revoked_at = ?3
+             WHERE id = ?1 AND account_id = ?2 AND revoked_at IS NULL",
+            rusqlite::params![id, account_id, revoked_at],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::FeedTokenNotFound);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn token_feed_events(
+        &self,
+        token_hash: &[u8; 32],
+        limit: usize,
+    ) -> Result<TokenFeedPage, StoreError> {
+        let limit = i64::try_from(limit).map_err(|_| StoreError::EventLimit)?;
+        let grant = self
+            .connection
+            .query_row(
+                "SELECT feed_token.scope, feed_token.repository_id,
+                        account.id, account.username
+                 FROM feed_token
+                 JOIN account ON account.id = feed_token.account_id
+                 WHERE feed_token.token_hash = ?1 AND feed_token.revoked_at IS NULL
+                   AND account.state = 'active'",
+                [token_hash.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::FeedTokenNotFound)?;
+        let events = match grant.0.as_str() {
+            "repository" => token_repository_events(
+                &self.connection,
+                grant.1.as_deref().ok_or(StoreError::InvalidFeedScope)?,
+                grant.2,
+                limit,
+            )?,
+            "watched" => watched_feed_events(&self.connection, grant.2, limit)?,
+            "assignments" => assignment_feed_events(&self.connection, grant.2, &grant.3, limit)?,
+            "mentions" => mention_feed_events(&self.connection, grant.2, &grant.3, limit)?,
+            _ => return Err(StoreError::InvalidFeedScope),
+        };
+        Ok(TokenFeedPage {
+            scope: grant.0,
+            username: grant.3,
+            target: grant.1,
+            events,
+        })
+    }
+
     #[allow(
         dead_code,
         reason = "some integration tests compile storage without authorization"
@@ -2063,7 +2265,7 @@ impl Store {
         limit: usize,
     ) -> Result<(RepositoryRecord, Vec<RepositoryEventRecord>), StoreError> {
         let repository = self.public_repository(owner, slug)?;
-        self.repository_events_for(repository, before, limit)
+        self.repository_events_for(repository, before, limit, false)
     }
 
     #[allow(
@@ -2078,7 +2280,18 @@ impl Store {
         limit: usize,
     ) -> Result<(RepositoryRecord, Vec<RepositoryEventRecord>), StoreError> {
         let repository = self.repository(owner, slug)?;
-        self.repository_events_for(repository, before, limit)
+        self.repository_events_for(repository, before, limit, false)
+    }
+
+    pub(crate) fn repository_issue_events(
+        &self,
+        owner: &str,
+        slug: &str,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<(RepositoryRecord, Vec<RepositoryEventRecord>), StoreError> {
+        let repository = self.repository(owner, slug)?;
+        self.repository_events_for(repository, before, limit, true)
     }
 
     fn repository_events_for(
@@ -2086,6 +2299,7 @@ impl Store {
         repository: RepositoryRecord,
         before: Option<i64>,
         limit: usize,
+        issues_only: bool,
     ) -> Result<(RepositoryRecord, Vec<RepositoryEventRecord>), StoreError> {
         let limit = i64::try_from(limit).map_err(|_| StoreError::EventLimit)?;
         let mut statement = self.connection.prepare(
@@ -2093,24 +2307,28 @@ impl Store {
                     payload_version, payload, created_at
              FROM repository_event
              WHERE repository_id = ?1 AND (?2 IS NULL OR sequence < ?2)
+               AND (?4 = 0 OR kind LIKE 'issue-%')
              ORDER BY sequence DESC
              LIMIT ?3",
         )?;
         let events = statement
-            .query_map(rusqlite::params![repository.id, before, limit], |row| {
-                Ok(RepositoryEventRecord {
-                    event_id: row.get(0)?,
-                    sequence: row.get(1)?,
-                    kind: row.get(2)?,
-                    actor: row.get(3)?,
-                    ref_name: row.get(4)?,
-                    old_target: row.get(5)?,
-                    new_target: row.get(6)?,
-                    payload_version: row.get(7)?,
-                    payload: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map(
+                rusqlite::params![repository.id, before, limit, issues_only],
+                |row| {
+                    Ok(RepositoryEventRecord {
+                        event_id: row.get(0)?,
+                        sequence: row.get(1)?,
+                        kind: row.get(2)?,
+                        actor: row.get(3)?,
+                        ref_name: row.get(4)?,
+                        old_target: row.get(5)?,
+                        new_target: row.get(6)?,
+                        payload_version: row.get(7)?,
+                        payload: row.get(8)?,
+                        created_at: row.get(9)?,
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok((repository, events))
     }
@@ -2372,6 +2590,28 @@ pub(crate) struct WatchRecord {
     pub(crate) updated_at: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FeedTokenRecord {
+    pub(crate) id: String,
+    pub(crate) scope: String,
+    pub(crate) owner: Option<String>,
+    pub(crate) repository: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) revoked_at: Option<i64>,
+}
+
+pub(crate) struct ActivityEventRecord {
+    pub(crate) repository: RepositoryRecord,
+    pub(crate) event: RepositoryEventRecord,
+}
+
+pub(crate) struct TokenFeedPage {
+    pub(crate) scope: String,
+    pub(crate) username: String,
+    pub(crate) target: Option<String>,
+    pub(crate) events: Vec<ActivityEventRecord>,
+}
+
 pub(crate) struct GitOperationIntent<'a> {
     pub(crate) id: &'a str,
     pub(crate) repository_path: &'a str,
@@ -2542,6 +2782,211 @@ fn repository_issue_access(
         )),
         Err(error) => Err(error.into()),
     }
+}
+
+fn validate_feed_scope(scope: &str, repository: Option<(&str, &str)>) -> Result<(), StoreError> {
+    match (scope, repository) {
+        ("repository", Some(_)) | ("watched" | "assignments" | "mentions", None) => Ok(()),
+        _ => Err(StoreError::InvalidFeedScope),
+    }
+}
+
+fn feed_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedTokenRecord> {
+    Ok(FeedTokenRecord {
+        id: row.get(0)?,
+        scope: row.get(1)?,
+        owner: row.get(2)?,
+        repository: row.get(3)?,
+        created_at: row.get(4)?,
+        revoked_at: row.get(5)?,
+    })
+}
+
+fn activity_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActivityEventRecord> {
+    Ok(ActivityEventRecord {
+        repository: RepositoryRecord {
+            id: row.get(0)?,
+            owner: row.get(1)?,
+            slug: row.get(2)?,
+            visibility: row.get(3)?,
+            state: row.get(4)?,
+            object_format: row.get(5)?,
+            created_at: row.get(6)?,
+            archived_at: row.get(7)?,
+        },
+        event: RepositoryEventRecord {
+            event_id: row.get(8)?,
+            sequence: row.get(9)?,
+            kind: row.get(10)?,
+            actor: row.get(11)?,
+            ref_name: row.get(12)?,
+            old_target: row.get(13)?,
+            new_target: row.get(14)?,
+            payload_version: row.get(15)?,
+            payload: row.get(16)?,
+            created_at: row.get(17)?,
+        },
+    })
+}
+
+const ACTIVITY_SELECT: &str = "SELECT repository.id, owner.username, repository.slug,
+            repository.visibility, repository.state, repository.object_format,
+            repository.created_at, repository.archived_at,
+            repository_event.event_id, repository_event.sequence,
+            repository_event.kind, repository_event.actor, repository_event.ref_name,
+            repository_event.old_target, repository_event.new_target,
+            repository_event.payload_version, repository_event.payload,
+            repository_event.created_at
+     FROM repository_event
+     JOIN repository ON repository.id = repository_event.repository_id
+     JOIN account AS owner ON owner.id = repository.owner_account_id";
+
+fn token_repository_events(
+    connection: &Connection,
+    repository_id: &str,
+    account_id: i64,
+    limit: i64,
+) -> Result<Vec<ActivityEventRecord>, StoreError> {
+    let sql = format!(
+        "{ACTIVITY_SELECT}
+         WHERE repository.id = ?1 AND repository.state = 'active'
+           AND (repository.visibility = 'public'
+                OR repository.owner_account_id = ?2
+                OR EXISTS (
+                    SELECT 1 FROM repository_collaborator
+                    WHERE repository_collaborator.repository_id = repository.id
+                      AND repository_collaborator.account_id = ?2
+                ))
+         ORDER BY repository_event.sequence DESC LIMIT ?3"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    statement
+        .query_map(
+            rusqlite::params![repository_id, account_id, limit],
+            activity_from_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn watched_feed_events(
+    connection: &Connection,
+    account_id: i64,
+    limit: i64,
+) -> Result<Vec<ActivityEventRecord>, StoreError> {
+    let sql = format!(
+        "{ACTIVITY_SELECT}
+         JOIN watch
+           ON watch.repository_id = repository.id AND watch.account_id = ?1
+         WHERE repository.state = 'active'
+           AND (repository.visibility = 'public'
+                OR repository.owner_account_id = ?1
+                OR EXISTS (
+                    SELECT 1 FROM repository_collaborator
+                    WHERE repository_collaborator.repository_id = repository.id
+                      AND repository_collaborator.account_id = ?1
+                ))
+           AND ((watch.pushes = 1 AND repository_event.kind IN
+                    ('push', 'ref-created', 'ref-updated', 'ref-deleted',
+                     'tag-created', 'tag-updated', 'tag-deleted'))
+                OR (watch.issues = 1 AND repository_event.kind LIKE 'issue-%')
+                OR (watch.pull_requests = 1
+                    AND repository_event.kind LIKE 'pull-request-%'))
+         ORDER BY repository_event.created_at DESC, repository_event.event_id DESC
+         LIMIT ?2"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    statement
+        .query_map(rusqlite::params![account_id, limit], activity_from_row)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn assignment_feed_events(
+    connection: &Connection,
+    account_id: i64,
+    username: &str,
+    limit: i64,
+) -> Result<Vec<ActivityEventRecord>, StoreError> {
+    let sql = format!(
+        "{ACTIVITY_SELECT}
+         WHERE repository.state = 'active'
+           AND repository_event.kind = 'issue-assigned'
+           AND json_extract(repository_event.payload, '$.assignee') = ?2
+           AND (repository.visibility = 'public'
+                OR repository.owner_account_id = ?1
+                OR EXISTS (
+                    SELECT 1 FROM repository_collaborator
+                    WHERE repository_collaborator.repository_id = repository.id
+                      AND repository_collaborator.account_id = ?1
+                ))
+         ORDER BY repository_event.created_at DESC, repository_event.event_id DESC
+         LIMIT ?3"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    statement
+        .query_map(
+            rusqlite::params![account_id, username, limit],
+            activity_from_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn mention_feed_events(
+    connection: &Connection,
+    account_id: i64,
+    username: &str,
+    limit: i64,
+) -> Result<Vec<ActivityEventRecord>, StoreError> {
+    let scan_limit = limit.saturating_mul(50).min(1_000);
+    let sql = format!(
+        "{ACTIVITY_SELECT}
+         WHERE repository.state = 'active'
+           AND repository_event.kind IN
+               ('issue-created', 'issue-edited', 'issue-commented')
+           AND (repository.visibility = 'public'
+                OR repository.owner_account_id = ?1
+                OR EXISTS (
+                    SELECT 1 FROM repository_collaborator
+                    WHERE repository_collaborator.repository_id = repository.id
+                      AND repository_collaborator.account_id = ?1
+                ))
+         ORDER BY repository_event.created_at DESC, repository_event.event_id DESC
+         LIMIT ?2"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let candidates = statement
+        .query_map(rusqlite::params![account_id, scan_limit], activity_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let limit = usize::try_from(limit).map_err(|_| StoreError::EventLimit)?;
+    Ok(candidates
+        .into_iter()
+        .filter(|record| event_mentions(&record.event, username))
+        .take(limit)
+        .collect())
+}
+
+fn event_mentions(event: &RepositoryEventRecord, username: &str) -> bool {
+    if event.payload_version != event::PAYLOAD_VERSION {
+        return false;
+    }
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload) else {
+        return false;
+    };
+    let Some(body) = payload.get("body").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let mention = format!("@{username}");
+    body.match_indices(&mention).any(|(start, _)| {
+        let before = body[..start].chars().next_back();
+        let after = body[start + mention.len()..].chars().next();
+        !before.is_some_and(is_username_character) && !after.is_some_and(is_username_character)
+    })
+}
+
+fn is_username_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '-'
 }
 
 fn find_issue(
@@ -2858,11 +3303,8 @@ fn require_one_intent(id: &str, changed: usize) -> Result<(), StoreError> {
     }
 }
 
-fn active_account_id(
-    transaction: &rusqlite::Transaction<'_>,
-    username: &str,
-) -> Result<i64, StoreError> {
-    let result = transaction.query_row(
+fn active_account_id(connection: &Connection, username: &str) -> Result<i64, StoreError> {
+    let result = connection.query_row(
         "SELECT id FROM account WHERE username = ?1 AND state = 'active'",
         [username],
         |row| row.get(0),

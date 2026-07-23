@@ -1,3 +1,4 @@
+mod feeds;
 mod issues;
 mod public;
 mod watches;
@@ -22,6 +23,7 @@ use tokio::task::JoinHandle;
 use crate::account::{AccountError, AccountService};
 use crate::auth::validate_username;
 use crate::domain::repository::validate_slug;
+use crate::feed_token::FeedTokenService;
 use crate::issue::IssueService;
 use crate::repository::{RepositoryService, RepositoryServiceError};
 use crate::session::{SessionError, WebLoginService};
@@ -47,6 +49,7 @@ struct WebState {
     login: Option<WebLoginService>,
     repositories: Option<RepositoryService>,
     issues: Option<IssueService>,
+    feeds: Option<FeedTokenService>,
     watches: Option<WatchService>,
     secure_cookies: bool,
 }
@@ -81,6 +84,7 @@ impl RunningWebServer {
                 login: None,
                 repositories: None,
                 issues: None,
+                feeds: None,
                 watches: None,
                 secure_cookies: false,
             },
@@ -118,6 +122,7 @@ impl RunningWebServer {
         let public = PublicWeb::open(config, Arc::clone(&jobs))?;
         let repositories = RepositoryService::new(public.database(), public.repository_root());
         let issues = IssueService::new(public.database());
+        let feeds = FeedTokenService::new(public.database());
         let watches = WatchService::new(public.database());
         Self::start_with_state(
             address,
@@ -129,6 +134,7 @@ impl RunningWebServer {
                 login: Some(login),
                 repositories: Some(repositories),
                 issues: Some(issues),
+                feeds: Some(feeds),
                 watches: Some(watches),
                 secure_cookies,
             },
@@ -174,6 +180,7 @@ pub(crate) fn router() -> Router {
         login: None,
         repositories: None,
         issues: None,
+        feeds: None,
         watches: None,
         secure_cookies: false,
     })
@@ -226,6 +233,7 @@ fn router_with_state(state: WebState) -> Router {
             axum::routing::post(logout).layer(DefaultBodyLimit::max(1024)),
         )
         .route("/assets/style.css", get(style))
+        .merge(feeds::routes())
         .merge(repository_routes)
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)

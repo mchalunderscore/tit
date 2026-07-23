@@ -57,6 +57,16 @@ const V12_FIXTURE: &str = concat!(
     include_str!("../src/store/migrations/012_issues.sql"),
     "PRAGMA user_version = 12;\n",
 );
+const V13_FIXTURE: &str = concat!(
+    include_str!("fixtures/sqlite/v7.sql"),
+    include_str!("../src/store/migrations/008_web_sessions.sql"),
+    include_str!("../src/store/migrations/009_repository_authorization.sql"),
+    include_str!("../src/store/migrations/010_audit_history.sql"),
+    include_str!("../src/store/migrations/011_domain_events.sql"),
+    include_str!("../src/store/migrations/012_issues.sql"),
+    include_str!("../src/store/migrations/013_watches.sql"),
+    "PRAGMA user_version = 13;\n",
+);
 
 fn database(directory: &TempDir, name: &str) -> std::path::PathBuf {
     directory.path().join(name)
@@ -174,7 +184,7 @@ fn configures_connections_and_creates_the_current_schema() {
     let directory = TempDir::new().expect("create a temporary directory");
     let store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
 
-    assert_eq!(store.schema_version().expect("read the schema version"), 13);
+    assert_eq!(store.schema_version().expect("read the schema version"), 14);
     assert_eq!(
         store
             .connection()
@@ -971,6 +981,145 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
             .is_err()
     );
 
+    store
+        .set_watch(
+            "alice",
+            "project",
+            "bob",
+            WatchPreferences {
+                pushes: false,
+                issues: true,
+                pull_requests: false,
+            },
+            20,
+        )
+        .expect("restore the issue watch");
+    store
+        .comment_issue(
+            "alice",
+            "project",
+            1,
+            "carol",
+            "Please review this, @bob. Do not match @bobby.",
+            21,
+        )
+        .expect("create a mention event");
+    let repository_token = store
+        .create_feed_token(
+            "bob",
+            "repository",
+            Some(("alice", "project")),
+            &[1; 32],
+            22,
+        )
+        .expect("create a private repository feed token");
+    let watched_token = store
+        .create_feed_token("bob", "watched", None, &[2; 32], 23)
+        .expect("create a watched feed token");
+    let assignment_token = store
+        .create_feed_token("bob", "assignments", None, &[3; 32], 24)
+        .expect("create an assignment feed token");
+    let mention_token = store
+        .create_feed_token("bob", "mentions", None, &[4; 32], 25)
+        .expect("create a mention feed token");
+    assert!(matches!(
+        store.create_feed_token(
+            "stranger",
+            "repository",
+            Some(("alice", "project")),
+            &[5; 32],
+            26,
+        ),
+        Err(StoreError::FeedTokenDenied)
+    ));
+    assert!(matches!(
+        store.create_feed_token("bob", "repository", None, &[5; 32], 26),
+        Err(StoreError::InvalidFeedScope)
+    ));
+    let private_page = store
+        .token_feed_events(&[1; 32], 100)
+        .expect("read a private repository feed");
+    assert_eq!(private_page.scope, "repository");
+    assert_eq!(private_page.username, "bob");
+    assert_eq!(
+        private_page.target.as_deref(),
+        Some("00112233445566778899aabbccddeeff")
+    );
+    assert!(
+        private_page
+            .events
+            .iter()
+            .all(|event| event.repository.slug == "project")
+    );
+    let watched_page = store
+        .token_feed_events(&[2; 32], 100)
+        .expect("read watched issue activity");
+    assert!(
+        watched_page
+            .events
+            .iter()
+            .all(|event| event.event.kind.starts_with("issue-"))
+    );
+    assert!(!watched_page.events.is_empty());
+    let assignment_page = store
+        .token_feed_events(&[3; 32], 100)
+        .expect("read assignment activity");
+    assert_eq!(assignment_page.events.len(), 1);
+    assert_eq!(assignment_page.events[0].event.kind, "issue-assigned");
+    let mention_page = store
+        .token_feed_events(&[4; 32], 100)
+        .expect("read mention activity");
+    assert_eq!(mention_page.events.len(), 1);
+    assert_eq!(mention_page.events[0].event.kind, "issue-commented");
+    assert_eq!(store.feed_tokens("bob").expect("list feed tokens").len(), 4);
+    store
+        .connection()
+        .execute_batch(
+            "CREATE TEMP TRIGGER reject_feed_token
+             BEFORE INSERT ON feed_token
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected feed token failure');
+             END;",
+        )
+        .expect("inject a feed token failure");
+    assert!(matches!(
+        store.rotate_feed_token("bob", &repository_token.id, &[7; 32], 27),
+        Err(StoreError::Sqlite(_))
+    ));
+    store
+        .token_feed_events(&[1; 32], 100)
+        .expect("retain the old token after a failed rotation");
+    store
+        .connection()
+        .execute_batch("DROP TRIGGER reject_feed_token;")
+        .expect("remove the feed token failure");
+    let rotated = store
+        .rotate_feed_token("bob", &repository_token.id, &[6; 32], 28)
+        .expect("rotate a repository feed token");
+    assert_eq!(rotated.scope, repository_token.scope);
+    assert!(matches!(
+        store.token_feed_events(&[1; 32], 100),
+        Err(StoreError::FeedTokenNotFound)
+    ));
+    store
+        .revoke_feed_token("bob", &rotated.id, 29)
+        .expect("revoke a repository feed token");
+    assert!(matches!(
+        store.token_feed_events(&[6; 32], 100),
+        Err(StoreError::FeedTokenNotFound)
+    ));
+    assert!(
+        store
+            .repository_issue_events("alice", "project", None, 100)
+            .expect("read issue-only events")
+            .1
+            .iter()
+            .all(|event| event.kind.starts_with("issue-"))
+    );
+    assert_eq!(watched_token.scope, "watched");
+    assert_eq!(assignment_token.scope, "assignments");
+    assert_eq!(mention_token.scope, "mentions");
+
     let comments_before: i64 = store
         .connection()
         .query_row("SELECT count(*) FROM issue_comment", [], |row| row.get(0))
@@ -997,6 +1146,33 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
             .expect("count comments after rollback"),
         comments_before
     );
+    store
+        .connection()
+        .execute(
+            "DELETE FROM repository_collaborator
+             WHERE repository_id = '00112233445566778899aabbccddeeff'
+               AND account_id = 2",
+            [],
+        )
+        .expect("remove the feed account repository role");
+    for hash in [[2; 32], [3; 32], [4; 32]] {
+        assert!(
+            store
+                .token_feed_events(&hash, 100)
+                .expect("read a feed after role removal")
+                .events
+                .is_empty()
+        );
+    }
+    for value in 10_u8..39 {
+        store
+            .create_feed_token("bob", "mentions", None, &[value; 32], 30 + i64::from(value))
+            .expect("fill the active feed token limit");
+    }
+    assert!(matches!(
+        store.create_feed_token("bob", "mentions", None, &[40; 32], 70),
+        Err(StoreError::FeedTokenLimit)
+    ));
 }
 
 #[test]
@@ -1339,13 +1515,14 @@ fn migrates_each_committed_historical_fixture() {
         (V10_FIXTURE, 10),
         (V11_FIXTURE, 11),
         (V12_FIXTURE, 12),
+        (V13_FIXTURE, 13),
     ] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "tit.sqlite3");
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
-        assert_eq!(store.schema_version().expect("read the schema version"), 13);
+        assert_eq!(store.schema_version().expect("read the schema version"), 14);
         store.integrity_check().expect("check migrated integrity");
         let state: String = store
             .connection()
@@ -1418,7 +1595,7 @@ fn backfills_repository_events_when_version_five_is_migrated() {
 
 #[test]
 fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
-    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 13)] {
+    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 14)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "fixture.sqlite");
         create_fixture(&path, V1_FIXTURE);

@@ -14,6 +14,8 @@ mod auth;
 mod domain;
 #[path = "../src/feed.rs"]
 mod feed;
+#[path = "../src/feed_token.rs"]
+mod feed_token;
 #[allow(
     dead_code,
     reason = "the public-route test does not use each shared Git API"
@@ -661,7 +663,10 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     for (path, fields) in [
         (
             "/alice/example/issues/1/comments",
-            vec![("csrf", csrf.as_str()), ("body", "A **comment**.")],
+            vec![
+                ("csrf", csrf.as_str()),
+                ("body", "A **comment** for @alice."),
+            ],
         ),
         (
             "/alice/example/issues/1/edit",
@@ -725,6 +730,25 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     let feed = request(server.address(), "GET", "/alice/example/atom.xml", &[], &[]);
     assert_eq!(feed.status, 200);
     assert!(feed.text().contains("alice reopened #1"));
+    for (path, content_type) in [
+        (
+            "/alice/example/issues/atom.xml",
+            "application/atom+xml; charset=utf-8",
+        ),
+        (
+            "/alice/example/issues/rss.xml",
+            "application/rss+xml; charset=utf-8",
+        ),
+    ] {
+        let issue_feed = request(server.address(), "GET", path, &[], &[]);
+        assert_eq!(issue_feed.status, 200);
+        assert_eq!(issue_feed.header("content-type"), content_type);
+        let parsed = feed_rs::parser::parse(issue_feed.body.as_slice())
+            .expect("parse the public issue feed");
+        assert!(!parsed.entries.is_empty());
+        assert!(issue_feed.text().contains("reopened #1"));
+        assert!(!issue_feed.text().contains("Repository imported"));
+    }
 
     let anonymous_watch = request(server.address(), "GET", "/alice/example/watch", &[], &[]);
     assert_eq!(anonymous_watch.status, 200);
@@ -774,6 +798,184 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
             .contains("You watch selected activity in this repository.")
     );
     assert_eq!(selected.text().matches("value=\"1\" selected").count(), 3);
+
+    let feed_tokens = request(
+        server.address(),
+        "GET",
+        "/feeds",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    );
+    assert_eq!(feed_tokens.status, 200);
+    assert!(feed_tokens.text().contains("Feed URLs are credentials."));
+    let issue_repository_token = form(&[
+        ("csrf", csrf.as_str()),
+        ("scope", "repository"),
+        ("owner", "alice"),
+        ("repository", "example"),
+    ]);
+    let issued = request(
+        server.address(),
+        "POST",
+        "/feeds/tokens",
+        &headers,
+        issue_repository_token.as_bytes(),
+    );
+    assert_eq!(issued.status, 201);
+    assert!(issued.text().contains("tit will not show them again."));
+    let private_token = extract_feed_token(issued.text());
+    let private_path = format!("/feeds/{private_token}/atom.xml");
+    let private_feed = request(server.address(), "GET", &private_path, &[], &[]);
+    assert_eq!(private_feed.status, 200);
+    assert_eq!(private_feed.header("cache-control"), "private, no-store");
+    assert_eq!(private_feed.header("referrer-policy"), "no-referrer");
+    assert!(private_feed.text().contains("alice/example"));
+    let private_hash: [u8; 32] = Sha256::digest(private_token.as_bytes()).into();
+    let token_store = Store::open(&database).expect("open the feed token database");
+    let (private_id, stored_hash): (String, Vec<u8>) = token_store
+        .connection()
+        .query_row(
+            "SELECT id, token_hash FROM feed_token
+             WHERE scope = 'repository' AND revoked_at IS NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read the stored feed token hash");
+    assert_eq!(stored_hash, private_hash);
+    assert_ne!(stored_hash, private_token.as_bytes());
+    drop(token_store);
+    let hidden_token = request(
+        server.address(),
+        "GET",
+        "/feeds",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    );
+    assert!(!hidden_token.text().contains(&private_token));
+
+    let private_store = Store::open(&database).expect("open the private feed database");
+    private_store
+        .connection()
+        .execute(
+            "UPDATE repository SET visibility = 'private' WHERE slug = 'example'",
+            [],
+        )
+        .expect("make the feed repository private");
+    drop(private_store);
+    assert_eq!(
+        request(
+            server.address(),
+            "GET",
+            "/alice/example/issues/atom.xml",
+            &[],
+            &[],
+        )
+        .status,
+        404
+    );
+    assert_eq!(
+        request(server.address(), "GET", &private_path, &[], &[]).status,
+        200
+    );
+
+    let rotate = form(&[("csrf", csrf.as_str())]);
+    let rotated = request(
+        server.address(),
+        "POST",
+        &format!("/feeds/tokens/{private_id}/rotate"),
+        &headers,
+        rotate.as_bytes(),
+    );
+    assert_eq!(rotated.status, 201);
+    let rotated_token = extract_feed_token(rotated.text());
+    assert_ne!(rotated_token, private_token);
+    assert_eq!(
+        request(server.address(), "GET", &private_path, &[], &[]).status,
+        404
+    );
+    let rotated_path = format!("/feeds/{rotated_token}/rss.xml");
+    assert_eq!(
+        request(server.address(), "GET", &rotated_path, &[], &[]).status,
+        200
+    );
+    let rotated_hash: [u8; 32] = Sha256::digest(rotated_token.as_bytes()).into();
+    let rotated_store = Store::open(&database).expect("open the rotated feed database");
+    let rotated_id: String = rotated_store
+        .connection()
+        .query_row(
+            "SELECT id FROM feed_token WHERE token_hash = ?1 AND revoked_at IS NULL",
+            [rotated_hash.as_slice()],
+            |row| row.get(0),
+        )
+        .expect("read the rotated feed token ID");
+    drop(rotated_store);
+    let revoked = request(
+        server.address(),
+        "POST",
+        &format!("/feeds/tokens/{rotated_id}/revoke"),
+        &headers,
+        rotate.as_bytes(),
+    );
+    assert_eq!(revoked.status, 303);
+    assert_eq!(
+        request(server.address(), "GET", &rotated_path, &[], &[]).status,
+        404
+    );
+
+    for (scope, expected, excluded, format) in [
+        (
+            "watched",
+            "commented on #1",
+            "no excluded event",
+            "atom.xml",
+        ),
+        (
+            "assignments",
+            "assigned alice on #1",
+            "commented on #1",
+            "rss.xml",
+        ),
+        (
+            "mentions",
+            "commented on #1",
+            "assigned alice on #1",
+            "atom.xml",
+        ),
+    ] {
+        let body = form(&[
+            ("csrf", csrf.as_str()),
+            ("scope", scope),
+            ("owner", ""),
+            ("repository", ""),
+        ]);
+        let issued = request(
+            server.address(),
+            "POST",
+            "/feeds/tokens",
+            &headers,
+            body.as_bytes(),
+        );
+        assert_eq!(issued.status, 201, "did not issue the {scope} token");
+        let token = extract_feed_token(issued.text());
+        let response = request(
+            server.address(),
+            "GET",
+            &format!("/feeds/{token}/{format}"),
+            &[],
+            &[],
+        );
+        assert_eq!(response.status, 200, "did not read the {scope} feed");
+        feed_rs::parser::parse(response.body.as_slice())
+            .unwrap_or_else(|_| panic!("parse the {scope} feed"));
+        assert!(response.text().contains(expected), "wrong {scope} feed");
+        if excluded != "no excluded event" {
+            assert!(
+                !response.text().contains(excluded),
+                "the {scope} token escaped its scope"
+            );
+        }
+    }
+
     let none = form(&[
         ("csrf", csrf.as_str()),
         ("pushes", "0"),
@@ -807,6 +1009,15 @@ fn form(fields: &[(&str, &str)]) -> String {
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     serializer.extend_pairs(fields.iter().copied());
     serializer.finish()
+}
+
+fn extract_feed_token(body: &str) -> String {
+    let marker = "/feeds/";
+    let start = body.find(marker).expect("find a feed URL") + marker.len();
+    let token = body[start..].split('/').next().expect("read a feed token");
+    assert_eq!(token.len(), 64);
+    assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    token.to_owned()
 }
 
 fn assert_hidden(address: SocketAddr, head: &str) {

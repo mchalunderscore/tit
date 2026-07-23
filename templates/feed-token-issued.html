@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}New feed token · tit{% endblock %}
+{% block content %}
+  <h1>New feed token</h1>
+  <p>This token gives access to {{ scope }} for {{ target }}. Copy the URLs now. tit will not show them again.</p>
+  <dl>
+    <dt>Atom</dt>
+    <dd><code>/feeds/{{ token }}/atom.xml</code></dd>
+    <dt>RSS</dt>
+    <dd><code>/feeds/{{ token }}/rss.xml</code></dd>
+  </dl>
+  <p>Keep these URLs secret. Rotate or revoke the token if a URL is exposed.</p>
+  <p><a href="/feeds">Return to feed tokens</a></p>
+{% endblock %}

@@ -22,7 +22,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::auth::validate_username;
 use crate::domain::repository::validate_slug;
-use crate::feed::{FeedFormat, FeedPage, PAGE_SIZE};
+use crate::feed::{FeedFormat, FeedPage, PAGE_SIZE, RepositoryFeedKind};
 use crate::git::packetline::MAX_REQUEST_BYTES;
 use crate::git::read::{
     BlameHunk, CommitInfo, DiffFile, ReadCancellation, ReadError, ReadLimits,
@@ -82,6 +82,10 @@ impl PublicWeb {
         &self.repositories
     }
 
+    pub(super) fn http_clone_base(&self) -> &str {
+        &self.http_clone_base
+    }
+
     async fn read<T, F>(
         &self,
         actor: Option<String>,
@@ -123,6 +127,7 @@ impl PublicWeb {
         owner: String,
         repository: String,
         before: Option<i64>,
+        kind: RepositoryFeedKind,
     ) -> Result<(RepositoryRecord, Vec<crate::store::RepositoryEventRecord>), RouteError> {
         validate_username(&owner).map_err(|_| RouteError::NotFound)?;
         validate_slug(&repository).map_err(|_| RouteError::NotFound)?;
@@ -142,9 +147,16 @@ impl PublicWeb {
                 &repository,
                 RepositoryOperation::Read,
             )?;
-            Store::open(&database)?
-                .repository_events(&owner, &repository, before, PAGE_SIZE + 1)
-                .map_err(Into::into)
+            let store = Store::open(&database)?;
+            match kind {
+                RepositoryFeedKind::Activity => {
+                    store.repository_events(&owner, &repository, before, PAGE_SIZE + 1)
+                }
+                RepositoryFeedKind::Issues => {
+                    store.repository_issue_events(&owner, &repository, before, PAGE_SIZE + 1)
+                }
+            }
+            .map_err(Into::into)
         })
         .await
         .map_err(|_| RouteError::Internal)?
@@ -254,6 +266,11 @@ pub(super) fn routes() -> Router<WebState> {
         .route("/{owner}/{repository}/refs", get(refs))
         .route("/{owner}/{repository}/atom.xml", get(atom_feed))
         .route("/{owner}/{repository}/rss.xml", get(rss_feed))
+        .route(
+            "/{owner}/{repository}/issues/atom.xml",
+            get(issue_atom_feed),
+        )
+        .route("/{owner}/{repository}/issues/rss.xml", get(issue_rss_feed))
         .route("/{owner}/{repository}/search", get(search))
         .route("/{owner}/{repository}/commit/{commit}", get(commit))
         .route("/{owner}/{repository}/diff/{old}/{new}", get(diff))
@@ -281,7 +298,7 @@ async fn atom_feed(
         path,
         query,
         headers,
-        FeedFormat::Atom,
+        (FeedFormat::Atom, RepositoryFeedKind::Activity),
     )
     .await
 }
@@ -301,7 +318,47 @@ async fn rss_feed(
         path,
         query,
         headers,
-        FeedFormat::Rss,
+        (FeedFormat::Rss, RepositoryFeedKind::Activity),
+    )
+    .await
+}
+
+async fn issue_atom_feed(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
+    AxumPath(path): AxumPath<RepositoryPath>,
+    Query(query): Query<FeedQuery>,
+    headers: HeaderMap,
+) -> Response {
+    feed_response(
+        state,
+        request_id,
+        actor,
+        path,
+        query,
+        headers,
+        (FeedFormat::Atom, RepositoryFeedKind::Issues),
+    )
+    .await
+}
+
+async fn issue_rss_feed(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
+    AxumPath(path): AxumPath<RepositoryPath>,
+    Query(query): Query<FeedQuery>,
+    headers: HeaderMap,
+) -> Response {
+    feed_response(
+        state,
+        request_id,
+        actor,
+        path,
+        query,
+        headers,
+        (FeedFormat::Rss, RepositoryFeedKind::Issues),
     )
     .await
 }
@@ -313,8 +370,9 @@ async fn feed_response(
     path: RepositoryPath,
     query: FeedQuery,
     headers: HeaderMap,
-    format: FeedFormat,
+    feed: (FeedFormat, RepositoryFeedKind),
 ) -> Response {
+    let (format, kind) = feed;
     if matches!(query.before, Some(before) if before <= 0) {
         return route_error(RouteError::InvalidRequest, &request_id.0);
     }
@@ -324,7 +382,13 @@ async fn feed_response(
     let owner = path.owner;
     let repository = path.repository;
     let (record, mut events) = match web
-        .event_page(actor.0, owner.clone(), repository.clone(), query.before)
+        .event_page(
+            actor.0,
+            owner.clone(),
+            repository.clone(),
+            query.before,
+            kind,
+        )
         .await
     {
         Ok(page) => page,
@@ -356,6 +420,7 @@ async fn feed_response(
         self_url: &self_url,
         events: &events,
         next_before,
+        kind,
     })
     .render(format)
     {
@@ -849,7 +914,7 @@ fn render_page(result: Result<RepositoryPage, RouteError>, request_id: &str) -> 
     }
 }
 
-fn conditional_feed(
+pub(super) fn conditional_feed(
     headers: &HeaderMap,
     name: &str,
     body: String,
