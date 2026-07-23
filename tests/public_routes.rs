@@ -48,6 +48,8 @@ mod policy;
 )]
 #[path = "../src/repository.rs"]
 mod repository;
+#[path = "../src/search.rs"]
+mod search;
 #[allow(dead_code, reason = "the public-route test does not complete a login")]
 #[path = "../src/session.rs"]
 mod session;
@@ -727,6 +729,26 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     assert!(final_text.contains("Assignees: <span>alice</span>"));
     assert!(final_text.contains("issue-created"));
     assert!(final_text.contains("issue-reopened"));
+    let search_page = request(server.address(), "GET", "/search", &[], &[]);
+    assert_eq!(search_page.status, 200);
+    assert!(
+        search_page
+            .text()
+            .contains("Search repositories and issues")
+    );
+    let metadata_search = request(
+        server.address(),
+        "GET",
+        "/search?q=Edited%20issue",
+        &[],
+        &[],
+    );
+    assert_eq!(metadata_search.status, 200);
+    assert!(metadata_search.text().contains("/alice/example/issues/1"));
+    assert_eq!(
+        request(server.address(), "GET", "/search?q=", &[], &[]).status,
+        400
+    );
     let feed = request(server.address(), "GET", "/alice/example/atom.xml", &[], &[]);
     assert_eq!(feed.status, 200);
     assert!(feed.text().contains("alice reopened #1"));
@@ -872,6 +894,30 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
         )
         .status,
         404
+    );
+    let anonymous_private_search = request(
+        server.address(),
+        "GET",
+        "/search?q=Edited%20issue",
+        &[],
+        &[],
+    );
+    assert!(
+        anonymous_private_search
+            .text()
+            .contains("No repository or issue matched")
+    );
+    let owner_private_search = request(
+        server.address(),
+        "GET",
+        "/search?q=Edited%20issue",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    );
+    assert!(
+        owner_private_search
+            .text()
+            .contains("/alice/example/issues/1")
     );
     assert_eq!(
         request(server.address(), "GET", &private_path, &[], &[]).status,

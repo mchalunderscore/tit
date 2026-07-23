@@ -1,5 +1,6 @@
 mod feeds;
 mod issues;
+mod metadata_search;
 mod public;
 mod watches;
 
@@ -26,6 +27,7 @@ use crate::domain::repository::validate_slug;
 use crate::feed_token::FeedTokenService;
 use crate::issue::IssueService;
 use crate::repository::{RepositoryService, RepositoryServiceError};
+use crate::search::MetadataSearchService;
 use crate::session::{SessionError, WebLoginService};
 use crate::store::StoreError;
 use crate::watch::WatchService;
@@ -50,6 +52,7 @@ struct WebState {
     repositories: Option<RepositoryService>,
     issues: Option<IssueService>,
     feeds: Option<FeedTokenService>,
+    search: Option<MetadataSearchService>,
     watches: Option<WatchService>,
     secure_cookies: bool,
 }
@@ -85,6 +88,7 @@ impl RunningWebServer {
                 repositories: None,
                 issues: None,
                 feeds: None,
+                search: None,
                 watches: None,
                 secure_cookies: false,
             },
@@ -123,6 +127,7 @@ impl RunningWebServer {
         let repositories = RepositoryService::new(public.database(), public.repository_root());
         let issues = IssueService::new(public.database());
         let feeds = FeedTokenService::new(public.database());
+        let search = MetadataSearchService::new(public.database());
         let watches = WatchService::new(public.database());
         Self::start_with_state(
             address,
@@ -135,6 +140,7 @@ impl RunningWebServer {
                 repositories: Some(repositories),
                 issues: Some(issues),
                 feeds: Some(feeds),
+                search: Some(search),
                 watches: Some(watches),
                 secure_cookies,
             },
@@ -181,13 +187,15 @@ pub(crate) fn router() -> Router {
         repositories: None,
         issues: None,
         feeds: None,
+        search: None,
         watches: None,
         secure_cookies: false,
     })
 }
 
 fn router_with_state(state: WebState) -> Router {
-    let repository_routes = watches::routes()
+    let repository_routes = metadata_search::routes()
+        .merge(watches::routes())
         .merge(issues::routes())
         .merge(public::routes())
         .layer(middleware::from_fn_with_state(

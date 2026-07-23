@@ -2140,6 +2140,86 @@ impl Store {
         })
     }
 
+    pub(crate) fn visit_metadata_search_candidates(
+        &self,
+        actor: Option<&str>,
+        limit: usize,
+        max_field_bytes: usize,
+        mut visit: impl FnMut(MetadataSearchCandidate) -> bool,
+    ) -> Result<bool, StoreError> {
+        let query_limit = limit.checked_add(1).ok_or(StoreError::EventLimit)?;
+        let query_limit = i64::try_from(query_limit).map_err(|_| StoreError::EventLimit)?;
+        let max_field_bytes = max_field_bytes
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(StoreError::EventLimit)?;
+        let mut statement = self.connection.prepare(
+            "WITH visible_repository AS (
+                 SELECT repository.id, owner.username AS owner, repository.slug
+                 FROM repository
+                 JOIN account AS owner ON owner.id = repository.owner_account_id
+                 LEFT JOIN account AS actor
+                   ON actor.username = ?1 AND actor.state = 'active'
+                 WHERE repository.state = 'active'
+                   AND (repository.visibility = 'public'
+                        OR repository.owner_account_id = actor.id
+                        OR EXISTS (
+                            SELECT 1 FROM repository_collaborator
+                            WHERE repository_collaborator.repository_id = repository.id
+                              AND repository_collaborator.account_id = actor.id
+                        ))
+             ), candidates AS (
+                 SELECT 'repository' AS kind, visible_repository.id AS record_id,
+                        visible_repository.owner, visible_repository.slug,
+                        NULL AS issue_number,
+                        CAST(visible_repository.owner || '/' || visible_repository.slug AS BLOB)
+                            AS title,
+                        X'' AS body
+                 FROM visible_repository
+                 UNION ALL
+                 SELECT 'issue', issue.id, visible_repository.owner,
+                        visible_repository.slug, issue.number,
+                        COALESCE(substr(CAST(issue.title AS BLOB), 1, ?3), X''),
+                        COALESCE(substr(CAST(issue.body AS BLOB), 1, ?3), X'')
+                 FROM issue
+                 JOIN visible_repository ON visible_repository.id = issue.repository_id
+                 UNION ALL
+                 SELECT 'issue-comment', issue_comment.id, visible_repository.owner,
+                        visible_repository.slug, issue.number,
+                        COALESCE(substr(CAST(issue.title AS BLOB), 1, ?3), X''),
+                        COALESCE(substr(CAST(issue_comment.body AS BLOB), 1, ?3), X'')
+                 FROM issue_comment
+                 JOIN issue ON issue.id = issue_comment.issue_id
+                 JOIN visible_repository ON visible_repository.id = issue.repository_id
+             )
+             SELECT kind, record_id, owner, slug, issue_number, title, body
+             FROM candidates
+             ORDER BY owner, slug, kind, issue_number, record_id
+             LIMIT ?2",
+        )?;
+        let mut rows = statement.query(rusqlite::params![actor, query_limit, max_field_bytes])?;
+        let mut visited = 0_usize;
+        while let Some(row) = rows.next()? {
+            if visited == limit {
+                return Ok(true);
+            }
+            visited += 1;
+            let candidate = MetadataSearchCandidate {
+                kind: row.get(0)?,
+                record_id: row.get(1)?,
+                owner: row.get(2)?,
+                repository: row.get(3)?,
+                issue_number: row.get(4)?,
+                title: row.get(5)?,
+                body: row.get(6)?,
+            };
+            if !visit(candidate) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     #[allow(
         dead_code,
         reason = "some integration tests compile storage without authorization"
@@ -2610,6 +2690,16 @@ pub(crate) struct TokenFeedPage {
     pub(crate) username: String,
     pub(crate) target: Option<String>,
     pub(crate) events: Vec<ActivityEventRecord>,
+}
+
+pub(crate) struct MetadataSearchCandidate {
+    pub(crate) kind: String,
+    pub(crate) record_id: String,
+    pub(crate) owner: String,
+    pub(crate) repository: String,
+    pub(crate) issue_number: Option<i64>,
+    pub(crate) title: Vec<u8>,
+    pub(crate) body: Vec<u8>,
 }
 
 pub(crate) struct GitOperationIntent<'a> {

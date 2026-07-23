@@ -43,6 +43,8 @@ mod policy;
 #[allow(dead_code, reason = "the Web shell test does not create repositories")]
 #[path = "../src/repository.rs"]
 mod repository;
+#[path = "../src/search.rs"]
+mod search;
 #[allow(dead_code, reason = "the Web shell test does not complete a login")]
 #[path = "../src/session.rs"]
 mod session;

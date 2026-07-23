@@ -1119,6 +1119,36 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
     assert_eq!(watched_token.scope, "watched");
     assert_eq!(assignment_token.scope, "assignments");
     assert_eq!(mention_token.scope, "mentions");
+    let mut metadata = Vec::new();
+    let metadata_truncated = store
+        .visit_metadata_search_candidates(Some("bob"), 100, 1024, |candidate| {
+            metadata.push(candidate);
+            true
+        })
+        .expect("scan authorized metadata");
+    assert!(!metadata_truncated);
+    assert!(metadata.iter().any(|candidate| {
+        candidate.kind == "repository"
+            && candidate.record_id == "00112233445566778899aabbccddeeff"
+            && candidate.owner == "alice"
+            && candidate.repository == "project"
+            && candidate.title == b"alice/project"
+            && candidate.body.is_empty()
+    }));
+    assert!(
+        metadata
+            .iter()
+            .any(|candidate| candidate.issue_number == Some(1))
+    );
+    let mut anonymous_metadata = Vec::new();
+    let anonymous_truncated = store
+        .visit_metadata_search_candidates(None, 100, 1024, |candidate| {
+            anonymous_metadata.push(candidate);
+            true
+        })
+        .expect("scan anonymous metadata");
+    assert!(!anonymous_truncated);
+    assert!(anonymous_metadata.is_empty());
 
     let comments_before: i64 = store
         .connection()

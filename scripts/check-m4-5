@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+./scripts/check
+cargo test --locked --release --test metadata_search
+cargo test --locked --release --test metadata_search measures_bounded_metadata_search_without_an_index -- --ignored --nocapture
+cargo test --locked --release --test public_routes runs_the_complete_issue_workflow_without_javascript

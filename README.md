@@ -348,3 +348,17 @@ display, repository and personalized scopes, current private-repository access,
 rotation, revocation, stable event selection, and Atom and RSS parsing. Read the
 [scoped feeds architectural decision record](docs/adr/0019-scoped-feeds.md) for
 the token, authorization, and ordering contracts.
+
+## Milestone 4.5 gate
+
+Run the metadata search gate:
+
+```text
+./scripts/check-m4-5
+```
+
+This command tests bounded repository and issue metadata search, public and
+private visibility, current collaborator permission, stable result identity,
+query validation, and the representative index workload. Read the
+[bounded metadata search architectural decision record](docs/adr/0020-bounded-metadata-search.md)
+for the limits, authorization, and index decision.
