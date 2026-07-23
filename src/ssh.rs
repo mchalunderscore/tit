@@ -20,6 +20,7 @@ use crate::git::packetline::{MAX_REQUEST_BYTES, Packet, decode, encode_data, fir
 use crate::git::receive_pack::{ReceivePack, ReceivePackError};
 use crate::git::transport::{GitRepositories, GitSshService};
 use crate::git::upload_pack::{ProtocolVersion, UploadPack, UploadPackError};
+use crate::issue::{IssueError, IssueService, MAX_BODY_BYTES, MAX_TITLE_BYTES};
 use crate::policy::RepositoryOperation;
 use crate::repository::{RepositoryService, RepositoryServiceError};
 
@@ -27,8 +28,12 @@ const VERSION_COMMAND: &[u8] = b"tit --version";
 const GIT_PROTOCOL_VARIABLE: &str = "GIT_PROTOCOL";
 const MAX_RECEIVE_PACK_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_REPOSITORY_COMMAND_BYTES: usize = 512;
+const MAX_ISSUE_COMMAND_BYTES: usize = 512;
+const MAX_ISSUE_INPUT_BYTES: usize = MAX_TITLE_BYTES + 1 + MAX_BODY_BYTES;
 const REPOSITORY_CREATE_USAGE: &str =
     "repo create NAME [--object-format sha1|sha256] [--output human|json]";
+const ISSUE_LIST_USAGE: &str = "issue list OWNER/REPOSITORY [--output human|json]";
+const ISSUE_CREATE_USAGE: &str = "issue create OWNER/REPOSITORY [--output human|json]";
 
 pub(crate) struct RunningSshServer {
     address: SocketAddr,
@@ -297,7 +302,7 @@ impl Server for SshServer {
             audit: Arc::clone(&self.audit),
             repositories: self.repositories.clone(),
             protocol: ProtocolVersion::V0,
-            git_channels: HashMap::new(),
+            exec_channels: HashMap::new(),
             authenticated_identity: None,
             authenticated_key: None,
             authenticated_writer: false,
@@ -311,15 +316,24 @@ struct SshSession {
     audit: Arc<RequestAudit>,
     repositories: Option<Arc<GitRepositories>>,
     protocol: ProtocolVersion,
-    git_channels: HashMap<ChannelId, GitChannel>,
+    exec_channels: HashMap<ChannelId, ExecChannel>,
     authenticated_identity: Option<SshIdentity>,
     authenticated_key: Option<PublicKey>,
     authenticated_writer: bool,
 }
 
-enum GitChannel {
+enum ExecChannel {
     Upload(Box<UploadChannel>),
     Receive(Box<ReceiveChannel>),
+    IssueCreate(IssueCreateChannel),
+}
+
+struct IssueCreateChannel {
+    actor: String,
+    owner: String,
+    repository: String,
+    output: CommandOutput,
+    input: Vec<u8>,
 }
 
 struct UploadChannel {
@@ -512,6 +526,41 @@ impl Handler for SshSession {
                 Err(()) => Err(RepositoryCommandError::Usage),
             };
             send_repository_command_result(channel, result, machine_requested, session)?;
+        } else if is_issue_command(command) {
+            self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
+            session.channel_success(channel)?;
+            let machine_requested = requests_json(command);
+            match (parse_issue_command(command), self.active_identity()) {
+                (Ok(IssueCommand::List(command)), Some(identity)) => {
+                    let result =
+                        run_issue_list(self.repositories.clone(), identity.username, command).await;
+                    send_issue_list_result(channel, result, machine_requested, session)?;
+                }
+                (Ok(IssueCommand::Create(command)), Some(identity)) => {
+                    self.exec_channels.insert(
+                        channel,
+                        ExecChannel::IssueCreate(IssueCreateChannel {
+                            actor: identity.username,
+                            owner: command.owner,
+                            repository: command.repository,
+                            output: command.output,
+                            input: Vec::new(),
+                        }),
+                    );
+                }
+                (Ok(_), None) => send_issue_error(
+                    channel,
+                    IssueCommandError::Unavailable,
+                    machine_requested,
+                    session,
+                )?,
+                (Err(()), _) => send_issue_error(
+                    channel,
+                    IssueCommandError::Usage,
+                    machine_requested,
+                    session,
+                )?,
+            }
         } else {
             let service = self.open_git_service(command).await;
             if let Some(service) = service {
@@ -523,9 +572,9 @@ impl Handler for SshSession {
                         advertisement,
                     } => {
                         session.data(channel, advertisement)?;
-                        self.git_channels.insert(
+                        self.exec_channels.insert(
                             channel,
-                            GitChannel::Upload(Box::new(UploadChannel {
+                            ExecChannel::Upload(Box::new(UploadChannel {
                                 service: *service,
                                 request: Vec::new(),
                             })),
@@ -544,9 +593,9 @@ impl Handler for SshSession {
                         let pack = tokio::fs::File::create(service.incoming_pack()).await;
                         match pack {
                             Ok(pack) => {
-                                self.git_channels.insert(
+                                self.exec_channels.insert(
                                     channel,
-                                    GitChannel::Receive(Box::new(ReceiveChannel {
+                                    ExecChannel::Receive(Box::new(ReceiveChannel {
                                         service: *service,
                                         owner,
                                         repository,
@@ -579,12 +628,26 @@ impl Handler for SshSession {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let Some(git) = self.git_channels.remove(&channel) else {
+        let Some(exec) = self.exec_channels.remove(&channel) else {
             return Ok(());
         };
-        let mut git = match git {
-            GitChannel::Upload(git) => git,
-            GitChannel::Receive(mut git) => {
+        let mut git = match exec {
+            ExecChannel::IssueCreate(mut issue) => {
+                if append_issue_input(&mut issue.input, data).is_err() {
+                    send_issue_error(
+                        channel,
+                        IssueCommandError::Input,
+                        issue.output == CommandOutput::Json,
+                        session,
+                    )?;
+                } else {
+                    self.exec_channels
+                        .insert(channel, ExecChannel::IssueCreate(issue));
+                }
+                return Ok(());
+            }
+            ExecChannel::Upload(git) => git,
+            ExecChannel::Receive(mut git) => {
                 if receive_data(&mut git, data).await.is_err() {
                     fail_git_channel(channel, session)?;
                 } else if git.commands_complete
@@ -596,7 +659,8 @@ impl Handler for SshSession {
                         session,
                     )?;
                 } else {
-                    self.git_channels.insert(channel, GitChannel::Receive(git));
+                    self.exec_channels
+                        .insert(channel, ExecChannel::Receive(git));
                 }
                 return Ok(());
             }
@@ -611,7 +675,7 @@ impl Handler for SshSession {
             Ok(packets) => packets,
             Err(super::git::packetline::PacketLineError::TruncatedHeader)
             | Err(super::git::packetline::PacketLineError::TruncatedPacket) => {
-                self.git_channels.insert(channel, GitChannel::Upload(git));
+                self.exec_channels.insert(channel, ExecChannel::Upload(git));
                 return Ok(());
             }
             Err(_) => {
@@ -638,12 +702,12 @@ impl Handler for SshSession {
                         Some((_, Err(_))) | None => fail_git_channel(channel, session)?,
                     }
                 } else {
-                    self.git_channels.insert(channel, GitChannel::Upload(git));
+                    self.exec_channels.insert(channel, ExecChannel::Upload(git));
                 }
             }
             ProtocolVersion::V2 => {
                 if packets.last() != Some(&Packet::Flush) {
-                    self.git_channels.insert(channel, GitChannel::Upload(git));
+                    self.exec_channels.insert(channel, ExecChannel::Upload(git));
                     return Ok(());
                 }
                 let fetch = packets.iter().any(
@@ -659,7 +723,7 @@ impl Handler for SshSession {
                             finish_git_channel(channel, 0, session)?;
                         } else {
                             git.request.clear();
-                            self.git_channels.insert(channel, GitChannel::Upload(git));
+                            self.exec_channels.insert(channel, ExecChannel::Upload(git));
                         }
                     }
                     Some((_, Err(_))) | None => fail_git_channel(channel, session)?,
@@ -674,7 +738,7 @@ impl Handler for SshSession {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.git_channels.remove(&channel);
+        self.exec_channels.remove(&channel);
         Ok(())
     }
 
@@ -683,15 +747,29 @@ impl Handler for SshSession {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let Some(GitChannel::Receive(git)) = self.git_channels.remove(&channel) else {
-            return Ok(());
-        };
-        if !git.commands_complete {
-            fail_git_channel(channel, session)?;
-            return Ok(());
+        match self.exec_channels.remove(&channel) {
+            Some(ExecChannel::Receive(git)) => {
+                if !git.commands_complete {
+                    fail_git_channel(channel, session)?;
+                    return Ok(());
+                }
+                let result = finish_receive(self.repositories.clone(), git).await;
+                send_receive_result(channel, result, session)?;
+            }
+            Some(ExecChannel::IssueCreate(issue)) => {
+                let active = self
+                    .active_identity()
+                    .is_some_and(|identity| identity.username == issue.actor);
+                let machine_requested = issue.output == CommandOutput::Json;
+                let result = if active {
+                    run_issue_create(self.repositories.clone(), issue).await
+                } else {
+                    Err(IssueCommandError::Unavailable)
+                };
+                send_issue_create_result(channel, result, machine_requested, session)?;
+            }
+            Some(ExecChannel::Upload(_)) | None => {}
         }
-        let result = finish_receive(self.repositories.clone(), git).await;
-        send_receive_result(channel, result, session)?;
         Ok(())
     }
 
@@ -737,8 +815,8 @@ impl Handler for SshSession {
     }
 }
 
-#[derive(Clone, Copy)]
-enum RepositoryCommandOutput {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CommandOutput {
     Human,
     Json,
 }
@@ -746,7 +824,7 @@ enum RepositoryCommandOutput {
 struct RepositoryCreateCommand {
     slug: String,
     object_format: gix::hash::Kind,
-    output: RepositoryCommandOutput,
+    output: CommandOutput,
 }
 
 fn is_repository_command(command: &[u8]) -> bool {
@@ -792,8 +870,8 @@ fn parse_repository_command(command: &[u8]) -> Result<RepositoryCreateCommand, (
             }
             "--output" if output.is_none() => {
                 output = Some(match value {
-                    "human" => RepositoryCommandOutput::Human,
-                    "json" => RepositoryCommandOutput::Json,
+                    "human" => CommandOutput::Human,
+                    "json" => CommandOutput::Json,
                     _ => return Err(()),
                 });
             }
@@ -803,7 +881,7 @@ fn parse_repository_command(command: &[u8]) -> Result<RepositoryCreateCommand, (
     Ok(RepositoryCreateCommand {
         slug,
         object_format: object_format.unwrap_or(gix::hash::Kind::Sha1),
-        output: output.unwrap_or(RepositoryCommandOutput::Human),
+        output: output.unwrap_or(CommandOutput::Human),
     })
 }
 
@@ -817,7 +895,7 @@ async fn run_repository_command(
     repositories: Option<Arc<GitRepositories>>,
     actor: String,
     command: RepositoryCreateCommand,
-) -> Result<(crate::store::RepositoryRecord, RepositoryCommandOutput), RepositoryCommandError> {
+) -> Result<(crate::store::RepositoryRecord, CommandOutput), RepositoryCommandError> {
     let repositories = repositories.ok_or(RepositoryCommandError::Unavailable)?;
     let database = repositories
         .push_database()
@@ -848,15 +926,12 @@ async fn run_repository_command(
 
 fn send_repository_command_result(
     channel: ChannelId,
-    result: Result<
-        (crate::store::RepositoryRecord, RepositoryCommandOutput),
-        RepositoryCommandError,
-    >,
+    result: Result<(crate::store::RepositoryRecord, CommandOutput), RepositoryCommandError>,
     machine_requested: bool,
     session: &mut Session,
 ) -> Result<(), russh::Error> {
     match result {
-        Ok((repository, RepositoryCommandOutput::Human)) => {
+        Ok((repository, CommandOutput::Human)) => {
             session.data(
                 channel,
                 format!(
@@ -867,7 +942,7 @@ fn send_repository_command_result(
             )?;
             finish_git_channel(channel, 0, session)
         }
-        Ok((repository, RepositoryCommandOutput::Json)) => {
+        Ok((repository, CommandOutput::Json)) => {
             session.data(
                 channel,
                 format!(
@@ -926,6 +1001,358 @@ fn repository_command_error_message(error: &RepositoryCommandError) -> String {
         "account-unavailable" => "The account is not active.".to_owned(),
         "service-unavailable" => "The repository service is not available.".to_owned(),
         _ => "The repository could not be created.".to_owned(),
+    }
+}
+
+enum IssueCommand {
+    List(IssueListCommand),
+    Create(IssueCreateCommand),
+}
+
+struct IssueListCommand {
+    owner: String,
+    repository: String,
+    output: CommandOutput,
+}
+
+struct IssueCreateCommand {
+    owner: String,
+    repository: String,
+    output: CommandOutput,
+}
+
+struct IssueListResult {
+    repository: crate::store::RepositoryRecord,
+    issues: Vec<crate::store::IssueRecord>,
+    output: CommandOutput,
+}
+
+struct IssueCreateResult {
+    owner: String,
+    repository: String,
+    issue: crate::store::IssueRecord,
+    output: CommandOutput,
+}
+
+enum IssueCommandError {
+    Usage,
+    Input,
+    Unavailable,
+    Service(IssueError),
+}
+
+fn is_issue_command(command: &[u8]) -> bool {
+    command == b"issue" || command.starts_with(b"issue ")
+}
+
+fn parse_issue_command(command: &[u8]) -> Result<IssueCommand, ()> {
+    if command.len() > MAX_ISSUE_COMMAND_BYTES || !command.is_ascii() {
+        return Err(());
+    }
+    let command = std::str::from_utf8(command).map_err(|_| ())?;
+    if command
+        .bytes()
+        .any(|byte| byte.is_ascii_control() && byte != b' ')
+    {
+        return Err(());
+    }
+    let mut tokens = command.split_ascii_whitespace();
+    if tokens.next() != Some("issue") {
+        return Err(());
+    }
+    let operation = tokens.next().ok_or(())?;
+    let target = tokens.next().ok_or(())?;
+    let (owner, repository) = target.split_once('/').ok_or(())?;
+    if owner.is_empty() || repository.is_empty() || repository.contains('/') {
+        return Err(());
+    }
+    let output = parse_output_options(tokens)?;
+    match operation {
+        "list" => Ok(IssueCommand::List(IssueListCommand {
+            owner: owner.to_owned(),
+            repository: repository.to_owned(),
+            output,
+        })),
+        "create" => Ok(IssueCommand::Create(IssueCreateCommand {
+            owner: owner.to_owned(),
+            repository: repository.to_owned(),
+            output,
+        })),
+        _ => Err(()),
+    }
+}
+
+fn parse_output_options<'a>(
+    mut tokens: impl Iterator<Item = &'a str>,
+) -> Result<CommandOutput, ()> {
+    let mut output = None;
+    while let Some(option) = tokens.next() {
+        let value = tokens.next().ok_or(())?;
+        if option != "--output" || output.is_some() {
+            return Err(());
+        }
+        output = Some(match value {
+            "human" => CommandOutput::Human,
+            "json" => CommandOutput::Json,
+            _ => return Err(()),
+        });
+    }
+    Ok(output.unwrap_or(CommandOutput::Human))
+}
+
+async fn run_issue_list(
+    repositories: Option<Arc<GitRepositories>>,
+    actor: String,
+    command: IssueListCommand,
+) -> Result<IssueListResult, IssueCommandError> {
+    let repositories = repositories.ok_or(IssueCommandError::Unavailable)?;
+    let database = repositories
+        .push_database()
+        .ok_or(IssueCommandError::Unavailable)?
+        .to_owned();
+    let permit = repositories
+        .blocking_permit()
+        .await
+        .map_err(|_| IssueCommandError::Unavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        IssueService::new(&database)
+            .list(&command.owner, &command.repository, Some(&actor))
+            .map(|(repository, issues)| IssueListResult {
+                repository,
+                issues,
+                output: command.output,
+            })
+            .map_err(IssueCommandError::Service)
+    })
+    .await
+    .map_err(|_| IssueCommandError::Unavailable)?
+}
+
+async fn run_issue_create(
+    repositories: Option<Arc<GitRepositories>>,
+    command: IssueCreateChannel,
+) -> Result<IssueCreateResult, IssueCommandError> {
+    let (title, body) = parse_issue_input(&command.input)?;
+    let repositories = repositories.ok_or(IssueCommandError::Unavailable)?;
+    let database = repositories
+        .push_database()
+        .ok_or(IssueCommandError::Unavailable)?
+        .to_owned();
+    let permit = repositories
+        .blocking_permit()
+        .await
+        .map_err(|_| IssueCommandError::Unavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        IssueService::new(&database)
+            .create(
+                &command.owner,
+                &command.repository,
+                &command.actor,
+                &title,
+                &body,
+            )
+            .map(|issue| IssueCreateResult {
+                owner: command.owner,
+                repository: command.repository,
+                issue,
+                output: command.output,
+            })
+            .map_err(IssueCommandError::Service)
+    })
+    .await
+    .map_err(|_| IssueCommandError::Unavailable)?
+}
+
+fn parse_issue_input(input: &[u8]) -> Result<(String, String), IssueCommandError> {
+    let (title, body) = input
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or((input, &[][..]), |end| (&input[..end], &input[end + 1..]));
+    let title = title.strip_suffix(b"\r").unwrap_or(title);
+    Ok((
+        std::str::from_utf8(title)
+            .map_err(|_| IssueCommandError::Input)?
+            .to_owned(),
+        std::str::from_utf8(body)
+            .map_err(|_| IssueCommandError::Input)?
+            .to_owned(),
+    ))
+}
+
+fn append_issue_input(input: &mut Vec<u8>, data: &[u8]) -> Result<(), ()> {
+    if input.len().saturating_add(data.len()) > MAX_ISSUE_INPUT_BYTES {
+        return Err(());
+    }
+    input.extend_from_slice(data);
+    Ok(())
+}
+
+fn send_issue_list_result(
+    channel: ChannelId,
+    result: Result<IssueListResult, IssueCommandError>,
+    machine_requested: bool,
+    session: &mut Session,
+) -> Result<(), russh::Error> {
+    match result {
+        Ok(result) => {
+            let data = match result.output {
+                CommandOutput::Human => issue_list_human(&result),
+                CommandOutput::Json => issue_list_json(&result),
+            };
+            session.data(channel, data)?;
+            finish_git_channel(channel, 0, session)
+        }
+        Err(error) => send_issue_error(channel, error, machine_requested, session),
+    }
+}
+
+fn issue_list_human(result: &IssueListResult) -> Vec<u8> {
+    if result.issues.is_empty() {
+        return b"No issues.\n".to_vec();
+    }
+    let mut output = String::new();
+    for issue in &result.issues {
+        output.push_str(&format!(
+            "#{} {} {}\n",
+            issue.number, issue.state, issue.title
+        ));
+    }
+    output.into_bytes()
+}
+
+fn issue_list_json(result: &IssueListResult) -> Vec<u8> {
+    let issues = result
+        .issues
+        .iter()
+        .map(|issue| {
+            serde_json::json!({
+                "number": issue.number,
+                "title": issue.title,
+                "state": issue.state,
+                "author": issue.author,
+                "created_at": issue.created_at,
+                "updated_at": issue.updated_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    json_line(serde_json::json!({
+        "version": 1,
+        "status": "success",
+        "repository": {
+            "owner": result.repository.owner,
+            "name": result.repository.slug,
+        },
+        "issues": issues,
+    }))
+}
+
+fn send_issue_create_result(
+    channel: ChannelId,
+    result: Result<IssueCreateResult, IssueCommandError>,
+    machine_requested: bool,
+    session: &mut Session,
+) -> Result<(), russh::Error> {
+    match result {
+        Ok(result) => {
+            let data = match result.output {
+                CommandOutput::Human => format!(
+                    "Created issue {}/{}#{}.\n",
+                    result.owner, result.repository, result.issue.number
+                )
+                .into_bytes(),
+                CommandOutput::Json => json_line(serde_json::json!({
+                    "version": 1,
+                    "status": "success",
+                    "repository": {
+                        "owner": result.owner,
+                        "name": result.repository,
+                    },
+                    "issue": {
+                        "number": result.issue.number,
+                        "title": result.issue.title,
+                        "state": result.issue.state,
+                        "author": result.issue.author,
+                        "created_at": result.issue.created_at,
+                        "updated_at": result.issue.updated_at,
+                    },
+                })),
+            };
+            session.data(channel, data)?;
+            finish_git_channel(channel, 0, session)
+        }
+        Err(error) => send_issue_error(channel, error, machine_requested, session),
+    }
+}
+
+fn send_issue_error(
+    channel: ChannelId,
+    error: IssueCommandError,
+    machine_requested: bool,
+    session: &mut Session,
+) -> Result<(), russh::Error> {
+    if machine_requested {
+        session.data(
+            channel,
+            json_line(serde_json::json!({
+                "version": 1,
+                "status": "error",
+                "error": { "code": issue_command_error_code(&error) },
+            })),
+        )?;
+    } else {
+        session.extended_data(
+            channel,
+            1,
+            format!("tit: {}\n", issue_command_error_message(&error)).into_bytes(),
+        )?;
+    }
+    finish_git_channel(channel, 1, session)
+}
+
+fn json_line(value: serde_json::Value) -> Vec<u8> {
+    let mut output = serde_json::to_vec(&value).expect("a JSON value can be serialized");
+    output.push(b'\n');
+    output
+}
+
+fn issue_command_error_code(error: &IssueCommandError) -> &'static str {
+    match error {
+        IssueCommandError::Usage => "invalid-command",
+        IssueCommandError::Input
+        | IssueCommandError::Service(IssueError::Title | IssueError::Body) => "invalid-input",
+        IssueCommandError::Service(IssueError::Auth(_) | IssueError::RepositoryName(_)) => {
+            "invalid-target"
+        }
+        IssueCommandError::Service(IssueError::Store(
+            crate::store::StoreError::RepositoryNotFound(_, _)
+            | crate::store::StoreError::IssueHidden,
+        )) => "repository-unavailable",
+        IssueCommandError::Service(IssueError::Store(crate::store::StoreError::IssueDenied)) => {
+            "permission-denied"
+        }
+        IssueCommandError::Service(IssueError::Store(
+            crate::store::StoreError::AccountNotFound(_),
+        )) => "account-unavailable",
+        IssueCommandError::Unavailable => "service-unavailable",
+        IssueCommandError::Service(_) => "issue-command-failed",
+    }
+}
+
+fn issue_command_error_message(error: &IssueCommandError) -> String {
+    match issue_command_error_code(error) {
+        "invalid-command" => format!("usage: {ISSUE_LIST_USAGE} or {ISSUE_CREATE_USAGE}"),
+        "invalid-input" => {
+            "The first input line must be a valid title. The remaining input is the body."
+                .to_owned()
+        }
+        "invalid-target" => "The repository name is not valid.".to_owned(),
+        "repository-unavailable" => "The repository is not available.".to_owned(),
+        "permission-denied" => "The account cannot create an issue in this repository.".to_owned(),
+        "account-unavailable" => "The account is not active.".to_owned(),
+        "service-unavailable" => "The issue service is not available.".to_owned(),
+        _ => "The issue command could not be completed.".to_owned(),
     }
 }
 
@@ -1214,4 +1641,37 @@ pub(crate) struct RequestAuditSnapshot {
     pub(crate) rejected_pty: usize,
     pub(crate) rejected_agent: usize,
     pub(crate) rejected_forward: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_only_bounded_issue_commands_and_input() {
+        assert!(matches!(
+            parse_issue_command(b"issue list alice/project --output json"),
+            Ok(IssueCommand::List(_))
+        ));
+        assert!(matches!(
+            parse_issue_command(b"issue create alice/project"),
+            Ok(IssueCommand::Create(_))
+        ));
+        for command in [
+            b"issue list alice/project --output json extra".as_slice(),
+            b"issue list alice/project/extra".as_slice(),
+            b"issue create alice/project --output json --output json".as_slice(),
+            &[b'x'; MAX_ISSUE_COMMAND_BYTES + 1],
+        ] {
+            assert!(parse_issue_command(command).is_err());
+        }
+
+        let mut input = Vec::new();
+        assert!(append_issue_input(&mut input, &[b'x'; MAX_ISSUE_INPUT_BYTES]).is_ok());
+        assert!(append_issue_input(&mut input, b"x").is_err());
+        assert!(matches!(
+            parse_issue_input(b"invalid\xff"),
+            Err(IssueCommandError::Input)
+        ));
+    }
 }

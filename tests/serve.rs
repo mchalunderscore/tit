@@ -613,6 +613,93 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
     );
     assert!(machine.stderr.is_empty());
 
+    let created_issue = ssh_exec_with_input(
+        ssh,
+        &member_key,
+        &["issue", "create", "bob/example"],
+        b"First issue\nBody with **Markdown**.\n",
+    );
+    assert!(created_issue.status.success());
+    assert_eq!(
+        String::from_utf8(created_issue.stdout).expect("read issue create output"),
+        "Created issue bob/example#1.\n"
+    );
+    assert!(created_issue.stderr.is_empty());
+    let human_issues = ssh_exec(ssh, &member_key, &["issue", "list", "bob/example"]);
+    assert!(human_issues.status.success());
+    assert_eq!(
+        String::from_utf8(human_issues.stdout).expect("read human issue list"),
+        "#1 open First issue\n"
+    );
+    let machine_issues = ssh_exec(
+        ssh,
+        &member_key,
+        &["issue", "list", "bob/example", "--output", "json"],
+    );
+    assert!(machine_issues.status.success());
+    let machine_issues: serde_json::Value =
+        serde_json::from_slice(&machine_issues.stdout).expect("parse machine issue list");
+    assert_eq!(machine_issues["version"], 1);
+    assert_eq!(machine_issues["status"], "success");
+    assert_eq!(machine_issues["repository"]["owner"], "bob");
+    assert_eq!(machine_issues["repository"]["name"], "example");
+    assert_eq!(machine_issues["issues"][0]["number"], 1);
+    assert_eq!(machine_issues["issues"][0]["title"], "First issue");
+
+    let access_database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the issue access database");
+    access_database
+        .execute_batch("UPDATE repository SET visibility = 'private' WHERE slug = 'example';")
+        .expect("make the issue repository private");
+    let hidden = ssh_exec(
+        ssh,
+        &private_key,
+        &["issue", "list", "bob/example", "--output", "json"],
+    );
+    assert!(!hidden.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&hidden.stdout)
+            .expect("parse hidden issue error")["error"]["code"],
+        "repository-unavailable"
+    );
+    access_database
+        .execute(
+            "INSERT INTO repository_collaborator
+                 (repository_id, account_id, role, created_at)
+             SELECT repository.id, account.id, 'reader', 10
+             FROM repository, account
+             WHERE repository.slug = 'example' AND account.username = 'alice'",
+            [],
+        )
+        .expect("give the administrator reader access");
+    drop(access_database);
+    let reader_create = ssh_exec_with_input(
+        ssh,
+        &private_key,
+        &["issue", "create", "bob/example", "--output", "json"],
+        b"Reader issue\nCreated through the shared service.",
+    );
+    assert!(reader_create.status.success());
+    let reader_create: serde_json::Value =
+        serde_json::from_slice(&reader_create.stdout).expect("parse machine issue create");
+    assert_eq!(reader_create["version"], 1);
+    assert_eq!(reader_create["status"], "success");
+    assert_eq!(reader_create["issue"]["number"], 2);
+    assert_eq!(reader_create["issue"]["author"], "alice");
+
+    let invalid_issue = ssh_exec_with_input(
+        ssh,
+        &private_key,
+        &["issue", "create", "bob/example", "--output", "json"],
+        b"\nbody without a title",
+    );
+    assert!(!invalid_issue.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&invalid_issue.stdout)
+            .expect("parse invalid issue input")["error"]["code"],
+        "invalid-input"
+    );
+
     let duplicate = ssh_exec(
         ssh,
         &member_key,
@@ -660,6 +747,17 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
         "{\"version\":1,\"status\":\"error\",\"error\":{\"code\":\"account-unavailable\"}}\n"
     );
     assert!(suspended.stderr.is_empty());
+    let suspended_issues = ssh_exec(
+        ssh,
+        &member_key,
+        &["issue", "list", "bob/example", "--output", "json"],
+    );
+    assert!(!suspended_issues.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&suspended_issues.stdout)
+            .expect("parse suspended issue output")["error"]["code"],
+        "repository-unavailable"
+    );
     server.terminate();
 
     let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
@@ -686,6 +784,44 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
             ),
         ]
     );
+    let issues: Vec<(i64, String, String, String)> = database
+        .prepare(
+            "SELECT issue.number, issue.title, issue.body, account.username
+             FROM issue JOIN account ON account.id = issue.author_account_id
+             ORDER BY issue.number",
+        )
+        .expect("prepare the issue query")
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .expect("query created issues")
+        .collect::<Result<_, _>>()
+        .expect("read created issues");
+    assert_eq!(
+        issues,
+        vec![
+            (
+                1,
+                "First issue".to_owned(),
+                "Body with **Markdown**.\n".to_owned(),
+                "bob".to_owned(),
+            ),
+            (
+                2,
+                "Reader issue".to_owned(),
+                "Created through the shared service.".to_owned(),
+                "alice".to_owned(),
+            ),
+        ]
+    );
+    let issue_events: i64 = database
+        .query_row(
+            "SELECT count(*) FROM repository_event WHERE kind = 'issue-created'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count issue create events");
+    assert_eq!(issue_events, 2);
     let audit: Vec<(String, String)> = database
         .prepare(
             "SELECT target, outcome FROM audit_event
@@ -1236,6 +1372,48 @@ fn ssh_exec(address: SocketAddr, private_key: &Path, command: &[&str]) -> Output
         .args(command)
         .output()
         .expect("run an SSH repository command")
+}
+
+fn ssh_exec_with_input(
+    address: SocketAddr,
+    private_key: &Path,
+    command: &[&str],
+    input: &[u8],
+) -> Output {
+    let mut child = Command::new("ssh")
+        .args([
+            "-F",
+            "/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "-i",
+        ])
+        .arg(private_key)
+        .args(["-p", &address.port().to_string()])
+        .arg(format!("ignored@{}", address.ip()))
+        .args(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start an SSH issue command");
+    child
+        .stdin
+        .take()
+        .expect("open SSH issue input")
+        .write_all(input)
+        .expect("write SSH issue input");
+    child
+        .wait_with_output()
+        .expect("finish an SSH issue command")
 }
 
 fn provision_account(

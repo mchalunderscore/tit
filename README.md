@@ -362,3 +362,17 @@ private visibility, current collaborator permission, stable result identity,
 query validation, and the representative index workload. Read the
 [bounded metadata search architectural decision record](docs/adr/0020-bounded-metadata-search.md)
 for the limits, authorization, and index decision.
+
+## Milestone 4.6 gate
+
+Install stock OpenSSH. Then, run the SSH issue command gate:
+
+```text
+./scripts/check-m4-6
+```
+
+This command tests issue creation and listing with human and JSON output. It
+tests owner and reader permission, hidden private repositories, suspended
+account access, invalid input, raw Markdown storage, and atomic issue events.
+Read the [SSH issue command architectural decision record](docs/adr/0021-ssh-issue-commands.md)
+for the input, output, authorization, and error contracts.

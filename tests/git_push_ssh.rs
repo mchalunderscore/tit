@@ -13,6 +13,9 @@ mod domain;
 )]
 #[path = "../src/git/mod.rs"]
 mod git;
+#[allow(dead_code, reason = "the SSH push test does not use issue commands")]
+#[path = "../src/issue.rs"]
+mod issue;
 #[allow(dead_code, reason = "the SSH push test does not use repository policy")]
 #[path = "../src/policy.rs"]
 mod policy;

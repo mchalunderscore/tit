@@ -12,6 +12,12 @@ mod domain;
 mod git;
 #[allow(
     dead_code,
+    reason = "the SSH identity test does not use issue commands"
+)]
+#[path = "../src/issue.rs"]
+mod issue;
+#[allow(
+    dead_code,
     reason = "the SSH identity test does not use repository policy"
 )]
 #[path = "../src/policy.rs"]

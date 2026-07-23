@@ -9,8 +9,8 @@ use crate::store::{
     IssueChange, IssueDetail, IssueRecord, NewIssue, RepositoryRecord, Store, StoreError,
 };
 
-const MAX_TITLE_BYTES: usize = 200;
-const MAX_BODY_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_TITLE_BYTES: usize = 200;
+pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024;
 const MAX_LABEL_BYTES: usize = 80;
 
 #[derive(Clone)]
