@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gix::hash::ObjectId;
 use read::{ReadCancellation, ReadError, ReadLimits, RepositoryReadService};
@@ -100,6 +100,28 @@ fn reads_repository_content_for_both_object_formats() {
             .expect("find a README");
         assert_eq!(readme.path, b"README.md");
         assert_eq!(readme.blob.data, b"Tit read service\n");
+
+        let search = service
+            .search(fixture.second, b"changed", &cancellation)
+            .expect("search source");
+        assert_eq!(search.commit, fixture.second);
+        assert_eq!(search.matches.len(), 1);
+        assert_eq!(search.matches[0].path, b"src/lib.rs");
+        assert_eq!(search.matches[0].line_number, 2);
+        assert_eq!(search.matches[0].line, b"changed");
+        assert!(!search.truncated);
+        let non_utf8 = service
+            .search(fixture.second, b"needle", &cancellation)
+            .expect("search non-UTF-8 source");
+        assert_eq!(non_utf8.matches[0].path, b"docs/note.txt");
+        assert_eq!(non_utf8.matches[0].line, b"note \xff needle");
+        assert_eq!(
+            service
+                .search(fixture.second, b"binary", &cancellation)
+                .expect("skip binary content")
+                .matches,
+            []
+        );
     }
 }
 
@@ -276,6 +298,61 @@ fn enforces_each_read_boundary_and_rejects_unsafe_paths() {
         Err(ReadError::Limit("archive bytes"))
     ));
 
+    let limits = ReadLimits {
+        max_search_files: 1,
+        ..ReadLimits::default()
+    };
+    let service = RepositoryReadService::open(&fixture.bare, limits).expect("open the service");
+    assert!(matches!(
+        service.search(fixture.second, b"missing", &cancellation),
+        Err(ReadError::Limit("search files"))
+    ));
+
+    let limits = ReadLimits {
+        max_search_bytes: 1,
+        ..ReadLimits::default()
+    };
+    let service = RepositoryReadService::open(&fixture.bare, limits).expect("open the service");
+    assert!(matches!(
+        service.search(fixture.second, b"missing", &cancellation),
+        Err(ReadError::Limit("search bytes"))
+    ));
+
+    let limits = ReadLimits {
+        max_search_results: 1,
+        ..ReadLimits::default()
+    };
+    let service = RepositoryReadService::open(&fixture.bare, limits).expect("open the service");
+    let search = service
+        .search(fixture.second, b"e", &cancellation)
+        .expect("truncate search results");
+    assert_eq!(search.matches.len(), 1);
+    assert!(search.truncated);
+
+    let limits = ReadLimits {
+        max_search_query_bytes: 3,
+        ..ReadLimits::default()
+    };
+    let service = RepositoryReadService::open(&fixture.bare, limits).expect("open the service");
+    assert!(matches!(
+        service.search(fixture.second, b"four", &cancellation),
+        Err(ReadError::Limit("search query bytes"))
+    ));
+    assert!(matches!(
+        service.search(fixture.second, b"", &cancellation),
+        Err(ReadError::InvalidSearchQuery)
+    ));
+
+    let limits = ReadLimits {
+        max_search_duration: Duration::from_nanos(1),
+        ..ReadLimits::default()
+    };
+    let service = RepositoryReadService::open(&fixture.bare, limits).expect("open the service");
+    assert!(matches!(
+        service.search(fixture.second, b"changed", &cancellation),
+        Err(ReadError::Deadline)
+    ));
+
     let service = RepositoryReadService::open(&fixture.bare, ReadLimits::default())
         .expect("open the service");
     for path in [b"".as_slice(), b"/src", b"src/", b"src//lib.rs", b"../HEAD"] {
@@ -290,6 +367,10 @@ fn enforces_each_read_boundary_and_rejects_unsafe_paths() {
         service.history(fixture.second, &cancelled),
         Err(ReadError::Cancelled)
     ));
+    assert!(matches!(
+        service.search(fixture.second, b"changed", &cancelled),
+        Err(ReadError::Cancelled)
+    ));
 
     let limits = ReadLimits {
         max_duration: Duration::ZERO,
@@ -299,6 +380,56 @@ fn enforces_each_read_boundary_and_rejects_unsafe_paths() {
         RepositoryReadService::open(&fixture.bare, limits),
         Err(ReadError::InvalidLimits)
     ));
+}
+
+#[test]
+#[ignore = "M2.8 representative search measurement"]
+fn measures_bounded_search_without_an_index() {
+    let directory = TempDir::new().expect("create a measurement directory");
+    let worktree = directory.path().join("worktree");
+    run(Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .arg(&worktree));
+    run(Command::new("git")
+        .args(["config", "commit.gpgsign", "false"])
+        .current_dir(&worktree));
+    for index in 0..2_000 {
+        let mut content = format!("file {index:05} needle-{index:05}\n").into_bytes();
+        content.resize(4_096, b'x');
+        fs::write(worktree.join(format!("file-{index:05}.txt")), content)
+            .expect("write a measurement file");
+    }
+    run(Command::new("git")
+        .args(["add", "."])
+        .current_dir(&worktree));
+    run(Command::new("git")
+        .args(["commit", "-q", "-m", "measurement"])
+        .env("GIT_AUTHOR_NAME", "Tit Test")
+        .env("GIT_AUTHOR_EMAIL", "tit@example.test")
+        .env("GIT_COMMITTER_NAME", "Tit Test")
+        .env("GIT_COMMITTER_EMAIL", "tit@example.test")
+        .current_dir(&worktree));
+    let head = revision(&worktree, "HEAD");
+    let bare = directory.path().join("repository.git");
+    run(Command::new("git")
+        .args(["clone", "-q", "--bare", "--no-local"])
+        .arg(&worktree)
+        .arg(&bare));
+    let service = RepositoryReadService::open(&bare, ReadLimits::default())
+        .expect("open the measurement repository");
+    let started = Instant::now();
+    let outcome = service
+        .search(head, b"needle-01999", &ReadCancellation::default())
+        .expect("search the measurement repository");
+    let elapsed = started.elapsed();
+    assert_eq!(outcome.files_scanned, 2_000);
+    assert_eq!(outcome.bytes_scanned, 2_000 * 4_096);
+    assert_eq!(outcome.matches.len(), 1);
+    assert!(!outcome.truncated);
+    eprintln!(
+        "searched {} files and {} bytes in {elapsed:?}",
+        outcome.files_scanned, outcome.bytes_scanned
+    );
 }
 
 fn fixture(object_format: &str) -> Fixture {
@@ -339,7 +470,7 @@ fn fixture(object_format: &str) -> Fixture {
     fs::create_dir(worktree.join("docs")).expect("create a documentation directory");
     fs::write(worktree.join("src/lib.rs"), b"one\nchanged\nthree\n").expect("change source");
     fs::write(worktree.join("binary"), b"new\0binary").expect("change binary content");
-    fs::write(worktree.join("docs/note.txt"), b"note\n").expect("write documentation");
+    fs::write(worktree.join("docs/note.txt"), b"note \xff needle\n").expect("write documentation");
     let long_directory = worktree.join("docs").join("a".repeat(60));
     fs::create_dir(&long_directory).expect("create a long archive directory");
     fs::write(

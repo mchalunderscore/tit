@@ -26,7 +26,7 @@ use crate::feed::{FeedFormat, FeedPage, PAGE_SIZE};
 use crate::git::packetline::MAX_REQUEST_BYTES;
 use crate::git::read::{
     BlameHunk, CommitInfo, DiffFile, ReadCancellation, ReadError, ReadLimits,
-    RepositoryReadService, TreeEntryInfo,
+    RepositoryReadService, SearchOutcome, TreeEntryInfo,
 };
 use crate::git::upload_pack::{ProtocolVersion, UploadPack};
 use crate::markdown::{self, RenderedMarkdown};
@@ -36,6 +36,7 @@ use super::{PublicWebConfig, RequestId, WebState, render_error};
 
 const MAX_HISTORY_COMMITS: usize = 10_000;
 const MAX_SUMMARY_COMMITS: usize = 50;
+const MAX_SEARCH_QUERY_BYTES: usize = 256;
 
 #[derive(Clone)]
 pub(super) struct PublicWeb {
@@ -227,6 +228,7 @@ pub(super) fn routes() -> Router<WebState> {
         .route("/{owner}/{repository}/refs", get(refs))
         .route("/{owner}/{repository}/atom.xml", get(atom_feed))
         .route("/{owner}/{repository}/rss.xml", get(rss_feed))
+        .route("/{owner}/{repository}/search", get(search))
         .route("/{owner}/{repository}/commit/{commit}", get(commit))
         .route("/{owner}/{repository}/diff/{old}/{new}", get(diff))
         .route("/{owner}/{repository}/tree/{commit}", get(tree_root))
@@ -371,6 +373,44 @@ async fn refs(
             let cancellation = ReadCancellation::default();
             let references = service.references(&cancellation)?;
             Ok(RepositoryPage::refs(record, references))
+        })
+        .await;
+    render_page(result, &request_id.0)
+}
+
+async fn search(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(path): AxumPath<RepositoryPath>,
+    Query(query): Query<SearchQuery>,
+) -> Response {
+    let Some(web) = state.public else {
+        return route_error(RouteError::NotFound, &request_id.0);
+    };
+    if query.query.as_ref().is_some_and(|query| {
+        query.is_empty() || query.len() > MAX_SEARCH_QUERY_BYTES || query.as_bytes().contains(&0)
+    }) {
+        return route_error(RouteError::InvalidRequest, &request_id.0);
+    }
+    let result = web
+        .read(path.owner, path.repository, move |record, service| {
+            let cancellation = ReadCancellation::default();
+            let references = service.references(&cancellation)?;
+            let selected = select_search_ref(&references, query.reference.as_deref())?;
+            let outcome = match (&query.query, selected.as_ref()) {
+                (Some(query), Some((_, commit))) => {
+                    Some(service.search(*commit, query.as_bytes(), &cancellation)?)
+                }
+                (Some(_), None) => return Err(RouteError::NotFound),
+                (None, _) => None,
+            };
+            Ok(RepositoryPage::search(
+                record,
+                references,
+                selected,
+                query.query.unwrap_or_default(),
+                outcome,
+            ))
         })
         .await;
     render_page(result, &request_id.0)
@@ -961,6 +1001,15 @@ struct FeedQuery {
     before: Option<i64>,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchQuery {
+    #[serde(rename = "q")]
+    query: Option<String>,
+    #[serde(rename = "ref")]
+    reference: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 struct CommitPath {
     owner: String,
@@ -1012,6 +1061,14 @@ struct RepositoryPage {
     diffs: Vec<DiffView>,
     refs: Vec<RefView>,
     blame: Vec<BlameView>,
+    search_query: String,
+    search_ref: String,
+    search_refs: Vec<SearchRefView>,
+    search_done: bool,
+    search_truncated: bool,
+    search_files: usize,
+    search_bytes: usize,
+    search_matches: Vec<SearchMatchView>,
 }
 
 impl RepositoryPage {
@@ -1043,6 +1100,14 @@ impl RepositoryPage {
             diffs: Vec::new(),
             refs: Vec::new(),
             blame: Vec::new(),
+            search_query: String::new(),
+            search_ref: String::new(),
+            search_refs: Vec::new(),
+            search_done: false,
+            search_truncated: false,
+            search_files: 0,
+            search_bytes: 0,
+            search_matches: Vec::new(),
         }
     }
 
@@ -1178,6 +1243,54 @@ impl RepositoryPage {
         }
         page
     }
+
+    fn search(
+        record: RepositoryRecord,
+        references: Vec<crate::git::read::RefInfo>,
+        selected: Option<(Vec<u8>, ObjectId)>,
+        query: String,
+        outcome: Option<SearchOutcome>,
+    ) -> Self {
+        let mut page = Self::base(record, "search", "Search".to_owned());
+        page.search_query = query;
+        if let Some((name, commit)) = selected {
+            page.has_head = true;
+            page.search_ref = display_bytes(&name);
+            page.commit_id = commit.to_string();
+        }
+        page.search_refs = references
+            .into_iter()
+            .filter(|reference| {
+                reference.name == b"HEAD"
+                    || reference.name.starts_with(b"refs/heads/")
+                    || reference.name.starts_with(b"refs/tags/")
+            })
+            .filter_map(|reference| {
+                let name = std::str::from_utf8(&reference.name).ok()?.to_owned();
+                Some(SearchRefView {
+                    selected: name == page.search_ref,
+                    name,
+                })
+            })
+            .collect();
+        if let Some(outcome) = outcome {
+            page.search_done = true;
+            page.search_truncated = outcome.truncated;
+            page.search_files = outcome.files_scanned;
+            page.search_bytes = outcome.bytes_scanned;
+            page.search_matches = outcome
+                .matches
+                .into_iter()
+                .map(|item| SearchMatchView {
+                    path: display_bytes(&item.path),
+                    encoded_path: encode_path(&item.path),
+                    line_number: item.line_number,
+                    line: display_bytes(&item.line),
+                })
+                .collect();
+        }
+        page
+    }
 }
 
 #[derive(Default)]
@@ -1291,6 +1404,18 @@ struct BlameView {
     content: String,
 }
 
+struct SearchRefView {
+    name: String,
+    selected: bool,
+}
+
+struct SearchMatchView {
+    path: String,
+    encoded_path: String,
+    line_number: usize,
+    line: String,
+}
+
 impl BlameView {
     fn new(hunk: BlameHunk, lines: &[&str]) -> Self {
         let start = usize::try_from(hunk.start_line.saturating_sub(1)).unwrap_or(usize::MAX);
@@ -1333,10 +1458,43 @@ impl From<ReadError> for RouteError {
             | ReadError::NotTree(_)
             | ReadError::NotBlob(_)
             | ReadError::WrongObjectKind { .. } => Self::NotFound,
+            ReadError::InvalidSearchQuery => Self::InvalidRequest,
             ReadError::Limit(_) | ReadError::Cancelled | ReadError::Deadline => Self::Unavailable,
             _ => Self::Internal,
         }
     }
+}
+
+fn select_search_ref(
+    references: &[crate::git::read::RefInfo],
+    requested: Option<&str>,
+) -> Result<Option<(Vec<u8>, ObjectId)>, RouteError> {
+    if requested.is_some_and(|name| name.is_empty() || name.len() > 4096) {
+        return Err(RouteError::InvalidRequest);
+    }
+    let reference = match requested {
+        Some(requested) => references
+            .iter()
+            .find(|reference| reference.name == requested.as_bytes())
+            .ok_or(RouteError::NotFound)?,
+        None => match references
+            .iter()
+            .find(|reference| reference.name == b"HEAD")
+        {
+            Some(reference) => reference,
+            None => match references.iter().find(|reference| {
+                reference.name.starts_with(b"refs/heads/")
+                    || reference.name.starts_with(b"refs/tags/")
+            }) {
+                Some(reference) => reference,
+                None => return Ok(None),
+            },
+        },
+    };
+    Ok(Some((
+        reference.name.clone(),
+        reference.peeled.unwrap_or(reference.target),
+    )))
 }
 
 impl From<StoreError> for RouteError {

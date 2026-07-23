@@ -81,6 +81,7 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         assert!(summary_text.contains("&#60;script&#62;alert(3)&#60;/script&#62;"));
         assert!(summary_text.contains("/alice/example/atom.xml"));
         assert!(summary_text.contains("/alice/example/rss.xml"));
+        assert!(summary_text.contains("/alice/example/search"));
 
         let mut feed_entry_ids = Vec::new();
         for (path, content_type) in [
@@ -183,6 +184,13 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         let empty = request(server.address(), "GET", "/alice/empty", &[], &[]);
         assert_eq!(empty.status, 200);
         assert!(empty.text().contains("This repository has no commits."));
+        let empty_search = request(server.address(), "GET", "/alice/empty/search", &[], &[]);
+        assert_eq!(empty_search.status, 200);
+        assert!(
+            empty_search
+                .text()
+                .contains("This repository has no commits to search.")
+        );
 
         let alias = request(server.address(), "GET", "/alice/example.git", &[], &[]);
         assert_eq!(alias.status, 308);
@@ -190,6 +198,7 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
 
         let routes = [
             "/alice/example/refs".to_owned(),
+            "/alice/example/search".to_owned(),
             format!("/alice/example/commit/{}", fixture.head),
             format!("/alice/example/tree/{}", fixture.head),
             format!("/alice/example/tree/{}/nested", fixture.head),
@@ -211,6 +220,68 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
                 response.body.len().to_string()
             );
         }
+
+        let search = request(
+            server.address(),
+            "GET",
+            "/alice/example/search?q=second%20line&ref=HEAD",
+            &[],
+            &[],
+        );
+        assert_eq!(search.status, 200);
+        assert_html_policy(&search);
+        let search_text = search.text();
+        assert!(search_text.contains("Found 1 matching lines."));
+        assert!(search_text.contains("nested/file.txt:2"));
+        assert!(search_text.contains(&format!(
+            "/alice/example/blob/{}/nested/file.txt",
+            fixture.head
+        )));
+        assert!(search_text.contains("<option value=\"HEAD\" selected>HEAD</option>"));
+
+        let malformed = request(
+            server.address(),
+            "GET",
+            "/alice/example/search?q=needle&ref=refs%2Fheads%2Fmain",
+            &[],
+            &[],
+        );
+        assert_eq!(malformed.status, 200);
+        assert!(malformed.text().contains("malformed.txt:1"));
+        assert!(malformed.text().contains("start � needle"));
+
+        let escaped = request(
+            server.address(),
+            "GET",
+            "/alice/example/search?q=%3Cscript%3E&ref=HEAD",
+            &[],
+            &[],
+        );
+        assert_eq!(escaped.status, 200);
+        assert!(!escaped.text().contains("value=\"<script>\""));
+        assert!(escaped.text().contains("value=\"&#60;script&#62;\""));
+        assert_eq!(
+            request(
+                server.address(),
+                "GET",
+                "/alice/example/search?q=&ref=HEAD",
+                &[],
+                &[],
+            )
+            .status,
+            400
+        );
+        assert_eq!(
+            request(
+                server.address(),
+                "GET",
+                "/alice/example/search?q=text&ref=refs%2Fheads%2Fmissing",
+                &[],
+                &[],
+            )
+            .status,
+            404
+        );
 
         let tree = request(
             server.address(),
@@ -249,6 +320,18 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         );
         assert_eq!(binary.status, 200);
         assert!(binary.text().contains("Binary content cannot be shown."));
+
+        let large = request(
+            server.address(),
+            "GET",
+            &format!("/alice/example/blob/{}/large.txt", fixture.head),
+            &[],
+            &[],
+        );
+        assert_eq!(large.status, 200);
+        assert!(large.body.len() > 2 * 1024 * 1024);
+        assert!(large.text().contains("large content starts"));
+        assert!(large.text().contains("large content ends"));
 
         let raw = request(
             server.address(),
@@ -463,6 +546,7 @@ fn assert_hidden(address: SocketAddr, head: &str) {
         format!("/alice/example/raw/{head}/README.md"),
         "/alice/example/atom.xml".to_owned(),
         "/alice/example/rss.xml".to_owned(),
+        "/alice/example/search?q=text".to_owned(),
         "/alice/example/info/refs?service=git-upload-pack".to_owned(),
     ] {
         let response = request(address, "GET", &route, &[], &[]);
@@ -507,6 +591,13 @@ impl Fixture {
         fs::create_dir(worktree.join("nested")).expect("create a nested directory");
         fs::write(worktree.join("nested/file.txt"), b"first line\n").expect("write the text file");
         fs::write(worktree.join("binary.dat"), b"binary\0content").expect("write the binary file");
+        let mut large = vec![b'x'; 2 * 1024 * 1024];
+        let prefix = b"large content starts\n";
+        large[..prefix.len()].copy_from_slice(prefix);
+        let suffix = b"\nlarge content ends\n";
+        let suffix_start = large.len() - suffix.len();
+        large[suffix_start..].copy_from_slice(suffix);
+        fs::write(worktree.join("large.txt"), large).expect("write the large file");
         fs::write(
             worktree.join("<img src=x onerror=alert(4)>.txt"),
             b"escaped path\n",
@@ -514,6 +605,8 @@ impl Fixture {
         .expect("write the hostile path");
         fs::write(worktree.join("non-å.txt"), b"non-UTF-8 path\n")
             .expect("write the percent-encoded path");
+        fs::write(worktree.join("malformed.txt"), b"start \xff needle\n")
+            .expect("write malformed UTF-8 content");
         commit_all(&worktree, "first commit");
         let parent = rev_parse(&worktree, "HEAD");
         fs::write(

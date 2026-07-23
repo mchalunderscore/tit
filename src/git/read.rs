@@ -24,6 +24,11 @@ pub(crate) struct ReadLimits {
     pub(crate) max_diff_bytes: usize,
     pub(crate) max_archive_entries: usize,
     pub(crate) max_archive_bytes: usize,
+    pub(crate) max_search_files: usize,
+    pub(crate) max_search_bytes: usize,
+    pub(crate) max_search_results: usize,
+    pub(crate) max_search_query_bytes: usize,
+    pub(crate) max_search_duration: Duration,
     pub(crate) max_duration: Duration,
 }
 
@@ -40,6 +45,11 @@ impl Default for ReadLimits {
             max_diff_bytes: 64 * 1024 * 1024,
             max_archive_entries: 100_000,
             max_archive_bytes: 256 * 1024 * 1024,
+            max_search_files: 10_000,
+            max_search_bytes: 64 * 1024 * 1024,
+            max_search_results: 500,
+            max_search_query_bytes: 256,
+            max_search_duration: Duration::from_secs(5),
             max_duration: Duration::from_secs(30),
         }
     }
@@ -125,6 +135,22 @@ pub(crate) struct BlameHunk {
 pub(crate) struct ArchiveStats {
     pub(crate) entries: usize,
     pub(crate) bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SearchMatch {
+    pub(crate) path: Vec<u8>,
+    pub(crate) line_number: usize,
+    pub(crate) line: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SearchOutcome {
+    pub(crate) commit: ObjectId,
+    pub(crate) matches: Vec<SearchMatch>,
+    pub(crate) files_scanned: usize,
+    pub(crate) bytes_scanned: usize,
+    pub(crate) truncated: bool,
 }
 
 impl RepositoryReadService {
@@ -467,10 +493,89 @@ impl RepositoryReadService {
         })
     }
 
+    pub(crate) fn search(
+        &self,
+        commit: ObjectId,
+        query: &[u8],
+        cancellation: &ReadCancellation,
+    ) -> Result<SearchOutcome, ReadError> {
+        if query.is_empty() || query.contains(&0) {
+            return Err(ReadError::InvalidSearchQuery);
+        }
+        if query.len() > self.limits.max_search_query_bytes {
+            return Err(ReadError::Limit("search query bytes"));
+        }
+        let budget = self.budget_for(cancellation, self.limits.max_search_duration);
+        let commit_info = self.read_commit(commit, &budget)?;
+        let files = self.flatten_tree(commit_info.tree, &budget)?;
+        let mut matches = Vec::new();
+        let mut files_scanned = 0_usize;
+        let mut bytes_scanned = 0_usize;
+        let mut truncated = false;
+
+        'files: for (path, file) in files {
+            budget.check()?;
+            if file.mode.is_commit() {
+                continue;
+            }
+            files_scanned += 1;
+            if files_scanned > self.limits.max_search_files {
+                return Err(ReadError::Limit("search files"));
+            }
+            let header = self
+                .repository
+                .objects
+                .header(file.id)
+                .map_err(|error| ReadError::Git(error.to_string()))?;
+            let size =
+                usize::try_from(header.size()).map_err(|_| ReadError::Limit("search bytes"))?;
+            bytes_scanned = checked_add(
+                bytes_scanned,
+                size,
+                self.limits.max_search_bytes,
+                "search bytes",
+            )?;
+            let blob = self.read_blob(file.id, file.mode, &budget)?;
+            if blob.data.contains(&0) {
+                continue;
+            }
+            for (index, line) in blob.data.split(|byte| *byte == b'\n').enumerate() {
+                budget.check()?;
+                if !contains_bytes(line, query) {
+                    continue;
+                }
+                if matches.len() == self.limits.max_search_results {
+                    truncated = true;
+                    break 'files;
+                }
+                matches.push(SearchMatch {
+                    path: path.clone(),
+                    line_number: index + 1,
+                    line: line.strip_suffix(b"\r").unwrap_or(line).to_vec(),
+                });
+            }
+        }
+        Ok(SearchOutcome {
+            commit,
+            matches,
+            files_scanned,
+            bytes_scanned,
+            truncated,
+        })
+    }
+
     fn budget<'a>(&self, cancellation: &'a ReadCancellation) -> ReadBudget<'a> {
+        self.budget_for(cancellation, self.limits.max_duration)
+    }
+
+    fn budget_for<'a>(
+        &self,
+        cancellation: &'a ReadCancellation,
+        duration: Duration,
+    ) -> ReadBudget<'a> {
         ReadBudget {
             cancellation,
-            deadline: Instant::now() + self.limits.max_duration,
+            deadline: Instant::now() + duration,
         }
     }
 
@@ -857,11 +962,22 @@ fn validate_limits(limits: &ReadLimits) -> Result<(), ReadError> {
         || limits.max_diff_bytes == 0
         || limits.max_archive_entries == 0
         || limits.max_archive_bytes < 1024
+        || limits.max_search_files == 0
+        || limits.max_search_bytes == 0
+        || limits.max_search_results == 0
+        || limits.max_search_query_bytes == 0
+        || limits.max_search_duration.is_zero()
         || limits.max_duration.is_zero()
     {
         return Err(ReadError::InvalidLimits);
     }
     Ok(())
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|candidate| candidate == needle)
 }
 
 fn validate_path(path: &[u8], permit_empty: bool, maximum: usize) -> Result<(), ReadError> {
@@ -1031,6 +1147,8 @@ pub(crate) enum ReadError {
     InvalidLimits,
     #[error("repository path is not valid")]
     InvalidPath,
+    #[error("repository search query is not valid")]
+    InvalidSearchQuery,
     #[error("repository path does not exist: {0:?}")]
     PathNotFound(Vec<u8>),
     #[error("repository path is not a tree: {0:?}")]

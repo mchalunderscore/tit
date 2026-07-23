@@ -1,7 +1,8 @@
 # tit
 
 `tit` is a small, self-hosted collaborative development environment (CDE) for
-Git. The project is in Milestone 1D and does not serve repositories at this time.
+Git. The current implementation has a read-only Web UI, HTTP and SSH clone
+services, public feeds, and bounded source search.
 
 Read [PLAN.md](PLAN.md) for the product design and implementation gates. Read
 [CONTRIBUTING.md](CONTRIBUTING.md) before you change code.
@@ -105,3 +106,16 @@ Use `--user` instead of `--config` to read the configuration from
 
 The executable does not run Git or OpenSSH. Tests can use stock clients as
 external test drivers.
+
+## Milestone 2 gate
+
+Install stock Git and OpenSSH. Then, run the read-only CDE gate:
+
+```text
+./scripts/check-m2-8
+```
+
+This command runs the quality gate, measures source search without an index,
+and tests the public routes with SHA-1 and SHA-256 repositories. Read the
+[source search architectural decision record](docs/adr/0008-bounded-source-search.md)
+for the search limits and current measurement.

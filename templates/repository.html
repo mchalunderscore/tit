@@ -8,6 +8,7 @@
       <a href="/{{ owner }}/{{ repository }}/refs">Refs</a>
       <a href="/{{ owner }}/{{ repository }}/atom.xml">Atom</a>
       <a href="/{{ owner }}/{{ repository }}/rss.xml">RSS</a>
+      <a href="/{{ owner }}/{{ repository }}/search">Search</a>
 {% if has_head %}
       <a href="/{{ owner }}/{{ repository }}/tree/{{ commit_id }}">Tree</a>
       <a href="/{{ owner }}/{{ repository }}/commit/{{ commit_id }}">Commit</a>
@@ -134,6 +135,37 @@
     <li value="{{ item.start_line }}"><a href="/{{ owner }}/{{ repository }}/commit/{{ item.commit_id }}"><code>{{ item.commit_id }}</code></a> lines {{ item.source_start_line }}–{{ item.end_line }}{% if item.source_path != "" %} from {{ item.source_path }}{% endif %}<pre>{{ item.content }}</pre></li>
 {% endfor %}
   </ol>
+{% endif %}
+{% endif %}
+
+{% if page_kind == "search" %}
+  <h2>Source search</h2>
+{% if has_head %}
+  <form method="get" action="/{{ owner }}/{{ repository }}/search">
+    <div class="field">
+      <label for="search-query">Text</label>
+      <input id="search-query" name="q" type="search" value="{{ search_query }}" required maxlength="256">
+    </div>
+    <div class="field">
+      <label for="search-ref">Ref</label>
+      <select id="search-ref" name="ref">
+{% for item in search_refs %}
+        <option value="{{ item.name }}"{% if item.selected %} selected{% endif %}>{{ item.name }}</option>
+{% endfor %}
+      </select>
+    </div>
+    <button type="submit">Search</button>
+  </form>
+{% if search_done %}
+  <p>Scanned {{ search_files }} files and {{ search_bytes }} bytes. Found {{ search_matches.len() }} matching lines.{% if search_truncated %} More results exist. Refine the search text.{% endif %}</p>
+  <ol class="search-results">
+{% for item in search_matches %}
+    <li><a href="/{{ owner }}/{{ repository }}/blob/{{ commit_id }}/{{ item.encoded_path }}">{{ item.path }}:{{ item.line_number }}</a><pre>{{ item.line }}</pre></li>
+{% endfor %}
+  </ol>
+{% endif %}
+{% else %}
+  <p>This repository has no commits to search.</p>
 {% endif %}
 {% endif %}
 {% endblock %}
