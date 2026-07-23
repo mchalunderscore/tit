@@ -23,17 +23,21 @@ use crate::git::upload_pack::{ProtocolVersion, UploadPack, UploadPackError};
 use crate::issue::{IssueError, IssueService, MAX_BODY_BYTES, MAX_TITLE_BYTES};
 use crate::policy::RepositoryOperation;
 use crate::repository::{RepositoryService, RepositoryServiceError};
+use crate::store::{Store, StoreError};
 
 const VERSION_COMMAND: &[u8] = b"tit --version";
 const GIT_PROTOCOL_VARIABLE: &str = "GIT_PROTOCOL";
 const MAX_RECEIVE_PACK_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_REPOSITORY_COMMAND_BYTES: usize = 512;
 const MAX_ISSUE_COMMAND_BYTES: usize = 512;
+const MAX_PULL_REQUEST_COMMAND_BYTES: usize = 512;
 const MAX_ISSUE_INPUT_BYTES: usize = MAX_TITLE_BYTES + 1 + MAX_BODY_BYTES;
 const REPOSITORY_CREATE_USAGE: &str =
     "repo create NAME [--object-format sha1|sha256] [--output human|json]";
 const ISSUE_LIST_USAGE: &str = "issue list OWNER/REPOSITORY [--output human|json]";
 const ISSUE_CREATE_USAGE: &str = "issue create OWNER/REPOSITORY [--output human|json]";
+const PULL_REQUEST_CHECKOUT_USAGE: &str =
+    "pr checkout OWNER/REPOSITORY NUMBER [--output human|json]";
 
 pub(crate) struct RunningSshServer {
     address: SocketAddr,
@@ -561,6 +565,19 @@ impl Handler for SshSession {
                     session,
                 )?,
             }
+        } else if is_pull_request_command(command) {
+            self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
+            session.channel_success(channel)?;
+            let machine_requested = requests_json(command);
+            let result = match (parse_pull_request_command(command), self.active_identity()) {
+                (Ok(command), Some(identity)) => {
+                    run_pull_request_checkout(self.repositories.clone(), identity.username, command)
+                        .await
+                }
+                (Ok(_), None) => Err(PullRequestCommandError::Unavailable),
+                (Err(()), _) => Err(PullRequestCommandError::Usage),
+            };
+            send_pull_request_result(channel, result, machine_requested, session)?;
         } else {
             let service = self.open_git_service(command).await;
             if let Some(service) = service {
@@ -1356,6 +1373,174 @@ fn issue_command_error_message(error: &IssueCommandError) -> String {
     }
 }
 
+struct PullRequestCheckoutCommand {
+    owner: String,
+    repository: String,
+    number: i64,
+    output: CommandOutput,
+}
+
+struct PullRequestCheckoutResult {
+    owner: String,
+    repository: String,
+    number: i64,
+    output: CommandOutput,
+}
+
+enum PullRequestCommandError {
+    Usage,
+    Unavailable,
+    Store(StoreError),
+}
+
+fn is_pull_request_command(command: &[u8]) -> bool {
+    command == b"pr" || command.starts_with(b"pr ")
+}
+
+fn parse_pull_request_command(command: &[u8]) -> Result<PullRequestCheckoutCommand, ()> {
+    if command.len() > MAX_PULL_REQUEST_COMMAND_BYTES || !command.is_ascii() {
+        return Err(());
+    }
+    let command = std::str::from_utf8(command).map_err(|_| ())?;
+    if command
+        .bytes()
+        .any(|byte| byte.is_ascii_control() && byte != b' ')
+    {
+        return Err(());
+    }
+    let mut tokens = command.split_ascii_whitespace();
+    if tokens.next() != Some("pr") || tokens.next() != Some("checkout") {
+        return Err(());
+    }
+    let target = tokens.next().ok_or(())?;
+    let (owner, repository) = target.split_once('/').ok_or(())?;
+    if owner.is_empty() || repository.is_empty() || repository.contains('/') {
+        return Err(());
+    }
+    let number = tokens.next().ok_or(())?.parse::<i64>().map_err(|_| ())?;
+    if number < 1 {
+        return Err(());
+    }
+    let output = parse_output_options(tokens)?;
+    Ok(PullRequestCheckoutCommand {
+        owner: owner.to_owned(),
+        repository: repository.to_owned(),
+        number,
+        output,
+    })
+}
+
+async fn run_pull_request_checkout(
+    repositories: Option<Arc<GitRepositories>>,
+    actor: String,
+    command: PullRequestCheckoutCommand,
+) -> Result<PullRequestCheckoutResult, PullRequestCommandError> {
+    let repositories = repositories.ok_or(PullRequestCommandError::Unavailable)?;
+    let database = repositories
+        .push_database()
+        .ok_or(PullRequestCommandError::Unavailable)?
+        .to_owned();
+    let permit = repositories
+        .blocking_permit()
+        .await
+        .map_err(|_| PullRequestCommandError::Unavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        Store::open(&database)
+            .and_then(|store| {
+                store.pull_request(
+                    &command.owner,
+                    &command.repository,
+                    command.number,
+                    Some(&actor),
+                )
+            })
+            .map(|_| PullRequestCheckoutResult {
+                owner: command.owner,
+                repository: command.repository,
+                number: command.number,
+                output: command.output,
+            })
+            .map_err(PullRequestCommandError::Store)
+    })
+    .await
+    .map_err(|_| PullRequestCommandError::Unavailable)?
+}
+
+fn send_pull_request_result(
+    channel: ChannelId,
+    result: Result<PullRequestCheckoutResult, PullRequestCommandError>,
+    machine_requested: bool,
+    session: &mut Session,
+) -> Result<(), russh::Error> {
+    match result {
+        Ok(result) => {
+            let fetch = format!(
+                "git fetch origin refs/pull/{}/head:refs/heads/pr-{}",
+                result.number, result.number
+            );
+            let checkout = format!("git checkout pr-{}", result.number);
+            let data = match result.output {
+                CommandOutput::Human => format!("{fetch}\n{checkout}\n"),
+                CommandOutput::Json => format!(
+                    "{{\"version\":1,\"status\":\"success\",\"repository\":{{\"owner\":\"{}\",\"name\":\"{}\"}},\"pull_request\":{{\"number\":{},\"ref\":\"refs/pull/{}/head\",\"local_branch\":\"pr-{}\"}},\"commands\":{{\"fetch\":\"{}\",\"checkout\":\"{}\"}}}}\n",
+                    result.owner,
+                    result.repository,
+                    result.number,
+                    result.number,
+                    result.number,
+                    fetch,
+                    checkout,
+                ),
+            };
+            session.data(channel, data.into_bytes())?;
+            finish_git_channel(channel, 0, session)
+        }
+        Err(error) => {
+            if machine_requested {
+                session.data(
+                    channel,
+                    format!(
+                        "{{\"version\":1,\"status\":\"error\",\"error\":{{\"code\":\"{}\"}}}}\n",
+                        pull_request_command_error_code(&error)
+                    )
+                    .into_bytes(),
+                )?;
+            } else {
+                session.extended_data(
+                    channel,
+                    1,
+                    format!("tit: {}\n", pull_request_command_error_message(&error)).into_bytes(),
+                )?;
+            }
+            finish_git_channel(channel, 1, session)
+        }
+    }
+}
+
+fn pull_request_command_error_code(error: &PullRequestCommandError) -> &'static str {
+    match error {
+        PullRequestCommandError::Usage => "invalid-command",
+        PullRequestCommandError::Unavailable => "service-unavailable",
+        PullRequestCommandError::Store(
+            StoreError::PullRequestHidden
+            | StoreError::PullRequestNotFound(_, _, _)
+            | StoreError::RepositoryNotFound(_, _),
+        ) => "pull-request-unavailable",
+        PullRequestCommandError::Store(_) => "pull-request-checkout-failed",
+    }
+}
+
+fn pull_request_command_error_message(error: &PullRequestCommandError) -> String {
+    match pull_request_command_error_code(error) {
+        "invalid-command" => format!("usage: {PULL_REQUEST_CHECKOUT_USAGE}"),
+        "pull-request-unavailable" => "The pull request is not available.".to_owned(),
+        "invalid-target" => "The pull-request target is not valid.".to_owned(),
+        "service-unavailable" => "The pull-request service is not available.".to_owned(),
+        _ => "The pull-request checkout command could not be completed.".to_owned(),
+    }
+}
+
 impl SshSession {
     fn authorize(&self, public_key: &PublicKey) -> Auth {
         if self.authorized_keys.contains(public_key) {
@@ -1684,5 +1869,25 @@ mod tests {
             parse_issue_input(b"invalid\xff"),
             Err(IssueCommandError::Input)
         ));
+    }
+
+    #[test]
+    fn parses_only_bounded_pull_request_checkout_commands() {
+        let command = parse_pull_request_command(b"pr checkout alice/project 42 --output json")
+            .expect("parse a pull-request checkout command");
+        assert_eq!(command.owner, "alice");
+        assert_eq!(command.repository, "project");
+        assert_eq!(command.number, 42);
+        assert!(command.output == CommandOutput::Json);
+        for command in [
+            b"pr checkout alice/project 0".as_slice(),
+            b"pr checkout alice/project not-a-number".as_slice(),
+            b"pr checkout alice/project/extra 1".as_slice(),
+            b"pr checkout alice/project 1 --output json extra".as_slice(),
+            b"pr checkout alice/project 1 --output json --output json".as_slice(),
+            &[b'x'; MAX_PULL_REQUEST_COMMAND_BYTES + 1],
+        ] {
+            assert!(parse_pull_request_command(command).is_err());
+        }
     }
 }

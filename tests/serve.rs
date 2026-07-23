@@ -604,6 +604,106 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
         "example",
         &instance.path().join("created-clone")
     ));
+    let created_clone = instance.path().join("created-clone");
+    fs::write(created_clone.join("README.md"), b"base\n").expect("write pull-request base");
+    git_commit(&created_clone, "create main");
+    assert!(git_push(&member_key, &created_clone, &["main"]).success());
+    command(&created_clone, ["switch", "-q", "-c", "feature"]);
+    fs::write(created_clone.join("feature.txt"), b"feature\n").expect("write pull-request feature");
+    git_commit(&created_clone, "create feature");
+    assert!(git_push(&member_key, &created_clone, &["feature"]).success());
+    let base = git_revision(&created_clone, "main");
+    let head = git_revision(&created_clone, "feature");
+    let pull_request_database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the pull-request command database");
+    let repository_id: String = pull_request_database
+        .query_row(
+            "SELECT id FROM repository WHERE slug = 'example'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the pull-request repository ID");
+    let bare = instance
+        .path()
+        .join("repositories")
+        .join(format!("{repository_id}.git"));
+    command(
+        instance.path(),
+        [
+            "--git-dir",
+            bare.to_str().expect("a UTF-8 bare path"),
+            "update-ref",
+            "refs/pull/1/head",
+            &head,
+        ],
+    );
+    pull_request_database
+        .execute(
+            "INSERT INTO pull_request
+             (id, repository_id, number, title, body, state, author_account_id,
+              base_ref, head_ref, base_object_id, head_object_id, created_at, updated_at)
+             SELECT '11111111111111111111111111111111', ?1, 1, 'Feature', '', 'open',
+                    account.id, 'refs/heads/main', 'refs/heads/feature', ?2, ?3, 10, 10
+             FROM account WHERE username = 'bob'",
+            rusqlite::params![repository_id, base, head],
+        )
+        .expect("create a pull-request command fixture");
+    pull_request_database
+        .execute(
+            "INSERT INTO pull_request_revision
+             (id, pull_request_id, number, author_account_id, base_object_id,
+              head_object_id, created_at)
+             SELECT '22222222222222222222222222222222',
+                    '11111111111111111111111111111111', 1, account.id, ?1, ?2, 10
+             FROM account WHERE username = 'bob'",
+            rusqlite::params![base, head],
+        )
+        .expect("create a pull-request revision fixture");
+    drop(pull_request_database);
+
+    let human_checkout = ssh_exec(ssh, &member_key, &["pr", "checkout", "bob/example", "1"]);
+    assert!(human_checkout.status.success());
+    assert_eq!(
+        String::from_utf8(human_checkout.stdout).expect("read human checkout output"),
+        "git fetch origin refs/pull/1/head:refs/heads/pr-1\ngit checkout pr-1\n"
+    );
+    assert!(human_checkout.stderr.is_empty());
+    let machine_checkout = ssh_exec(
+        ssh,
+        &member_key,
+        &["pr", "checkout", "bob/example", "1", "--output", "json"],
+    );
+    assert!(machine_checkout.status.success());
+    let machine_checkout: serde_json::Value =
+        serde_json::from_slice(&machine_checkout.stdout).expect("parse machine checkout output");
+    assert_eq!(machine_checkout["version"], 1);
+    assert_eq!(machine_checkout["status"], "success");
+    assert_eq!(machine_checkout["repository"]["owner"], "bob");
+    assert_eq!(machine_checkout["repository"]["name"], "example");
+    assert_eq!(machine_checkout["pull_request"]["number"], 1);
+    assert_eq!(machine_checkout["pull_request"]["ref"], "refs/pull/1/head");
+    assert_eq!(
+        machine_checkout["commands"]["fetch"],
+        "git fetch origin refs/pull/1/head:refs/heads/pr-1"
+    );
+    let checkout_clone = instance.path().join("pull-request-checkout");
+    assert!(ssh_clone_repository_succeeds(
+        ssh,
+        &member_key,
+        "bob",
+        "example",
+        &checkout_clone
+    ));
+    assert!(
+        git_fetch_ref(
+            &member_key,
+            &checkout_clone,
+            "refs/pull/1/head:refs/heads/pr-1"
+        )
+        .success()
+    );
+    command(&checkout_clone, ["checkout", "-q", "pr-1"]);
+    assert_eq!(git_revision(&checkout_clone, "HEAD"), head);
 
     let machine = ssh_exec(
         ssh,
@@ -673,6 +773,17 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
         serde_json::from_slice::<serde_json::Value>(&hidden.stdout)
             .expect("parse hidden issue error")["error"]["code"],
         "repository-unavailable"
+    );
+    let hidden_checkout = ssh_exec(
+        ssh,
+        &private_key,
+        &["pr", "checkout", "bob/example", "1", "--output", "json"],
+    );
+    assert!(!hidden_checkout.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&hidden_checkout.stdout)
+            .expect("parse hidden pull-request error")["error"]["code"],
+        "pull-request-unavailable"
     );
     access_database
         .execute(
@@ -1550,6 +1661,36 @@ fn git_push_output(private_key: &Path, worktree: &Path, refspecs: &[&str]) -> Ou
         .current_dir(worktree)
         .output()
         .expect("push through the tit SSH server")
+}
+
+fn git_fetch_ref(private_key: &Path, worktree: &Path, refspec: &str) -> ExitStatus {
+    let ssh_command = format!(
+        "ssh -F /dev/null -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+        private_key.display()
+    );
+    Command::new("git")
+        .args(["fetch", "origin", refspec])
+        .env("GIT_SSH_COMMAND", ssh_command)
+        .current_dir(worktree)
+        .status()
+        .expect("fetch through the tit SSH server")
+}
+
+fn git_revision(worktree: &Path, revision: &str) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", revision])
+        .current_dir(worktree)
+        .output()
+        .expect("resolve a Git revision");
+    assert!(
+        output.status.success(),
+        "cannot resolve Git revision: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("read a Git revision")
+        .trim()
+        .to_owned()
 }
 
 struct ChildGuard(Option<Child>);

@@ -449,3 +449,17 @@ force-push rejection, protected-ref deletion rejection, topic-branch access,
 and pull-request merge permission. Read the
 [branch-rule architectural decision record](docs/adr/0026-branch-rules.md) for
 the ref, role, transport, and merge contracts.
+
+## Milestone 5.6 gate
+
+Run the SSH pull-request command gate:
+
+```text
+./scripts/check-m5-6
+```
+
+This command tests bounded command parsing, exact human output, versioned JSON
+output, repository read permission, and the returned stock Git fetch and
+checkout commands. Read the
+[SSH pull-request checkout architectural decision record](docs/adr/0027-ssh-pull-request-checkout.md)
+for the command, output, permission, and error contracts.
