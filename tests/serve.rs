@@ -490,6 +490,31 @@ fn keeps_private_git_hidden_from_http_but_allows_its_owner_over_ssh() {
     wait_for_listener(ssh, &mut server);
     let discovery = http_get(http, "/alice/private.git/info/refs?service=git-upload-pack");
     assert!(discovery.starts_with("HTTP/1.1 404"), "{discovery}");
+    let home = http_get(http, "/");
+    assert!(home.starts_with("HTTP/1.1 200"));
+    assert!(!home.contains("/alice/private"));
+    for route in [
+        "/alice/private",
+        "/alice/private/refs",
+        "/alice/private/atom.xml",
+        "/alice/private/rss.xml",
+        "/alice/private/search?q=serve&ref=HEAD",
+        "/alice/private/commit/main",
+        "/alice/private/diff/main/main",
+        "/alice/private/tree/main",
+        "/alice/private/tree/main/nested",
+        "/alice/private/blob/main/README.md",
+        "/alice/private/raw/main/README.md",
+        "/alice/private/blame/main/README.md",
+        "/alice/private/archive/main.tar",
+    ] {
+        let response = http_get(http, route);
+        assert!(
+            response.starts_with("HTTP/1.1 404"),
+            "route leaked: {route}"
+        );
+        assert!(!response.contains("serve fixture"), "route leaked: {route}");
+    }
 
     let ssh_command = format!(
         "ssh -F /dev/null -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",

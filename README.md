@@ -280,3 +280,15 @@ account ownership, both object formats, human output, JSON output, failure
 codes, audit events, and clone access. Read the
 [SSH repository command architectural decision record](docs/adr/0015-ssh-repository-commands.md)
 for the command and authorization rules.
+
+## Milestone 3 gate
+
+Run the complete account and authorization gate:
+
+```text
+./scripts/check-m3
+```
+
+This command tests one Web and SSH identity, account recovery, key revocation,
+sessions, repository roles, private route isolation, push policy, audit history,
+and repository creation from the Web UI and SSH.
