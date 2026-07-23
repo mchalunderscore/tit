@@ -9,13 +9,17 @@ use std::time::{Duration, Instant};
 use std::{env, ffi::OsString, fs};
 
 use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
-use store::{GitOperationIntent, InitialAdministrator, NewRepository, Store, StoreError};
+use store::{
+    GitOperationIntent, InitialAdministrator, NewRepository, NewRepositoryReference,
+    RepositoryOrigin, Store, StoreError,
+};
 use tempfile::TempDir;
 
 const V1_FIXTURE: &str = include_str!("fixtures/sqlite/v1.sql");
 const V2_FIXTURE: &str = include_str!("fixtures/sqlite/v2.sql");
 const V3_FIXTURE: &str = include_str!("fixtures/sqlite/v3.sql");
 const V4_FIXTURE: &str = include_str!("fixtures/sqlite/v4.sql");
+const V5_FIXTURE: &str = include_str!("fixtures/sqlite/v5.sql");
 
 fn database(directory: &TempDir, name: &str) -> std::path::PathBuf {
     directory.path().join(name)
@@ -133,7 +137,7 @@ fn configures_connections_and_creates_the_current_schema() {
     let directory = TempDir::new().expect("create a temporary directory");
     let store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
 
-    assert_eq!(store.schema_version().expect("read the schema version"), 5);
+    assert_eq!(store.schema_version().expect("read the schema version"), 6);
     assert_eq!(
         store
             .connection()
@@ -304,12 +308,24 @@ fn creates_renames_archives_and_reads_owned_repositories() {
             created_at: 10,
         })
         .expect("create an account");
+    let initial_references = [
+        NewRepositoryReference {
+            name: b"refs/heads/main".to_vec(),
+            target: "1".repeat(64),
+        },
+        NewRepositoryReference {
+            name: b"refs/tags/v1".to_vec(),
+            target: "2".repeat(64),
+        },
+    ];
     let repository = NewRepository {
         id: "00112233445566778899aabbccddeeff",
         owner: "alice",
         slug: "project",
         object_format: "sha256",
         created_at: 20,
+        origin: RepositoryOrigin::Imported,
+        initial_references: &initial_references,
     };
     store
         .create_repository(&repository)
@@ -325,6 +341,51 @@ fn creates_renames_archives_and_reads_owned_repositories() {
     assert_eq!(created.object_format, "sha256");
     assert_eq!(created.created_at, 20);
     assert_eq!(created.archived_at, None);
+    let (_, imported_events) = store
+        .public_repository_events("alice", "project", None, 10)
+        .expect("read imported repository events");
+    assert_eq!(imported_events.len(), 3);
+    assert_eq!(imported_events[0].kind, "tag-created");
+    assert_eq!(imported_events[1].kind, "ref-created");
+    assert_eq!(imported_events[2].kind, "repository-imported");
+
+    let initial = format!("{} refs/heads/main\n", "0".repeat(64));
+    let proposed = format!("{} refs/heads/main\n", "a".repeat(64));
+    let push = GitOperationIntent {
+        id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        repository_path: "/srv/tit/repositories/00112233445566778899aabbccddeeff.git",
+        actor: "alice",
+        initial_refs: initial.as_bytes(),
+        proposed_refs: proposed.as_bytes(),
+        event_payload: proposed.as_bytes(),
+        quarantine_path: "/srv/tit/quarantine/push",
+        created_at: 21,
+    };
+    store.begin_git_intent(&push).expect("begin a managed push");
+    let (_, pending_events) = store
+        .public_repository_events("alice", "project", None, 10)
+        .expect("read events while a push is pending");
+    assert_eq!(pending_events.len(), 3);
+    store
+        .mark_git_objects_promoted(push.id, None)
+        .expect("promote a managed push");
+    let (_, promoted_events) = store
+        .public_repository_events("alice", "project", None, 10)
+        .expect("read events while a push is promoted");
+    assert_eq!(promoted_events.len(), 3);
+    store
+        .complete_git_intent(push.id)
+        .expect("complete a managed push");
+    let (_, pushed_events) = store
+        .public_repository_events("alice", "project", None, 10)
+        .expect("read pushed repository events");
+    assert_eq!(pushed_events.len(), 5);
+    assert_eq!(pushed_events[0].kind, "ref-created");
+    assert_eq!(
+        pushed_events[0].new_target.as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
+    assert_eq!(pushed_events[1].kind, "push");
 
     assert!(matches!(
         store.create_repository(&repository),
@@ -345,6 +406,8 @@ fn creates_renames_archives_and_reads_owned_repositories() {
         slug: "project",
         object_format: "sha1",
         created_at: 20,
+        origin: RepositoryOrigin::Created,
+        initial_references: &[],
     };
     assert!(matches!(
         store.create_repository(&missing_owner),
@@ -708,13 +771,14 @@ fn migrates_each_committed_historical_fixture() {
         (V2_FIXTURE, 2),
         (V3_FIXTURE, 3),
         (V4_FIXTURE, 4),
+        (V5_FIXTURE, 5),
     ] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "tit.sqlite3");
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
-        assert_eq!(store.schema_version().expect("read the schema version"), 5);
+        assert_eq!(store.schema_version().expect("read the schema version"), 6);
         store.integrity_check().expect("check migrated integrity");
         let state: String = store
             .connection()
@@ -742,8 +806,45 @@ fn migrates_each_committed_historical_fixture() {
 }
 
 #[test]
+fn backfills_repository_events_when_version_five_is_migrated() {
+    let directory = TempDir::new().expect("create a temporary directory");
+    let path = database(&directory, "tit.sqlite3");
+    create_fixture(&path, V5_FIXTURE);
+    let connection = Connection::open(&path).expect("open the version-five fixture");
+    connection
+        .execute(
+            "INSERT INTO account
+             (id, username, is_administrator, state, created_at)
+             VALUES (1, 'alice', 1, 'active', 1)",
+            [],
+        )
+        .expect("insert a historical account");
+    connection
+        .execute(
+            "INSERT INTO repository
+             (id, owner_account_id, slug, visibility, state, object_format, created_at)
+             VALUES ('00112233445566778899aabbccddeeff', 1, 'project', 'public',
+                     'active', 'sha1', 2)",
+            [],
+        )
+        .expect("insert a historical repository");
+    connection
+        .pragma_update(None, "user_version", 5)
+        .expect("set the historical schema version");
+    drop(connection);
+
+    let store = Store::open(&path).expect("migrate the version-five fixture");
+    let (_, events) = store
+        .public_repository_events("alice", "project", None, 10)
+        .expect("read the backfilled event");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, "repository-created");
+    assert_eq!(events[0].created_at, 2);
+}
+
+#[test]
 fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
-    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 5)] {
+    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 6)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "fixture.sqlite");
         create_fixture(&path, V1_FIXTURE);

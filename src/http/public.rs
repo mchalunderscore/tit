@@ -2,11 +2,12 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
 use askama::Template;
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, Path as AxumPath, State};
+use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -14,12 +15,14 @@ use gix::bstr::ByteSlice;
 use gix::hash::ObjectId;
 use gix::objs::tree::EntryKind;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::auth::validate_username;
 use crate::domain::repository::validate_slug;
+use crate::feed::{FeedFormat, FeedPage, PAGE_SIZE};
 use crate::git::packetline::MAX_REQUEST_BYTES;
 use crate::git::read::{
     BlameHunk, CommitInfo, DiffFile, ReadCancellation, ReadError, ReadLimits,
@@ -94,6 +97,31 @@ impl PublicWeb {
             };
             let service = RepositoryReadService::open(&path, limits)?;
             operation(repository, service)
+        })
+        .await
+        .map_err(|_| RouteError::Internal)?
+    }
+
+    async fn event_page(
+        &self,
+        owner: String,
+        repository: String,
+        before: Option<i64>,
+    ) -> Result<(RepositoryRecord, Vec<crate::store::RepositoryEventRecord>), RouteError> {
+        validate_username(&owner).map_err(|_| RouteError::NotFound)?;
+        validate_slug(&repository).map_err(|_| RouteError::NotFound)?;
+        let permit = self
+            .jobs
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| RouteError::Unavailable)?;
+        let database = self.database.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            Store::open(&database)?
+                .public_repository_events(&owner, &repository, before, PAGE_SIZE + 1)
+                .map_err(Into::into)
         })
         .await
         .map_err(|_| RouteError::Internal)?
@@ -197,6 +225,8 @@ pub(super) fn routes() -> Router<WebState> {
             post(git_upload_pack).layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)),
         )
         .route("/{owner}/{repository}/refs", get(refs))
+        .route("/{owner}/{repository}/atom.xml", get(atom_feed))
+        .route("/{owner}/{repository}/rss.xml", get(rss_feed))
         .route("/{owner}/{repository}/commit/{commit}", get(commit))
         .route("/{owner}/{repository}/diff/{old}/{new}", get(diff))
         .route("/{owner}/{repository}/tree/{commit}", get(tree_root))
@@ -206,6 +236,84 @@ pub(super) fn routes() -> Router<WebState> {
         .route("/{owner}/{repository}/blame/{commit}/{*path}", get(blame))
         .route("/{owner}/{repository}/archive/{archive}", get(archive))
         .route("/{owner}/{repository}", get(summary))
+}
+
+async fn atom_feed(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(path): AxumPath<RepositoryPath>,
+    Query(query): Query<FeedQuery>,
+    headers: HeaderMap,
+) -> Response {
+    feed_response(state, request_id, path, query, headers, FeedFormat::Atom).await
+}
+
+async fn rss_feed(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(path): AxumPath<RepositoryPath>,
+    Query(query): Query<FeedQuery>,
+    headers: HeaderMap,
+) -> Response {
+    feed_response(state, request_id, path, query, headers, FeedFormat::Rss).await
+}
+
+async fn feed_response(
+    state: WebState,
+    request_id: RequestId,
+    path: RepositoryPath,
+    query: FeedQuery,
+    headers: HeaderMap,
+    format: FeedFormat,
+) -> Response {
+    if matches!(query.before, Some(before) if before <= 0) {
+        return route_error(RouteError::InvalidRequest, &request_id.0);
+    }
+    let Some(web) = state.public else {
+        return route_error(RouteError::NotFound, &request_id.0);
+    };
+    let owner = path.owner;
+    let repository = path.repository;
+    let (record, mut events) = match web
+        .event_page(owner.clone(), repository.clone(), query.before)
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => return route_error(error, &request_id.0),
+    };
+    let has_next = events.len() > PAGE_SIZE;
+    events.truncate(PAGE_SIZE);
+    let next_before = has_next
+        .then(|| events.last().map(|event| event.id))
+        .flatten();
+    let name = match format {
+        FeedFormat::Atom => "atom.xml",
+        FeedFormat::Rss => "rss.xml",
+    };
+    let feed_url = format!("{}/{owner}/{repository}/{name}", web.http_clone_base);
+    let self_url = query.before.map_or_else(
+        || feed_url.clone(),
+        |before| format!("{feed_url}?before={before}"),
+    );
+    let newest = events
+        .iter()
+        .map(|event| event.created_at)
+        .max()
+        .unwrap_or(record.created_at);
+    let body = match (FeedPage {
+        repository: &record,
+        base_url: &web.http_clone_base,
+        feed_url: &feed_url,
+        self_url: &self_url,
+        events: &events,
+        next_before,
+    })
+    .render(format)
+    {
+        Ok(body) => body,
+        Err(_) => return route_error(RouteError::Internal, &request_id.0),
+    };
+    conditional_feed(&headers, name, body, newest)
 }
 
 async fn summary(
@@ -583,6 +691,63 @@ fn render_page(result: Result<RepositoryPage, RouteError>, request_id: &str) -> 
     }
 }
 
+fn conditional_feed(headers: &HeaderMap, name: &str, body: String, timestamp: i64) -> Response {
+    let digest = Sha256::digest(body.as_bytes());
+    let etag = format!("\"{}\"", encode_hex(&digest));
+    let modified = u64::try_from(timestamp)
+        .ok()
+        .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
+        .unwrap_or(UNIX_EPOCH);
+    let not_modified = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| etag_matches(value, &etag))
+        || (!headers.contains_key(header::IF_NONE_MATCH)
+            && headers
+                .get(header::IF_MODIFIED_SINCE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| httpdate::parse_http_date(value).ok())
+                .is_some_and(|value| modified <= value));
+    let status = if not_modified {
+        StatusCode::NOT_MODIFIED
+    } else {
+        StatusCode::OK
+    };
+    let content_type = if name == "atom.xml" {
+        "application/atom+xml; charset=utf-8"
+    } else {
+        "application/rss+xml; charset=utf-8"
+    };
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "public, max-age=60")
+        .header(header::ETAG, etag)
+        .header(header::LAST_MODIFIED, httpdate::fmt_http_date(modified))
+        .body(if not_modified {
+            Body::empty()
+        } else {
+            Body::from(body)
+        })
+        .expect("the feed response is valid")
+}
+
+fn etag_matches(value: &str, etag: &str) -> bool {
+    value.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
+        output.push(char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
 fn route_error(error: RouteError, request_id: &str) -> Response {
     match error {
         RouteError::NotFound => render_error(
@@ -788,6 +953,12 @@ fn message_summary(message: &[u8]) -> String {
 struct RepositoryPath {
     owner: String,
     repository: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeedQuery {
+    before: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]

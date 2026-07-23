@@ -10,7 +10,9 @@ use crate::auth::{AuthError, validate_username};
 use crate::domain::repository::{RepositoryNameError, validate_slug};
 use crate::git::repository::{GitRepository, GitRepositoryError};
 use crate::instance::{InstanceError, InstanceLock, prepare_database, prepare_repository_root};
-use crate::store::{NewRepository, RepositoryRecord, Store, StoreError};
+use crate::store::{
+    NewRepository, NewRepositoryReference, RepositoryOrigin, RepositoryRecord, Store, StoreError,
+};
 
 pub(crate) fn create_repository(
     instance_dir: &Path,
@@ -19,10 +21,16 @@ pub(crate) fn create_repository(
     object_format: Kind,
 ) -> Result<RepositoryRecord, AdminError> {
     validate_names(owner, slug)?;
-    administer_repository(instance_dir, owner, slug, |path| {
-        GitRepository::create_bare(path, object_format)?;
-        Ok(object_format)
-    })
+    administer_repository(
+        instance_dir,
+        owner,
+        slug,
+        RepositoryOrigin::Created,
+        |path| {
+            GitRepository::create_bare(path, object_format)?;
+            Ok(object_format)
+        },
+    )
 }
 
 pub(crate) fn import_repository(
@@ -36,12 +44,18 @@ pub(crate) fn import_repository(
         path: source.to_owned(),
         source: source_error,
     })?;
-    administer_repository(instance_dir, owner, slug, |path| {
-        if source.starts_with(path.parent().expect("a managed repository has a parent")) {
-            return Err(AdminError::ManagedImport(source));
-        }
-        GitRepository::copy_bare(&source, path).map_err(Into::into)
-    })
+    administer_repository(
+        instance_dir,
+        owner,
+        slug,
+        RepositoryOrigin::Imported,
+        |path| {
+            if source.starts_with(path.parent().expect("a managed repository has a parent")) {
+                return Err(AdminError::ManagedImport(source));
+            }
+            GitRepository::copy_bare(&source, path).map_err(Into::into)
+        },
+    )
 }
 
 pub(crate) fn rename_repository(
@@ -97,6 +111,7 @@ fn administer_repository(
     instance_dir: &Path,
     owner: &str,
     slug: &str,
+    origin: RepositoryOrigin,
     prepare: impl FnOnce(&Path) -> Result<Kind, AdminError>,
 ) -> Result<RepositoryRecord, AdminError> {
     let _lock = InstanceLock::acquire(instance_dir)?;
@@ -133,12 +148,26 @@ fn administer_repository(
 
     let created_at = timestamp()?;
     let object_format = object_format_name(object_format)?;
+    let git = GitRepository::open(&canonical_path)?;
+    let initial_references = git
+        .references()?
+        .into_iter()
+        .filter(|reference| {
+            reference.name.starts_with(b"refs/heads/") || reference.name.starts_with(b"refs/tags/")
+        })
+        .map(|reference| NewRepositoryReference {
+            name: reference.name,
+            target: reference.target.to_string(),
+        })
+        .collect::<Vec<_>>();
     if let Err(error) = store.create_repository(&NewRepository {
         id: &id,
         owner,
         slug,
         object_format,
         created_at,
+        origin,
+        initial_references: &initial_references,
     }) {
         remove_created_repository(&canonical_path)?;
         return Err(error.into());

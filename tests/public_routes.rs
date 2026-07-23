@@ -6,6 +6,8 @@
 mod auth;
 #[path = "../src/domain/mod.rs"]
 mod domain;
+#[path = "../src/feed.rs"]
+mod feed;
 #[allow(
     dead_code,
     reason = "the public-route test does not use each shared Git API"
@@ -41,7 +43,7 @@ use std::path::Path;
 use std::process::Command;
 
 use http::{PublicWebConfig, RunningWebServer};
-use store::{InitialAdministrator, NewRepository, Store};
+use store::{InitialAdministrator, NewRepository, RepositoryOrigin, Store};
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -77,6 +79,106 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         assert!(!summary_text.contains("<img"));
         assert!(!summary_text.contains("tracker.example"));
         assert!(summary_text.contains("&#60;script&#62;alert(3)&#60;/script&#62;"));
+        assert!(summary_text.contains("/alice/example/atom.xml"));
+        assert!(summary_text.contains("/alice/example/rss.xml"));
+
+        let mut feed_entry_ids = Vec::new();
+        for (path, content_type) in [
+            (
+                "/alice/example/atom.xml",
+                "application/atom+xml; charset=utf-8",
+            ),
+            (
+                "/alice/example/rss.xml",
+                "application/rss+xml; charset=utf-8",
+            ),
+        ] {
+            let feed = request(server.address(), "GET", path, &[], &[]);
+            assert_eq!(feed.status, 200);
+            assert_eq!(feed.header("content-type"), content_type);
+            assert_eq!(feed.header("cache-control"), "public, max-age=60");
+            assert!(!feed.header("etag").is_empty());
+            assert!(!feed.header("last-modified").is_empty());
+            let parsed = feed_rs::parser::parse(feed.body.as_slice()).expect("parse the feed");
+            assert_eq!(parsed.entries.len(), 1);
+            assert!(parsed.entries[0].id.starts_with("urn:tit:event:"));
+            feed_entry_ids.push(parsed.entries[0].id.clone());
+            assert!(feed.text().contains("Repository imported"));
+
+            let etag = feed.header("etag");
+            let conditional = request(
+                server.address(),
+                "GET",
+                path,
+                &[("If-None-Match", etag)],
+                &[],
+            );
+            assert_eq!(conditional.status, 304);
+            assert!(conditional.body.is_empty());
+
+            let modified = request(
+                server.address(),
+                "GET",
+                path,
+                &[("If-Modified-Since", feed.header("last-modified"))],
+                &[],
+            );
+            assert_eq!(modified.status, 304);
+            assert!(modified.body.is_empty());
+
+            let head = request(server.address(), "HEAD", path, &[], &[]);
+            assert_eq!(head.status, 200);
+            assert!(head.body.is_empty());
+            assert_eq!(head.header("etag"), feed.header("etag"));
+        }
+        assert_eq!(feed_entry_ids[0], feed_entry_ids[1]);
+
+        let invalid_page = request(
+            server.address(),
+            "GET",
+            "/alice/example/atom.xml?before=0",
+            &[],
+            &[],
+        );
+        assert_eq!(invalid_page.status, 400);
+
+        let database = fixture.instance.path().join("tit.sqlite3");
+        let feed_store = Store::open(&database).expect("open the feed database");
+        for timestamp in 10..35 {
+            let actor = if timestamp == 34 {
+                "x</title><script>alert(5)</script>"
+            } else {
+                "alice"
+            };
+            feed_store
+                .connection()
+                .execute(
+                    "INSERT INTO repository_event
+                     (repository_id, kind, actor, created_at)
+                     VALUES (?1, 'push', ?2, ?3)",
+                    rusqlite::params![fixture.repository_id, actor, timestamp],
+                )
+                .expect("insert a page fixture event");
+        }
+        drop(feed_store);
+        let first_page = request(server.address(), "GET", "/alice/example/atom.xml", &[], &[]);
+        let first_feed =
+            feed_rs::parser::parse(first_page.body.as_slice()).expect("parse the first page");
+        assert_eq!(first_feed.entries.len(), 20);
+        assert!(!first_page.text().contains("<script>"));
+        assert!(first_page.text().contains("x&lt;/title&gt;&lt;script&gt;"));
+        let next = first_page
+            .text()
+            .split("rel=\"next\" href=\"")
+            .nth(1)
+            .and_then(|value| value.split('\"').next())
+            .expect("find the next-page URL")
+            .replace("https://tit.example", "");
+        let second_page = request(server.address(), "GET", &next, &[], &[]);
+        let second_feed =
+            feed_rs::parser::parse(second_page.body.as_slice()).expect("parse the second page");
+        assert_eq!(second_feed.entries.len(), 6);
+        assert!(!second_page.text().contains("rel=\"next\""));
 
         let empty = request(server.address(), "GET", "/alice/empty", &[], &[]);
         assert_eq!(empty.status, 200);
@@ -359,6 +461,8 @@ fn assert_hidden(address: SocketAddr, head: &str) {
     for route in [
         "/alice/example".to_owned(),
         format!("/alice/example/raw/{head}/README.md"),
+        "/alice/example/atom.xml".to_owned(),
+        "/alice/example/rss.xml".to_owned(),
         "/alice/example/info/refs?service=git-upload-pack".to_owned(),
     ] {
         let response = request(address, "GET", &route, &[], &[]);
@@ -368,6 +472,7 @@ fn assert_hidden(address: SocketAddr, head: &str) {
 
 struct Fixture {
     instance: TempDir,
+    repository_id: String,
     head: String,
     parent: String,
 }
@@ -389,6 +494,11 @@ impl Fixture {
         run(Command::new("git")
             .args(["init", "-q", "-b", "main", "--object-format", format])
             .arg(&worktree));
+        run(Command::new("git").arg("-C").arg(&worktree).args([
+            "config",
+            "commit.gpgsign",
+            "false",
+        ]));
         fs::write(
             worktree.join("README.md"),
             b"# tit fixture\n\n**safe** and `<safe>`\n\n[guide](docs/guide.md) [bad](javascript:alert(1))\n\n![tracker](https://tracker.example/pixel)\n\n<script>alert(2)</script>\n",
@@ -450,6 +560,8 @@ impl Fixture {
                 slug: "example",
                 object_format: format,
                 created_at: 2,
+                origin: RepositoryOrigin::Imported,
+                initial_references: &[],
             })
             .expect("create the repository record");
         store
@@ -459,12 +571,15 @@ impl Fixture {
                 slug: "empty",
                 object_format: format,
                 created_at: 2,
+                origin: RepositoryOrigin::Created,
+                initial_references: &[],
             })
             .expect("create the empty repository record");
         drop(store);
 
         Self {
             instance,
+            repository_id: id.to_owned(),
             head,
             parent,
         }

@@ -6,6 +6,8 @@
     <nav aria-label="Repository">
       <a href="/{{ owner }}/{{ repository }}">Summary</a>
       <a href="/{{ owner }}/{{ repository }}/refs">Refs</a>
+      <a href="/{{ owner }}/{{ repository }}/atom.xml">Atom</a>
+      <a href="/{{ owner }}/{{ repository }}/rss.xml">RSS</a>
 {% if has_head %}
       <a href="/{{ owner }}/{{ repository }}/tree/{{ commit_id }}">Tree</a>
       <a href="/{{ owner }}/{{ repository }}/commit/{{ commit_id }}">Commit</a>

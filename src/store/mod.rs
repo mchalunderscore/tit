@@ -4,12 +4,12 @@ use std::time::Duration;
 
 use rusqlite::OpenFlags;
 use rusqlite::backup::Backup;
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use thiserror::Error;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -19,12 +19,13 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 5] = [
+const MIGRATIONS: [&str; 6] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
     include_str!("migrations/004_identity.sql"),
     include_str!("migrations/005_repository.sql"),
+    include_str!("migrations/006_repository_events.sql"),
 ];
 
 #[derive(Debug, Error)]
@@ -65,6 +66,14 @@ pub(crate) enum StoreError {
     RepositoryIdentifierCollision,
     #[error("repository is already archived: {0}/{1}")]
     RepositoryArchived(String, String),
+    #[allow(
+        dead_code,
+        reason = "some integration tests import storage without public event pages"
+    )]
+    #[error("repository event page limit is too large")]
+    EventLimit,
+    #[error("stored Git reference event is malformed")]
+    EventPayload,
 }
 
 pub(crate) struct Store {
@@ -241,11 +250,28 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let payload: Vec<u8> = transaction.query_row(
-            "SELECT event_payload FROM git_operation_intent
+        let (payload, repository_path, actor, initial_refs, proposed_refs, created_at): (
+            Vec<u8>,
+            String,
+            String,
+            Vec<u8>,
+            Vec<u8>,
+            i64,
+        ) = transaction.query_row(
+            "SELECT event_payload, repository_path, actor, initial_refs, proposed_refs, created_at
+             FROM git_operation_intent
              WHERE id = ?1 AND state = 'promoted'",
             [id],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )?;
         let changed = transaction.execute(
             "UPDATE git_operation_intent SET state = 'completed'
@@ -256,6 +282,15 @@ impl Store {
         transaction.execute(
             "INSERT INTO git_operation_event (intent_id, payload) VALUES (?1, ?2)",
             rusqlite::params![id, payload],
+        )?;
+        insert_push_events(
+            &transaction,
+            id,
+            &repository_path,
+            &actor,
+            &initial_refs,
+            &proposed_refs,
+            created_at,
         )?;
         transaction.commit()?;
         Ok(())
@@ -359,7 +394,42 @@ impl Store {
             ],
         );
         match result {
-            Ok(1) => transaction.commit()?,
+            Ok(1) => {
+                transaction.execute(
+                    "INSERT INTO repository_event
+                     (repository_id, kind, actor, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        repository.id,
+                        repository.origin.event_kind(),
+                        repository.owner,
+                        repository.created_at,
+                    ],
+                )?;
+                for reference in repository.initial_references {
+                    let kind = if reference.name.starts_with(b"refs/tags/") {
+                        "tag-created"
+                    } else if reference.name.starts_with(b"refs/heads/") {
+                        "ref-created"
+                    } else {
+                        return Err(StoreError::EventPayload);
+                    };
+                    transaction.execute(
+                        "INSERT INTO repository_event
+                         (repository_id, kind, actor, ref_name, new_target, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            repository.id,
+                            kind,
+                            repository.owner,
+                            reference.name,
+                            reference.target,
+                            repository.created_at,
+                        ],
+                    )?;
+                }
+                transaction.commit()?;
+            }
             Ok(_) => unreachable!("an INSERT changes one row"),
             Err(error) if is_unique_constraint(&error) => {
                 let duplicate_id: bool = transaction.query_row(
@@ -494,6 +564,42 @@ impl Store {
             Err(error) => Err(error.into()),
         }
     }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests import storage without public event pages"
+    )]
+    pub(crate) fn public_repository_events(
+        &self,
+        owner: &str,
+        slug: &str,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<(RepositoryRecord, Vec<RepositoryEventRecord>), StoreError> {
+        let repository = self.public_repository(owner, slug)?;
+        let limit = i64::try_from(limit).map_err(|_| StoreError::EventLimit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, kind, actor, ref_name, old_target, new_target, created_at
+             FROM repository_event
+             WHERE repository_id = ?1 AND (?2 IS NULL OR id < ?2)
+             ORDER BY id DESC
+             LIMIT ?3",
+        )?;
+        let events = statement
+            .query_map(rusqlite::params![repository.id, before, limit], |row| {
+                Ok(RepositoryEventRecord {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    actor: row.get(2)?,
+                    ref_name: row.get(3)?,
+                    old_target: row.get(4)?,
+                    new_target: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((repository, events))
+    }
 }
 
 pub(crate) struct InitialAdministrator<'a> {
@@ -510,6 +616,32 @@ pub(crate) struct NewRepository<'a> {
     pub(crate) slug: &'a str,
     pub(crate) object_format: &'a str,
     pub(crate) created_at: i64,
+    pub(crate) origin: RepositoryOrigin,
+    pub(crate) initial_references: &'a [NewRepositoryReference],
+}
+
+#[derive(Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "some integration tests create repositories without the import operation"
+)]
+pub(crate) enum RepositoryOrigin {
+    Created,
+    Imported,
+}
+
+impl RepositoryOrigin {
+    fn event_kind(self) -> &'static str {
+        match self {
+            Self::Created => "repository-created",
+            Self::Imported => "repository-imported",
+        }
+    }
+}
+
+pub(crate) struct NewRepositoryReference {
+    pub(crate) name: Vec<u8>,
+    pub(crate) target: String,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -522,6 +654,20 @@ pub(crate) struct RepositoryRecord {
     pub(crate) object_format: String,
     pub(crate) created_at: i64,
     pub(crate) archived_at: Option<i64>,
+}
+
+#[allow(
+    dead_code,
+    reason = "some integration tests import storage without public event pages"
+)]
+pub(crate) struct RepositoryEventRecord {
+    pub(crate) id: i64,
+    pub(crate) kind: String,
+    pub(crate) actor: String,
+    pub(crate) ref_name: Option<Vec<u8>>,
+    pub(crate) old_target: Option<String>,
+    pub(crate) new_target: Option<String>,
+    pub(crate) created_at: i64,
 }
 
 pub(crate) struct GitOperationIntent<'a> {
@@ -543,6 +689,116 @@ pub(crate) struct GitIntentRecord {
     pub(crate) quarantine_path: String,
     pub(crate) state: String,
     pub(crate) pack_name: Option<String>,
+}
+
+fn insert_push_events(
+    transaction: &rusqlite::Transaction<'_>,
+    intent_id: &str,
+    repository_path: &str,
+    actor: &str,
+    initial_bytes: &[u8],
+    proposed_bytes: &[u8],
+    created_at: i64,
+) -> Result<(), StoreError> {
+    let Some(repository_id) = managed_repository_id(repository_path) else {
+        return Ok(());
+    };
+    let exists = transaction
+        .query_row(
+            "SELECT id FROM repository WHERE id = ?1",
+            [repository_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        return Ok(());
+    }
+
+    let initial = parse_event_refs(initial_bytes)?;
+    let proposed = parse_event_refs(proposed_bytes)?;
+    if initial.len() != proposed.len() {
+        return Err(StoreError::EventPayload);
+    }
+    transaction.execute(
+        "INSERT INTO repository_event
+         (repository_id, source_intent_id, source_ordinal, kind, actor, created_at)
+         VALUES (?1, ?2, 0, 'push', ?3, ?4)",
+        rusqlite::params![repository_id, intent_id, actor, created_at],
+    )?;
+    for (index, ((old, old_name), (new, new_name))) in initial.into_iter().zip(proposed).enumerate()
+    {
+        if old_name != new_name || (is_null_id(&old) && is_null_id(&new)) {
+            return Err(StoreError::EventPayload);
+        }
+        let prefix = if old_name.starts_with(b"refs/tags/") {
+            "tag"
+        } else if old_name.starts_with(b"refs/heads/") {
+            "ref"
+        } else {
+            return Err(StoreError::EventPayload);
+        };
+        let action = if is_null_id(&old) {
+            "created"
+        } else if is_null_id(&new) {
+            "deleted"
+        } else {
+            "updated"
+        };
+        let kind = format!("{prefix}-{action}");
+        let old_target = (!is_null_id(&old)).then_some(old);
+        let new_target = (!is_null_id(&new)).then_some(new);
+        let ordinal = i64::try_from(index + 1).map_err(|_| StoreError::EventPayload)?;
+        transaction.execute(
+            "INSERT INTO repository_event
+             (repository_id, source_intent_id, source_ordinal, kind, actor,
+              ref_name, old_target, new_target, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                repository_id,
+                intent_id,
+                ordinal,
+                kind,
+                actor,
+                old_name,
+                old_target,
+                new_target,
+                created_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn managed_repository_id(repository_path: &str) -> Option<&str> {
+    let name = Path::new(repository_path).file_name()?.to_str()?;
+    let id = name.strip_suffix(".git")?;
+    (id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(id)
+}
+
+fn parse_event_refs(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+    let mut references = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Some(space) = line.iter().position(|byte| *byte == b' ') else {
+            return Err(StoreError::EventPayload);
+        };
+        let id = std::str::from_utf8(&line[..space]).map_err(|_| StoreError::EventPayload)?;
+        if !matches!(id.len(), 40 | 64) || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(StoreError::EventPayload);
+        }
+        let name = line[space + 1..].to_vec();
+        if name.is_empty() {
+            return Err(StoreError::EventPayload);
+        }
+        references.push((id.to_owned(), name));
+    }
+    Ok(references)
+}
+
+fn is_null_id(id: &str) -> bool {
+    id.bytes().all(|byte| byte == b'0')
 }
 
 fn require_one_intent(id: &str, changed: usize) -> Result<(), StoreError> {

@@ -17,6 +17,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "origin
 clap = { version = "4.6", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 gix = { version = "0.84", default-features = false, features = ["blame", "parallel", "sha1", "sha256"] }
 gix-pack = { version = "0.71", default-features = false, features = ["generate", "sha1", "sha256", "streaming-input"] }
+httpdate = "1.0.3"
+jiff = { version = "0.2.34", default-features = false, features = ["std"] }
 pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
 rand = "0.10"
 rusqlite = { version = "0.40", default-features = false, features = ["backup", "bundled"] }
@@ -31,6 +33,7 @@ toml = { version = "1.1", default-features = false, features = ["parse", "serde"
 url = { version = "2.5", features = ["serde"] }
 
 [dev-dependencies]
+feed-rs = { version = "2.4.0", default-features = false }
 tempfile = "3.27"
 
 [lints.rust]

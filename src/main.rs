@@ -8,6 +8,7 @@ mod bootstrap;
 mod cli;
 mod config;
 mod domain;
+mod feed;
 #[allow(dead_code, reason = "M1C proves Git reads before the CLI serves them")]
 mod git;
 #[allow(
