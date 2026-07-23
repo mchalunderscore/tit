@@ -11,7 +11,7 @@ mod event;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -21,7 +21,7 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 12] = [
+const MIGRATIONS: [&str; 13] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
@@ -34,6 +34,7 @@ const MIGRATIONS: [&str; 12] = [
     include_str!("migrations/010_audit_history.sql"),
     include_str!("migrations/011_domain_events.sql"),
     include_str!("migrations/012_issues.sql"),
+    include_str!("migrations/013_watches.sql"),
 ];
 
 #[allow(
@@ -130,6 +131,8 @@ pub(crate) enum StoreError {
     IssueAssigneeState,
     #[error("issue assignee does not exist or cannot read the repository: {0}")]
     IssueAssigneeNotFound(String),
+    #[error("repository watch access is not authorized")]
+    WatchDenied,
 }
 
 pub(crate) struct Store {
@@ -1839,6 +1842,102 @@ impl Store {
         })
     }
 
+    pub(crate) fn watch(
+        &self,
+        owner: &str,
+        repository: &str,
+        actor: Option<&str>,
+    ) -> Result<(RepositoryRecord, Option<WatchRecord>), StoreError> {
+        let access = repository_issue_access(&self.connection, owner, repository, actor)?;
+        if !access.can_read() {
+            return Err(StoreError::WatchDenied);
+        }
+        let watch = match access.active_actor_id {
+            Some(actor_id) => self
+                .connection
+                .query_row(
+                    "SELECT id, pushes, issues, pull_requests, created_at, updated_at
+                 FROM watch WHERE repository_id = ?1 AND account_id = ?2",
+                    rusqlite::params![access.repository.id, actor_id],
+                    |row| {
+                        Ok(WatchRecord {
+                            id: row.get(0)?,
+                            pushes: row.get(1)?,
+                            issues: row.get(2)?,
+                            pull_requests: row.get(3)?,
+                            created_at: row.get(4)?,
+                            updated_at: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()?,
+            None => None,
+        };
+        Ok((access.repository, watch))
+    }
+
+    pub(crate) fn set_watch(
+        &mut self,
+        owner: &str,
+        repository: &str,
+        actor: &str,
+        preferences: WatchPreferences,
+        changed_at: i64,
+    ) -> Result<Option<WatchRecord>, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let access = repository_issue_access(&transaction, owner, repository, Some(actor))?;
+        let actor_id = access.active_actor_id.ok_or(StoreError::WatchDenied)?;
+        if !access.can_read() {
+            return Err(StoreError::WatchDenied);
+        }
+        if !preferences.any() {
+            transaction.execute(
+                "DELETE FROM watch WHERE repository_id = ?1 AND account_id = ?2",
+                rusqlite::params![access.repository.id, actor_id],
+            )?;
+            transaction.commit()?;
+            return Ok(None);
+        }
+        transaction.execute(
+            "INSERT INTO watch
+             (id, repository_id, account_id, pushes, issues, pull_requests,
+              created_at, updated_at)
+             VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?6)
+             ON CONFLICT (repository_id, account_id) DO UPDATE SET
+                 pushes = excluded.pushes,
+                 issues = excluded.issues,
+                 pull_requests = excluded.pull_requests,
+                 updated_at = excluded.updated_at",
+            rusqlite::params![
+                access.repository.id,
+                actor_id,
+                preferences.pushes,
+                preferences.issues,
+                preferences.pull_requests,
+                changed_at,
+            ],
+        )?;
+        let record = transaction.query_row(
+            "SELECT id, pushes, issues, pull_requests, created_at, updated_at
+             FROM watch WHERE repository_id = ?1 AND account_id = ?2",
+            rusqlite::params![access.repository.id, actor_id],
+            |row| {
+                Ok(WatchRecord {
+                    id: row.get(0)?,
+                    pushes: row.get(1)?,
+                    issues: row.get(2)?,
+                    pull_requests: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            },
+        )?;
+        transaction.commit()?;
+        Ok(Some(record))
+    }
+
     #[allow(
         dead_code,
         reason = "some integration tests compile storage without authorization"
@@ -2248,6 +2347,29 @@ pub(crate) struct IssueChange<'a> {
     pub(crate) number: i64,
     pub(crate) actor: &'a str,
     pub(crate) changed_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WatchPreferences {
+    pub(crate) pushes: bool,
+    pub(crate) issues: bool,
+    pub(crate) pull_requests: bool,
+}
+
+impl WatchPreferences {
+    pub(crate) fn any(self) -> bool {
+        self.pushes || self.issues || self.pull_requests
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WatchRecord {
+    pub(crate) id: String,
+    pub(crate) pushes: bool,
+    pub(crate) issues: bool,
+    pub(crate) pull_requests: bool,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
 }
 
 pub(crate) struct GitOperationIntent<'a> {

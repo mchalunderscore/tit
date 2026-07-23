@@ -11,7 +11,7 @@ use std::{env, ffi::OsString, fs};
 use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
 use store::{
     GitOperationIntent, InitialAdministrator, IssueChange, NewAuditEvent, NewIssue, NewRepository,
-    NewRepositoryReference, RepositoryOrigin, Store, StoreError,
+    NewRepositoryReference, RepositoryOrigin, Store, StoreError, WatchPreferences,
 };
 use tempfile::TempDir;
 
@@ -47,6 +47,15 @@ const V11_FIXTURE: &str = concat!(
     include_str!("../src/store/migrations/010_audit_history.sql"),
     include_str!("../src/store/migrations/011_domain_events.sql"),
     "PRAGMA user_version = 11;\n",
+);
+const V12_FIXTURE: &str = concat!(
+    include_str!("fixtures/sqlite/v7.sql"),
+    include_str!("../src/store/migrations/008_web_sessions.sql"),
+    include_str!("../src/store/migrations/009_repository_authorization.sql"),
+    include_str!("../src/store/migrations/010_audit_history.sql"),
+    include_str!("../src/store/migrations/011_domain_events.sql"),
+    include_str!("../src/store/migrations/012_issues.sql"),
+    "PRAGMA user_version = 12;\n",
 );
 
 fn database(directory: &TempDir, name: &str) -> std::path::PathBuf {
@@ -165,7 +174,7 @@ fn configures_connections_and_creates_the_current_schema() {
     let directory = TempDir::new().expect("create a temporary directory");
     let store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
 
-    assert_eq!(store.schema_version().expect("read the schema version"), 12);
+    assert_eq!(store.schema_version().expect("read the schema version"), 13);
     assert_eq!(
         store
             .connection()
@@ -872,6 +881,96 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
         assert!(!event.actor.is_empty());
     }
 
+    let events_before_watch: i64 = store
+        .connection()
+        .query_row("SELECT count(*) FROM repository_event", [], |row| {
+            row.get(0)
+        })
+        .expect("count events before watch changes");
+    let everything = WatchPreferences {
+        pushes: true,
+        issues: true,
+        pull_requests: true,
+    };
+    let watch = store
+        .set_watch("alice", "project", "bob", everything, 16)
+        .expect("watch all repository activity")
+        .expect("read the created watch");
+    assert_eq!(watch.id.len(), 32);
+    assert!(watch.pushes && watch.issues && watch.pull_requests);
+    assert_eq!(watch.created_at, 16);
+    assert_eq!(watch.updated_at, 16);
+    let granular = WatchPreferences {
+        pushes: false,
+        issues: true,
+        pull_requests: false,
+    };
+    let updated = store
+        .set_watch("alice", "project", "bob", granular, 17)
+        .expect("set granular watch preferences")
+        .expect("read the updated watch");
+    assert_eq!(updated.id, watch.id);
+    assert_eq!(updated.created_at, 16);
+    assert_eq!(updated.updated_at, 17);
+    assert!(!updated.pushes && updated.issues && !updated.pull_requests);
+    let (watched_repository, stored_watch) = store
+        .watch("alice", "project", Some("bob"))
+        .expect("read watch preferences");
+    assert_eq!(watched_repository.slug, "project");
+    assert_eq!(stored_watch.expect("find the watch"), updated);
+    assert!(matches!(
+        store.watch("alice", "project", Some("stranger")),
+        Err(StoreError::WatchDenied)
+    ));
+    assert!(matches!(
+        store.set_watch("alice", "project", "suspended", everything, 18),
+        Err(StoreError::WatchDenied)
+    ));
+    assert_eq!(
+        store
+            .connection()
+            .query_row("SELECT count(*) FROM repository_event", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count events after watch changes"),
+        events_before_watch
+    );
+    assert_eq!(
+        store
+            .set_watch(
+                "alice",
+                "project",
+                "bob",
+                WatchPreferences {
+                    pushes: false,
+                    issues: false,
+                    pull_requests: false,
+                },
+                19,
+            )
+            .expect("stop watching the repository"),
+        None
+    );
+    assert_eq!(
+        store
+            .watch("alice", "project", Some("bob"))
+            .expect("read the cleared watch")
+            .1,
+        None
+    );
+    assert!(
+        store
+            .connection()
+            .execute(
+                "INSERT INTO watch
+             (id, repository_id, account_id, pushes, issues, pull_requests,
+              created_at, updated_at)
+             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     '00112233445566778899aabbccddeeff', 2, 0, 0, 0, 20, 20)",
+                [],
+            )
+            .is_err()
+    );
+
     let comments_before: i64 = store
         .connection()
         .query_row("SELECT count(*) FROM issue_comment", [], |row| row.get(0))
@@ -887,7 +986,7 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
         )
         .expect("inject an issue event failure");
     assert!(matches!(
-        store.comment_issue("alice", "project", 1, "bob", "must roll back", 16),
+        store.comment_issue("alice", "project", 1, "bob", "must roll back", 21),
         Err(StoreError::Sqlite(_))
     ));
     assert_eq!(
@@ -1239,13 +1338,14 @@ fn migrates_each_committed_historical_fixture() {
         (V9_FIXTURE, 9),
         (V10_FIXTURE, 10),
         (V11_FIXTURE, 11),
+        (V12_FIXTURE, 12),
     ] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "tit.sqlite3");
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
-        assert_eq!(store.schema_version().expect("read the schema version"), 12);
+        assert_eq!(store.schema_version().expect("read the schema version"), 13);
         store.integrity_check().expect("check migrated integrity");
         let state: String = store
             .connection()
@@ -1318,7 +1418,7 @@ fn backfills_repository_events_when_version_five_is_migrated() {
 
 #[test]
 fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
-    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 12)] {
+    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 13)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "fixture.sqlite");
         create_fixture(&path, V1_FIXTURE);

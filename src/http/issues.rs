@@ -12,8 +12,8 @@ use crate::markdown::{self, RenderedMarkdown};
 use crate::store::{IssueDetail, StoreError};
 
 use super::{
-    CSRF_COOKIE, RequestActor, RequestId, SESSION_COOKIE, WebState, cookie, login_job,
-    login_redirect, parse_named_form, render, render_error,
+    CSRF_COOKIE, RequestActor, RequestId, WebState, authenticate_mutation, cookie,
+    parse_named_form, render, render_error,
 };
 
 const MAX_ISSUE_REQUEST_BYTES: usize = 300 * 1024;
@@ -327,34 +327,6 @@ async fn mutate(
         Ok(()) => issue_redirect(&redirect_owner, &redirect_repository, redirect_number),
         Err(error) => issue_mutation_error(error, &request_id.0),
     }
-}
-
-async fn authenticate_mutation(
-    state: WebState,
-    headers: &HeaderMap,
-    submitted_csrf: &str,
-    request_id: &str,
-) -> Result<String, Response> {
-    let Some(session_token) = cookie(headers, SESSION_COOKIE) else {
-        return Err(login_redirect(false));
-    };
-    let Some(csrf) = cookie(headers, CSRF_COOKIE) else {
-        return Err(login_redirect(true));
-    };
-    if submitted_csrf != csrf {
-        return Err(render_error(
-            StatusCode::FORBIDDEN,
-            request_id,
-            "Forbidden",
-            "The request is not authorized.",
-        ));
-    }
-    login_job(state, move |login| {
-        login.authenticate(&session_token, Some(&csrf))
-    })
-    .await
-    .map(|session| session.username)
-    .map_err(|_| login_redirect(true))
 }
 
 async fn issue_job<T: Send + 'static>(

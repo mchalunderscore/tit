@@ -55,6 +55,9 @@ mod session;
 )]
 #[path = "../src/store/mod.rs"]
 mod store;
+#[allow(dead_code, reason = "the public-route test does not change watches")]
+#[path = "../src/watch.rs"]
+mod watch;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -722,6 +725,80 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     let feed = request(server.address(), "GET", "/alice/example/atom.xml", &[], &[]);
     assert_eq!(feed.status, 200);
     assert!(feed.text().contains("alice reopened #1"));
+
+    let anonymous_watch = request(server.address(), "GET", "/alice/example/watch", &[], &[]);
+    assert_eq!(anonymous_watch.status, 200);
+    assert!(
+        anonymous_watch
+            .text()
+            .contains("Log in</a> to change watch preferences.")
+    );
+    let watch_page = request(
+        server.address(),
+        "GET",
+        "/alice/example/watch",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    );
+    assert_eq!(watch_page.status, 200);
+    assert!(
+        watch_page
+            .text()
+            .contains("You do not watch this repository.")
+    );
+    let everything = form(&[
+        ("csrf", csrf.as_str()),
+        ("pushes", "1"),
+        ("issues", "1"),
+        ("pull-requests", "1"),
+    ]);
+    let watched = request(
+        server.address(),
+        "POST",
+        "/alice/example/watch",
+        &headers,
+        everything.as_bytes(),
+    );
+    assert_eq!(watched.status, 303);
+    assert_eq!(watched.header("location"), "/alice/example/watch");
+    let selected = request(
+        server.address(),
+        "GET",
+        "/alice/example/watch",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    );
+    assert!(
+        selected
+            .text()
+            .contains("You watch selected activity in this repository.")
+    );
+    assert_eq!(selected.text().matches("value=\"1\" selected").count(), 3);
+    let none = form(&[
+        ("csrf", csrf.as_str()),
+        ("pushes", "0"),
+        ("issues", "0"),
+        ("pull-requests", "0"),
+    ]);
+    assert_eq!(
+        request(
+            server.address(),
+            "POST",
+            "/alice/example/watch",
+            &headers,
+            none.as_bytes(),
+        )
+        .status,
+        303
+    );
+    assert_eq!(
+        Store::open(&database)
+            .expect("reopen the watch database")
+            .connection()
+            .query_row("SELECT count(*) FROM watch", [], |row| row.get::<_, i64>(0))
+            .expect("count cleared watches"),
+        0
+    );
 
     server.shutdown().await.expect("stop the issue Web server");
 }

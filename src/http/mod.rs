@@ -1,5 +1,6 @@
 mod issues;
 mod public;
+mod watches;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -25,6 +26,7 @@ use crate::issue::IssueService;
 use crate::repository::{RepositoryService, RepositoryServiceError};
 use crate::session::{SessionError, WebLoginService};
 use crate::store::StoreError;
+use crate::watch::WatchService;
 
 use self::public::PublicWeb;
 
@@ -45,6 +47,7 @@ struct WebState {
     login: Option<WebLoginService>,
     repositories: Option<RepositoryService>,
     issues: Option<IssueService>,
+    watches: Option<WatchService>,
     secure_cookies: bool,
 }
 
@@ -78,6 +81,7 @@ impl RunningWebServer {
                 login: None,
                 repositories: None,
                 issues: None,
+                watches: None,
                 secure_cookies: false,
             },
         )
@@ -114,6 +118,7 @@ impl RunningWebServer {
         let public = PublicWeb::open(config, Arc::clone(&jobs))?;
         let repositories = RepositoryService::new(public.database(), public.repository_root());
         let issues = IssueService::new(public.database());
+        let watches = WatchService::new(public.database());
         Self::start_with_state(
             address,
             WebState {
@@ -124,6 +129,7 @@ impl RunningWebServer {
                 login: Some(login),
                 repositories: Some(repositories),
                 issues: Some(issues),
+                watches: Some(watches),
                 secure_cookies,
             },
         )
@@ -168,18 +174,19 @@ pub(crate) fn router() -> Router {
         login: None,
         repositories: None,
         issues: None,
+        watches: None,
         secure_cookies: false,
     })
 }
 
 fn router_with_state(state: WebState) -> Router {
-    let repository_routes =
-        issues::routes()
-            .merge(public::routes())
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                repository_actor,
-            ));
+    let repository_routes = watches::routes()
+        .merge(issues::routes())
+        .merge(public::routes())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            repository_actor,
+        ));
     Router::new()
         .route("/", get(home))
         .route("/go", get(go_to_repository))
@@ -800,6 +807,34 @@ async fn repository_job<T: Send + 'static>(
     .map_err(|_| {
         RepositoryServiceError::Store(StoreError::Integrity("repository worker failed".to_owned()))
     })?
+}
+
+async fn authenticate_mutation(
+    state: WebState,
+    headers: &HeaderMap,
+    submitted_csrf: &str,
+    request_id: &str,
+) -> Result<String, Response> {
+    let Some(session_token) = cookie(headers, SESSION_COOKIE) else {
+        return Err(login_redirect(false));
+    };
+    let Some(csrf) = cookie(headers, CSRF_COOKIE) else {
+        return Err(login_redirect(true));
+    };
+    if submitted_csrf != csrf {
+        return Err(render_error(
+            StatusCode::FORBIDDEN,
+            request_id,
+            "Forbidden",
+            "The request is not authorized.",
+        ));
+    }
+    login_job(state, move |login| {
+        login.authenticate(&session_token, Some(&csrf))
+    })
+    .await
+    .map(|session| session.username)
+    .map_err(|_| login_redirect(true))
 }
 
 fn parse_named_form(

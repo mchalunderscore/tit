@@ -47,6 +47,9 @@ mod session;
 #[allow(dead_code, reason = "the shell test does not use repository storage")]
 #[path = "../src/store/mod.rs"]
 mod store;
+#[allow(dead_code, reason = "the Web shell test does not change watches")]
+#[path = "../src/watch.rs"]
+mod watch;
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};

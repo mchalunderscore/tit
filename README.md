@@ -320,3 +320,17 @@ comments, state, labels, assignees, the event timeline, transaction rollback,
 sessions, CSRF checks, and forms that operate without JavaScript. Read the
 [issue workflow architectural decision record](docs/adr/0017-issue-workflow.md)
 for the permission and event contracts.
+
+## Milestone 4.3 gate
+
+Run the repository watch gate:
+
+```text
+./scripts/check-m4-3
+```
+
+This command tests granular push, issue, and pull-request preferences, the
+“everything” selection, stable watch IDs, permission checks, removal, private
+preference handling, CSRF checks, and forms that operate without JavaScript.
+Read the [repository watches architectural decision record](docs/adr/0018-repository-watches.md)
+for the storage and privacy contracts.
