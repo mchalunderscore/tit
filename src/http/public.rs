@@ -26,6 +26,7 @@ use crate::git::read::{
     RepositoryReadService, TreeEntryInfo,
 };
 use crate::git::upload_pack::{ProtocolVersion, UploadPack};
+use crate::markdown::{self, RenderedMarkdown};
 use crate::store::{DATABASE_FILE, RepositoryRecord, Store, StoreError};
 
 use super::{PublicWebConfig, RequestId, WebState, render_error};
@@ -830,7 +831,7 @@ struct RepositoryPage {
     has_head: bool,
     has_readme: bool,
     readme_path: String,
-    readme_content: String,
+    readme_html: RenderedMarkdown,
     readme_binary: bool,
     history: Vec<CommitView>,
     entries: Vec<TreeView>,
@@ -861,7 +862,7 @@ impl RepositoryPage {
             has_head: false,
             has_readme: false,
             readme_path: String::new(),
-            readme_content: String::new(),
+            readme_html: RenderedMarkdown::default(),
             readme_binary: false,
             history: Vec::new(),
             entries: Vec::new(),
@@ -898,7 +899,7 @@ impl RepositoryPage {
             if let Ok(content) = std::str::from_utf8(&data)
                 && !data.contains(&0)
             {
-                page.readme_content = content.to_owned();
+                page.readme_html = markdown::render(content);
             } else {
                 page.readme_binary = true;
             }

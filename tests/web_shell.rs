@@ -22,6 +22,8 @@ mod http;
 )]
 #[path = "../src/instance.rs"]
 mod instance;
+#[path = "../src/markdown.rs"]
+mod markdown;
 #[allow(dead_code, reason = "the shell test does not use repository storage")]
 #[path = "../src/store/mod.rs"]
 mod store;

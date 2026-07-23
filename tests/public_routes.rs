@@ -24,6 +24,8 @@ mod http;
 )]
 #[path = "../src/instance.rs"]
 mod instance;
+#[path = "../src/markdown.rs"]
+mod markdown;
 #[allow(
     dead_code,
     reason = "the public-route test does not use each store API"
@@ -66,8 +68,15 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         assert!(summary_text.contains("ssh://tit.example:2222/alice/example"));
         assert!(summary_text.contains(&fixture.head));
         assert!(summary_text.contains("README.md"));
-        assert!(summary_text.contains("tit fixture &#60;safe&#62;"));
+        assert!(summary_text.contains("<h1>tit fixture</h1>"));
+        assert!(summary_text.contains("<strong>safe</strong>"));
+        assert!(summary_text.contains("<code>&lt;safe&gt;</code>"));
+        assert!(summary_text.contains("href=\"docs/guide.md\""));
         assert!(!summary_text.contains("<script"));
+        assert!(!summary_text.contains("javascript:"));
+        assert!(!summary_text.contains("<img"));
+        assert!(!summary_text.contains("tracker.example"));
+        assert!(summary_text.contains("&#60;script&#62;alert(3)&#60;/script&#62;"));
 
         let empty = request(server.address(), "GET", "/alice/empty", &[], &[]);
         assert_eq!(empty.status, 200);
@@ -113,6 +122,8 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         assert!(tree_text.contains("binary.dat"));
         assert!(tree_text.contains("non-å.txt"));
         assert!(tree_text.contains("non-%C3%A5.txt"));
+        assert!(tree_text.contains("&#60;img src=x onerror=alert(4)&#62;.txt"));
+        assert!(!tree_text.contains("<img"));
 
         let blob = request(
             server.address(),
@@ -378,10 +389,19 @@ impl Fixture {
         run(Command::new("git")
             .args(["init", "-q", "-b", "main", "--object-format", format])
             .arg(&worktree));
-        fs::write(worktree.join("README.md"), b"# tit fixture <safe>\n").expect("write the README");
+        fs::write(
+            worktree.join("README.md"),
+            b"# tit fixture\n\n**safe** and `<safe>`\n\n[guide](docs/guide.md) [bad](javascript:alert(1))\n\n![tracker](https://tracker.example/pixel)\n\n<script>alert(2)</script>\n",
+        )
+        .expect("write the README");
         fs::create_dir(worktree.join("nested")).expect("create a nested directory");
         fs::write(worktree.join("nested/file.txt"), b"first line\n").expect("write the text file");
         fs::write(worktree.join("binary.dat"), b"binary\0content").expect("write the binary file");
+        fs::write(
+            worktree.join("<img src=x onerror=alert(4)>.txt"),
+            b"escaped path\n",
+        )
+        .expect("write the hostile path");
         fs::write(worktree.join("non-å.txt"), b"non-UTF-8 path\n")
             .expect("write the percent-encoded path");
         commit_all(&worktree, "first commit");
@@ -391,7 +411,7 @@ impl Fixture {
             b"first line\nsecond line\n",
         )
         .expect("update the text file");
-        commit_all(&worktree, "second commit");
+        commit_all(&worktree, "<script>alert(3)</script>");
         let head = rev_parse(&worktree, "HEAD");
 
         run(Command::new("git")

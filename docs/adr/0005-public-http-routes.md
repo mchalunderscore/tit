@@ -62,6 +62,5 @@ moves. A repository rename changes its owner-and-repository URL, but the
 filesystem name and repository ID do not change.
 
 HTML repository views use server-rendered templates and embedded CSS. Raw files
-use `application/octet-stream`. Archives use a streamed ustar body. The first
-public interface shows plain-text README content. Milestone 2.6 owns Markdown
-rendering and sanitization.
+use `application/octet-stream`. Archives use a streamed ustar body. ADR 0006
+specifies Markdown rendering and sanitization for README content.

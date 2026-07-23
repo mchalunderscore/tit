@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+./scripts/check
+cargo test --locked --release --bin tit markdown::tests
+cargo test --locked --release --test public_routes browses_and_clones_public_repositories_for_both_hash_formats

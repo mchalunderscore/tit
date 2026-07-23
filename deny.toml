@@ -13,6 +13,10 @@ allow = [
     "Unicode-3.0",
     "Zlib",
 ]
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "cssparser@0.37.0" },
+    { allow = ["MPL-2.0"], crate = "dtoa-short@0.3.5" },
+]
 
 [bans]
 multiple-versions = "warn"

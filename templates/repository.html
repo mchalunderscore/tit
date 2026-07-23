@@ -39,7 +39,7 @@
 {% if readme_binary %}
     <p>Binary README content cannot be shown.</p>
 {% else %}
-    <pre>{{ readme_content }}</pre>
+    <div class="markdown">{{ readme_html|safe }}</div>
 {% endif %}
   </section>
 {% endif %}
