@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 use std::{env, ffi::OsString, fs};
 
 use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
-use store::{GitOperationIntent, InitialAdministrator, Store, StoreError};
+use store::{GitOperationIntent, InitialAdministrator, NewRepository, Store, StoreError};
 use tempfile::TempDir;
 
 const V1_FIXTURE: &str = include_str!("fixtures/sqlite/v1.sql");
 const V2_FIXTURE: &str = include_str!("fixtures/sqlite/v2.sql");
 const V3_FIXTURE: &str = include_str!("fixtures/sqlite/v3.sql");
+const V4_FIXTURE: &str = include_str!("fixtures/sqlite/v4.sql");
 
 fn database(directory: &TempDir, name: &str) -> std::path::PathBuf {
     directory.path().join(name)
@@ -132,7 +133,7 @@ fn configures_connections_and_creates_the_current_schema() {
     let directory = TempDir::new().expect("create a temporary directory");
     let store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
 
-    assert_eq!(store.schema_version().expect("read the schema version"), 4);
+    assert_eq!(store.schema_version().expect("read the schema version"), 5);
     assert_eq!(
         store
             .connection()
@@ -287,6 +288,92 @@ fn creates_only_one_initial_administrator_in_one_transaction() {
             .expect("count accounts"),
         1
     );
+}
+
+#[test]
+fn creates_renames_archives_and_reads_owned_repositories() {
+    let directory = TempDir::new().expect("create a temporary directory");
+    let mut store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
+    let recovery_hash = [7_u8; 32];
+    store
+        .create_initial_administrator(&InitialAdministrator {
+            username: "alice",
+            canonical_key: "ssh-ed25519 AAAAexample",
+            fingerprint: "SHA256:example",
+            recovery_hash: &recovery_hash,
+            created_at: 10,
+        })
+        .expect("create an account");
+    let repository = NewRepository {
+        id: "00112233445566778899aabbccddeeff",
+        owner: "alice",
+        slug: "project",
+        object_format: "sha256",
+        created_at: 20,
+    };
+    store
+        .create_repository(&repository)
+        .expect("create a repository");
+    let created = store
+        .repository("alice", "project")
+        .expect("read a repository");
+    assert_eq!(created.id, repository.id);
+    assert_eq!(created.owner, "alice");
+    assert_eq!(created.slug, "project");
+    assert_eq!(created.visibility, "public");
+    assert_eq!(created.state, "active");
+    assert_eq!(created.object_format, "sha256");
+    assert_eq!(created.created_at, 20);
+    assert_eq!(created.archived_at, None);
+
+    assert!(matches!(
+        store.create_repository(&repository),
+        Err(StoreError::RepositoryIdentifierCollision)
+    ));
+    let duplicate_name = NewRepository {
+        id: "ffeeddccbbaa99887766554433221100",
+        ..repository
+    };
+    assert!(matches!(
+        store.create_repository(&duplicate_name),
+        Err(StoreError::RepositoryExists(owner, slug))
+            if owner == "alice" && slug == "project"
+    ));
+    let missing_owner = NewRepository {
+        id: "1234567890abcdef1234567890abcdef",
+        owner: "bob",
+        slug: "project",
+        object_format: "sha1",
+        created_at: 20,
+    };
+    assert!(matches!(
+        store.create_repository(&missing_owner),
+        Err(StoreError::AccountNotFound(owner)) if owner == "bob"
+    ));
+
+    store
+        .rename_repository("alice", "project", "renamed")
+        .expect("rename a repository");
+    assert!(matches!(
+        store.repository("alice", "project"),
+        Err(StoreError::RepositoryNotFound(_, _))
+    ));
+    store
+        .archive_repository("alice", "renamed", 30)
+        .expect("archive a repository");
+    let archived = store
+        .repository("alice", "renamed")
+        .expect("read the archived repository");
+    assert_eq!(archived.state, "archived");
+    assert_eq!(archived.archived_at, Some(30));
+    assert!(matches!(
+        store.archive_repository("alice", "renamed", 31),
+        Err(StoreError::RepositoryArchived(_, _))
+    ));
+    assert!(matches!(
+        store.rename_repository("alice", "renamed", "again"),
+        Err(StoreError::RepositoryArchived(_, _))
+    ));
 }
 
 #[test]
@@ -616,13 +703,18 @@ fn backs_up_a_consistent_database_while_writes_continue() {
 
 #[test]
 fn migrates_each_committed_historical_fixture() {
-    for (fixture, initial_version) in [(V1_FIXTURE, 1), (V2_FIXTURE, 2), (V3_FIXTURE, 3)] {
+    for (fixture, initial_version) in [
+        (V1_FIXTURE, 1),
+        (V2_FIXTURE, 2),
+        (V3_FIXTURE, 3),
+        (V4_FIXTURE, 4),
+    ] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "tit.sqlite3");
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
-        assert_eq!(store.schema_version().expect("read the schema version"), 4);
+        assert_eq!(store.schema_version().expect("read the schema version"), 5);
         store.integrity_check().expect("check migrated integrity");
         let state: String = store
             .connection()
@@ -651,7 +743,7 @@ fn migrates_each_committed_historical_fixture() {
 
 #[test]
 fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
-    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 4)] {
+    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 5)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "fixture.sqlite");
         create_fixture(&path, V1_FIXTURE);

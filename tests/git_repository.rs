@@ -36,6 +36,40 @@ fn opens_empty_sha1_and_sha256_bare_repositories() {
 }
 
 #[test]
+fn creates_main_bare_repositories_and_copies_without_git() {
+    let directory = TempDir::new().expect("create a repository directory");
+    for kind in [gix::hash::Kind::Sha1, gix::hash::Kind::Sha256] {
+        let source = directory.path().join(format!("source-{kind}"));
+        GitRepository::create_bare(&source, kind).expect("create a bare repository");
+        assert_eq!(
+            fs::read_to_string(source.join("HEAD")).expect("read HEAD"),
+            "ref: refs/heads/main\n"
+        );
+        let destination = directory.path().join(format!("copy-{kind}"));
+        assert_eq!(
+            GitRepository::copy_bare(&source, &destination).expect("copy a bare repository"),
+            kind
+        );
+        assert_eq!(
+            GitRepository::open(&destination)
+                .expect("open the copy")
+                .object_format(),
+            kind
+        );
+    }
+
+    let unsafe_source = directory.path().join("unsafe");
+    GitRepository::create_bare(&unsafe_source, gix::hash::Kind::Sha1)
+        .expect("create an unsafe-source repository");
+    std::os::unix::fs::symlink("HEAD", unsafe_source.join("unsafe-link"))
+        .expect("create a repository symlink");
+    assert!(matches!(
+        GitRepository::copy_bare(&unsafe_source, &directory.path().join("unsafe-copy")),
+        Err(GitRepositoryError::UnsafeFile(_))
+    ));
+}
+
+#[test]
 fn reads_sorted_refs_and_generates_complete_packs_for_both_hashes() {
     let directory = TempDir::new().expect("create a repository directory");
     for format in ["sha1", "sha256"] {

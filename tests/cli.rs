@@ -2,6 +2,7 @@ mod support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
@@ -11,7 +12,7 @@ use support::{
 };
 use tempfile::TempDir;
 
-const V4_DATABASE: &str = include_str!("fixtures/sqlite/v4.sql");
+const V5_DATABASE: &str = include_str!("fixtures/sqlite/v5.sql");
 
 #[test]
 fn help_and_version_use_standard_output() {
@@ -66,7 +67,7 @@ fn doctor_checks_an_existing_current_database() {
     let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
         .expect("open the instance database");
     database
-        .execute_batch(V4_DATABASE)
+        .execute_batch(V5_DATABASE)
         .expect("create the current database");
     drop(database);
 
@@ -118,7 +119,7 @@ fn doctor_reports_a_foreign_key_violation() {
     let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
         .expect("open the instance database");
     database
-        .execute_batch(V4_DATABASE)
+        .execute_batch(V5_DATABASE)
         .expect("create the current database");
     database
         .pragma_update(None, "foreign_keys", false)
@@ -355,4 +356,229 @@ fn concurrent_setup_creates_exactly_one_administrator() {
             .expect("count accounts"),
         1
     );
+}
+
+#[test]
+fn administers_repositories_with_immutable_canonical_paths() {
+    let instance = TestInstance::new();
+    create_administrator(&instance, "alice");
+    let config = instance.config().to_str().expect("a UTF-8 path");
+
+    let created = Command::new(env!("CARGO_BIN_EXE_tit"))
+        .args([
+            "--config",
+            config,
+            "admin",
+            "repository",
+            "create",
+            "alice",
+            "project",
+            "--object-format",
+            "sha256",
+        ])
+        .env("PATH", "")
+        .output()
+        .expect("create a repository without runtime Git");
+    assert!(
+        created.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created = repository_output(&created.stdout);
+    assert_eq!(created.get("owner").map(String::as_str), Some("alice"));
+    assert_eq!(created.get("slug").map(String::as_str), Some("project"));
+    assert_eq!(
+        created.get("visibility").map(String::as_str),
+        Some("public")
+    );
+    assert_eq!(created.get("state").map(String::as_str), Some("active"));
+    assert_eq!(
+        created.get("object-format").map(String::as_str),
+        Some("sha256")
+    );
+    let id = created.get("id").expect("read the repository ID");
+    assert_eq!(id.len(), 32);
+    assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let path = PathBuf::from(created.get("path").expect("read the repository path"));
+    let repository_root = fs::canonicalize(instance.path().join("repositories"))
+        .expect("canonicalize managed repositories");
+    assert_eq!(path.parent(), Some(repository_root.as_path()));
+    let expected_name = format!("{id}.git");
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(expected_name.as_str())
+    );
+    assert_eq!(
+        fs::read_to_string(path.join("HEAD")).expect("read repository HEAD"),
+        "ref: refs/heads/main\n"
+    );
+
+    let renamed = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "rename",
+        "alice",
+        "project",
+        "renamed",
+    ]);
+    assert!(renamed.status.success());
+    let renamed = repository_output(&renamed.stdout);
+    assert_eq!(renamed.get("slug").map(String::as_str), Some("renamed"));
+    assert_eq!(renamed.get("id"), Some(id));
+    assert_eq!(renamed.get("path"), created.get("path"));
+
+    let old_name = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "inspect",
+        "alice",
+        "project",
+    ]);
+    assert_eq!(old_name.status.code(), Some(1));
+    let archived = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "archive",
+        "alice",
+        "renamed",
+    ]);
+    assert!(archived.status.success());
+    let archived = repository_output(&archived.stdout);
+    assert_eq!(archived.get("state").map(String::as_str), Some("archived"));
+    assert_ne!(archived.get("archived-at").map(String::as_str), Some("-"));
+    let second_archive = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "archive",
+        "alice",
+        "renamed",
+    ]);
+    assert_eq!(second_archive.status.code(), Some(1));
+
+    let duplicate = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "create",
+        "alice",
+        "renamed",
+    ]);
+    assert_eq!(duplicate.status.code(), Some(1));
+    let missing_owner = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "create",
+        "bob",
+        "project",
+    ]);
+    assert_eq!(missing_owner.status.code(), Some(1));
+}
+
+#[test]
+fn imports_bare_repositories_and_rejects_unsafe_sources() {
+    let instance = TestInstance::new();
+    create_administrator(&instance, "alice");
+    let config = instance.config().to_str().expect("a UTF-8 path");
+    let source = instance.path().join("source.git");
+    create_bare_git_fixture(&source, "sha1");
+
+    let imported = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "import",
+        "alice",
+        "imported",
+        source.to_str().expect("a UTF-8 path"),
+    ]);
+    assert!(
+        imported.status.success(),
+        "import failed: {}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let imported = repository_output(&imported.stdout);
+    assert_eq!(
+        imported.get("object-format").map(String::as_str),
+        Some("sha1")
+    );
+    assert_ne!(imported.get("path"), Some(&source.display().to_string()));
+
+    let unsafe_source = instance.path().join("unsafe.git");
+    create_bare_git_fixture(&unsafe_source, "sha1");
+    std::os::unix::fs::symlink("HEAD", unsafe_source.join("unsafe-link"))
+        .expect("create a repository symlink");
+    let unsafe_import = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "import",
+        "alice",
+        "unsafe",
+        unsafe_source.to_str().expect("a UTF-8 path"),
+    ]);
+    assert_eq!(unsafe_import.status.code(), Some(1));
+    assert!(unsafe_import.stdout.is_empty());
+    assert!(
+        fs::read_dir(instance.path().join("repositories"))
+            .expect("read managed repositories")
+            .all(|entry| !entry
+                .expect("read a managed repository")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".pending-"))
+    );
+
+    for slug in ["Project", "project.git", "../project", "admin"] {
+        let rejected = instance.run(&[
+            "--config",
+            config,
+            "admin",
+            "repository",
+            "create",
+            "alice",
+            slug,
+        ]);
+        assert_eq!(rejected.status.code(), Some(1), "accepted {slug:?}");
+        assert!(rejected.stdout.is_empty());
+    }
+}
+
+fn create_administrator(instance: &TestInstance, username: &str) {
+    let private_key = instance.path().join("admin-key");
+    create_ssh_key_fixture(&private_key);
+    let public_key = fs::read_to_string(private_key.with_extension("pub"))
+        .expect("read the administrator public key");
+    let output = instance.run(&[
+        "--config",
+        instance.config().to_str().expect("a UTF-8 path"),
+        "setup",
+        "admin",
+        username,
+        public_key.trim(),
+    ]);
+    assert!(output.status.success());
+}
+
+fn repository_output(output: &[u8]) -> std::collections::BTreeMap<String, String> {
+    String::from_utf8(output.to_vec())
+        .expect("read repository output")
+        .lines()
+        .map(|line| {
+            let (name, value) = line.split_once('=').expect("read a repository field");
+            (name.to_owned(), value.to_owned())
+        })
+        .collect()
 }

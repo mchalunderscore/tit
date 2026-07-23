@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use url::Url;
 
 #[derive(Debug, Parser)]
@@ -53,6 +53,54 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: SetupCommand,
     },
+    /// Run an offline administrator command
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum AdminCommand {
+    /// Administer repositories
+    Repository {
+        #[command(subcommand)]
+        command: RepositoryCommand,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum RepositoryCommand {
+    /// Create an empty repository
+    Create {
+        owner: String,
+        slug: String,
+        #[arg(long, value_enum, default_value_t = ObjectFormat::Sha1)]
+        object_format: ObjectFormat,
+    },
+    /// Import a bare repository
+    Import {
+        owner: String,
+        slug: String,
+        source: PathBuf,
+    },
+    /// Rename a repository
+    Rename {
+        owner: String,
+        old_slug: String,
+        new_slug: String,
+    },
+    /// Archive a repository
+    Archive { owner: String, slug: String },
+    /// Inspect a repository
+    Inspect { owner: String, slug: String },
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub(crate) enum ObjectFormat {
+    #[default]
+    Sha1,
+    Sha256,
 }
 
 #[derive(Clone, Debug, Subcommand)]

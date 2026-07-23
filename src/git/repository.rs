@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use gix::hash::{Kind, ObjectId};
@@ -37,6 +38,41 @@ impl GitRepository {
 
     pub(crate) fn object_format(&self) -> Kind {
         self.repository.object_hash()
+    }
+
+    pub(crate) fn create_bare(path: &Path, object_format: Kind) -> Result<(), GitRepositoryError> {
+        let options = gix::create::Options {
+            object_hash: (object_format == Kind::Sha256).then_some(Kind::Sha256),
+            ..Default::default()
+        };
+        let repository = gix::ThreadSafeRepository::init(path, gix::create::Kind::Bare, options)
+            .map_err(|error| GitRepositoryError::Create {
+                path: path.to_owned(),
+                reason: error.to_string(),
+            })?;
+        drop(repository);
+        fs::write(path.join("HEAD"), b"ref: refs/heads/main\n").map_err(|source| {
+            GitRepositoryError::Filesystem {
+                path: path.join("HEAD"),
+                source,
+            }
+        })?;
+        let created = Self::open(path)?;
+        if created.object_format() != object_format {
+            return Err(GitRepositoryError::WrongObjectFormat);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn copy_bare(source: &Path, destination: &Path) -> Result<Kind, GitRepositoryError> {
+        let source_repository = Self::open(source)?;
+        let object_format = source_repository.object_format();
+        copy_repository_tree(source, destination)?;
+        let copy = Self::open(destination)?;
+        if copy.object_format() != object_format {
+            return Err(GitRepositoryError::WrongObjectFormat);
+        }
+        Ok(object_format)
     }
 
     pub(crate) fn references(&self) -> Result<Vec<GitReference>, GitRepositoryError> {
@@ -255,6 +291,8 @@ impl GitRepository {
 
 #[derive(Debug, Error)]
 pub(crate) enum GitRepositoryError {
+    #[error("cannot create Git repository {path}: {reason}")]
+    Create { path: PathBuf, reason: String },
     #[error("cannot open Git repository {path}: {reason}")]
     Open { path: PathBuf, reason: String },
     #[error("Git repository is not bare: {0}")]
@@ -271,10 +309,55 @@ pub(crate) enum GitRepositoryError {
     UnadvertisedWant,
     #[error("object ID uses the wrong repository hash format")]
     WrongObjectFormat,
+    #[error("Git repository contains a symbolic link or special file: {0}")]
+    UnsafeFile(PathBuf),
+    #[error("cannot access Git repository path {path}: {source}")]
+    Filesystem {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("Git object count or decoded size exceeds the limit")]
     ObjectLimit,
     #[error("generated Git pack exceeds the limit")]
     PackLimit,
     #[error("cannot generate Git pack: {0}")]
     Pack(String),
+}
+
+fn copy_repository_tree(source: &Path, destination: &Path) -> Result<(), GitRepositoryError> {
+    fs::create_dir(destination).map_err(|source_error| GitRepositoryError::Filesystem {
+        path: destination.to_owned(),
+        source: source_error,
+    })?;
+    for entry in fs::read_dir(source).map_err(|source_error| GitRepositoryError::Filesystem {
+        path: source.to_owned(),
+        source: source_error,
+    })? {
+        let entry = entry.map_err(|source_error| GitRepositoryError::Filesystem {
+            path: source.to_owned(),
+            source: source_error,
+        })?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type =
+            entry
+                .file_type()
+                .map_err(|source_error| GitRepositoryError::Filesystem {
+                    path: source_path.clone(),
+                    source: source_error,
+                })?;
+        if file_type.is_dir() {
+            copy_repository_tree(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path).map_err(|source_error| {
+                GitRepositoryError::Filesystem {
+                    path: source_path,
+                    source: source_error,
+                }
+            })?;
+        } else {
+            return Err(GitRepositoryError::UnsafeFile(source_path));
+        }
+    }
+    Ok(())
 }

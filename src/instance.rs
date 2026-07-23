@@ -8,6 +8,8 @@ use crate::store::DATABASE_FILE;
 
 const LOCK_FILE: &str = "tit.lock";
 const PRIVATE_MODE: u32 = 0o600;
+const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+pub(crate) const REPOSITORY_DIRECTORY: &str = "repositories";
 
 pub(crate) struct InstanceLock {
     _file: File,
@@ -62,6 +64,45 @@ pub(crate) fn prepare_database(instance_dir: &Path) -> Result<PathBuf, InstanceE
     Ok(path)
 }
 
+pub(crate) fn prepare_repository_root(instance_dir: &Path) -> Result<PathBuf, InstanceError> {
+    let path = instance_dir.join(REPOSITORY_DIRECTORY);
+    reject_symlink(&path)?;
+    match std::fs::create_dir(&path) {
+        Ok(()) => {
+            let mut permissions = std::fs::metadata(&path)
+                .map_err(|source| InstanceError::Open {
+                    path: path.clone(),
+                    source,
+                })?
+                .permissions();
+            permissions.set_mode(PRIVATE_DIRECTORY_MODE);
+            std::fs::set_permissions(&path, permissions).map_err(|source| InstanceError::Open {
+                path: path.clone(),
+                source,
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) => {
+            return Err(InstanceError::Open {
+                path: path.clone(),
+                source,
+            });
+        }
+    }
+    let metadata = std::fs::metadata(&path).map_err(|source| InstanceError::Open {
+        path: path.clone(),
+        source,
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(InstanceError::InvalidDirectory(path));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(InstanceError::DirectoryPermissions { path, mode });
+    }
+    std::fs::canonicalize(&path).map_err(|source| InstanceError::Open { path, source })
+}
+
 fn reject_symlink(path: &Path) -> Result<(), InstanceError> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -109,6 +150,10 @@ pub(crate) enum InstanceError {
     InvalidFile(PathBuf),
     #[error("instance file permissions for {path} are {mode:o}, expected 600 or more restrictive")]
     Permissions { path: PathBuf, mode: u32 },
+    #[error(
+        "instance directory permissions for {path} are {mode:o}, expected 700 or more restrictive"
+    )]
+    DirectoryPermissions { path: PathBuf, mode: u32 },
     #[error("cannot open instance file {path}: {source}")]
     Open {
         path: PathBuf,
@@ -174,6 +219,31 @@ mod tests {
         assert!(matches!(
             prepare_database(directory.path()),
             Err(InstanceError::Symlink(path)) if path == database
+        ));
+    }
+
+    #[test]
+    fn creates_a_private_canonical_repository_directory() {
+        let directory = TempDir::new().expect("create an instance directory");
+        let root = prepare_repository_root(directory.path()).expect("prepare repositories");
+        assert!(root.is_absolute());
+        assert_eq!(
+            fs::metadata(&root)
+                .expect("inspect repositories")
+                .permissions()
+                .mode()
+                & 0o777,
+            PRIVATE_DIRECTORY_MODE
+        );
+
+        let mut permissions = fs::metadata(&root)
+            .expect("inspect repositories")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&root, permissions).expect("make repositories unsafe");
+        assert!(matches!(
+            prepare_repository_root(directory.path()),
+            Err(InstanceError::DirectoryPermissions { mode: 0o755, .. })
         ));
     }
 }

@@ -9,7 +9,7 @@ use thiserror::Error;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -19,11 +19,12 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 4] = [
+const MIGRATIONS: [&str; 5] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
     include_str!("migrations/004_identity.sql"),
+    include_str!("migrations/005_repository.sql"),
 ];
 
 #[derive(Debug, Error)]
@@ -54,6 +55,16 @@ pub(crate) enum StoreError {
     IntentState(String),
     #[error("the instance already has an administrator")]
     AlreadyInitialized,
+    #[error("account does not exist or is not active: {0}")]
+    AccountNotFound(String),
+    #[error("repository does not exist: {0}/{1}")]
+    RepositoryNotFound(String, String),
+    #[error("repository already exists: {0}/{1}")]
+    RepositoryExists(String, String),
+    #[error("repository ID already exists")]
+    RepositoryIdentifierCollision,
+    #[error("repository is already archived: {0}/{1}")]
+    RepositoryArchived(String, String),
 }
 
 pub(crate) struct Store {
@@ -326,6 +337,133 @@ impl Store {
         transaction.commit()?;
         Ok(())
     }
+
+    pub(crate) fn create_repository(
+        &mut self,
+        repository: &NewRepository<'_>,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner_id = active_account_id(&transaction, repository.owner)?;
+        let result = transaction.execute(
+            "INSERT INTO repository
+             (id, owner_account_id, slug, visibility, state, object_format, created_at, archived_at)
+             VALUES (?1, ?2, ?3, 'public', 'active', ?4, ?5, NULL)",
+            rusqlite::params![
+                repository.id,
+                owner_id,
+                repository.slug,
+                repository.object_format,
+                repository.created_at,
+            ],
+        );
+        match result {
+            Ok(1) => transaction.commit()?,
+            Ok(_) => unreachable!("an INSERT changes one row"),
+            Err(error) if is_unique_constraint(&error) => {
+                let duplicate_id: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM repository WHERE id = ?1)",
+                    [repository.id],
+                    |row| row.get(0),
+                )?;
+                return if duplicate_id {
+                    Err(StoreError::RepositoryIdentifierCollision)
+                } else {
+                    Err(StoreError::RepositoryExists(
+                        repository.owner.to_owned(),
+                        repository.slug.to_owned(),
+                    ))
+                };
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rename_repository(
+        &mut self,
+        owner: &str,
+        old_slug: &str,
+        new_slug: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner_id = active_account_id(&transaction, owner)?;
+        let result = transaction.execute(
+            "UPDATE repository SET slug = ?3
+             WHERE owner_account_id = ?1 AND slug = ?2 AND state = 'active'",
+            rusqlite::params![owner_id, old_slug, new_slug],
+        );
+        match result {
+            Ok(1) => transaction.commit()?,
+            Ok(0) => {
+                return Err(repository_state_error(
+                    &transaction,
+                    owner_id,
+                    owner,
+                    old_slug,
+                )?);
+            }
+            Ok(_) => unreachable!("an owner and slug identify one repository"),
+            Err(error) if is_unique_constraint(&error) => {
+                return Err(StoreError::RepositoryExists(
+                    owner.to_owned(),
+                    new_slug.to_owned(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn archive_repository(
+        &mut self,
+        owner: &str,
+        slug: &str,
+        archived_at: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner_id = active_account_id(&transaction, owner)?;
+        let changed = transaction.execute(
+            "UPDATE repository SET state = 'archived', archived_at = ?3
+             WHERE owner_account_id = ?1 AND slug = ?2 AND state = 'active'",
+            rusqlite::params![owner_id, slug, archived_at],
+        )?;
+        if changed == 0 {
+            return Err(repository_state_error(&transaction, owner_id, owner, slug)?);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn repository(
+        &self,
+        owner: &str,
+        slug: &str,
+    ) -> Result<RepositoryRecord, StoreError> {
+        let result = self.connection.query_row(
+            "SELECT repository.id, account.username, repository.slug,
+                    repository.visibility, repository.state, repository.object_format,
+                    repository.created_at, repository.archived_at
+             FROM repository
+             JOIN account ON account.id = repository.owner_account_id
+             WHERE account.username = ?1 AND repository.slug = ?2",
+            rusqlite::params![owner, slug],
+            repository_from_row,
+        );
+        match result {
+            Ok(repository) => Ok(repository),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(StoreError::RepositoryNotFound(
+                owner.to_owned(),
+                slug.to_owned(),
+            )),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 pub(crate) struct InitialAdministrator<'a> {
@@ -334,6 +472,26 @@ pub(crate) struct InitialAdministrator<'a> {
     pub(crate) fingerprint: &'a str,
     pub(crate) recovery_hash: &'a [u8; 32],
     pub(crate) created_at: i64,
+}
+
+pub(crate) struct NewRepository<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) owner: &'a str,
+    pub(crate) slug: &'a str,
+    pub(crate) object_format: &'a str,
+    pub(crate) created_at: i64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct RepositoryRecord {
+    pub(crate) id: String,
+    pub(crate) owner: String,
+    pub(crate) slug: String,
+    pub(crate) visibility: String,
+    pub(crate) state: String,
+    pub(crate) object_format: String,
+    pub(crate) created_at: i64,
+    pub(crate) archived_at: Option<i64>,
 }
 
 pub(crate) struct GitOperationIntent<'a> {
@@ -363,6 +521,71 @@ fn require_one_intent(id: &str, changed: usize) -> Result<(), StoreError> {
     } else {
         Err(StoreError::IntentState(id.to_owned()))
     }
+}
+
+fn active_account_id(
+    transaction: &rusqlite::Transaction<'_>,
+    username: &str,
+) -> Result<i64, StoreError> {
+    let result = transaction.query_row(
+        "SELECT id FROM account WHERE username = ?1 AND state = 'active'",
+        [username],
+        |row| row.get(0),
+    );
+    match result {
+        Ok(id) => Ok(id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            Err(StoreError::AccountNotFound(username.to_owned()))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn repository_state_error(
+    transaction: &rusqlite::Transaction<'_>,
+    owner_id: i64,
+    owner: &str,
+    slug: &str,
+) -> Result<StoreError, StoreError> {
+    let state = transaction.query_row(
+        "SELECT state FROM repository WHERE owner_account_id = ?1 AND slug = ?2",
+        rusqlite::params![owner_id, slug],
+        |row| row.get::<_, String>(0),
+    );
+    match state {
+        Ok(state) if state == "archived" => Ok(StoreError::RepositoryArchived(
+            owner.to_owned(),
+            slug.to_owned(),
+        )),
+        Ok(_) => unreachable!("repository state has a database constraint"),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(StoreError::RepositoryNotFound(
+            owner.to_owned(),
+            slug.to_owned(),
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn repository_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryRecord> {
+    Ok(RepositoryRecord {
+        id: row.get(0)?,
+        owner: row.get(1)?,
+        slug: row.get(2)?,
+        visibility: row.get(3)?,
+        state: row.get(4)?,
+        object_format: row.get(5)?,
+        created_at: row.get(6)?,
+        archived_at: row.get(7)?,
+    })
+}
+
+fn is_unique_constraint(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                || code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+    )
 }
 
 #[allow(
