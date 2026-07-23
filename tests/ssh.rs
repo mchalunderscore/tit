@@ -13,6 +13,12 @@ mod git;
 )]
 #[path = "../src/ssh.rs"]
 mod ssh;
+#[allow(
+    dead_code,
+    reason = "the SSH identity test does not use the intent store"
+)]
+#[path = "../src/store/mod.rs"]
+mod store;
 
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};

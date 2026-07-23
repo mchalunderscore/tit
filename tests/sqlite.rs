@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use std::{env, ffi::OsString, fs};
 
 use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
-use store::{Store, StoreError};
+use store::{GitOperationIntent, Store, StoreError};
 use tempfile::TempDir;
 
 const V1_FIXTURE: &str = include_str!("fixtures/sqlite/v1.sql");
@@ -131,7 +131,7 @@ fn configures_connections_and_creates_the_current_schema() {
     let directory = TempDir::new().expect("create a temporary directory");
     let store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
 
-    assert_eq!(store.schema_version().expect("read the schema version"), 2);
+    assert_eq!(store.schema_version().expect("read the schema version"), 3);
     assert_eq!(
         store
             .connection()
@@ -161,6 +161,77 @@ fn configures_connections_and_creates_the_current_schema() {
         5_000
     );
     store.integrity_check().expect("check database integrity");
+}
+
+#[test]
+fn persists_and_completes_git_operation_intents_with_their_events() {
+    let directory = TempDir::new().expect("create a temporary directory");
+    let mut store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
+    let intent = GitOperationIntent {
+        id: "00112233445566778899aabbccddeeff",
+        repository_path: "/srv/tit/repositories/alice/example.git",
+        actor: "SHA256:test-key",
+        initial_refs: b"0000000000000000000000000000000000000000 refs/heads/main\n",
+        proposed_refs: b"1111111111111111111111111111111111111111 refs/heads/main\n",
+        event_payload: b"push event",
+        quarantine_path: "/srv/tit/repositories/alice/example.git/objects/tit-quarantine/test",
+        created_at: 1,
+    };
+    store.begin_git_intent(&intent).expect("begin an intent");
+    let pending = store
+        .incomplete_git_intents()
+        .expect("list pending intents");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, intent.id);
+    assert_eq!(pending[0].repository_path, intent.repository_path);
+    assert_eq!(pending[0].initial_refs, intent.initial_refs);
+    assert_eq!(pending[0].proposed_refs, intent.proposed_refs);
+    assert_eq!(pending[0].quarantine_path, intent.quarantine_path);
+    assert_eq!(pending[0].state, "pending");
+    assert_eq!(pending[0].pack_name, None);
+
+    store
+        .mark_git_objects_promoted(intent.id, Some("pack-test.pack"))
+        .expect("mark objects as promoted");
+    let promoted = store
+        .incomplete_git_intents()
+        .expect("list promoted intents");
+    assert_eq!(promoted[0].state, "promoted");
+    assert_eq!(promoted[0].pack_name.as_deref(), Some("pack-test.pack"));
+    store
+        .complete_git_intent(intent.id)
+        .expect("complete the intent");
+    assert!(
+        store
+            .incomplete_git_intents()
+            .expect("list incomplete intents")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .connection()
+            .query_row("SELECT count(*) FROM git_operation_event", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count Git operation events"),
+        1
+    );
+
+    let abandoned = GitOperationIntent {
+        id: "ffeeddccbbaa99887766554433221100",
+        ..intent
+    };
+    store
+        .begin_git_intent(&abandoned)
+        .expect("begin an abandoned intent");
+    store
+        .abandon_git_intent(abandoned.id)
+        .expect("abandon the intent");
+    assert!(
+        store
+            .incomplete_git_intents()
+            .expect("list incomplete intents")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -496,7 +567,7 @@ fn migrates_each_committed_historical_fixture() {
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
-        assert_eq!(store.schema_version().expect("read the schema version"), 2);
+        assert_eq!(store.schema_version().expect("read the schema version"), 3);
         store.integrity_check().expect("check migrated integrity");
         let state: String = store
             .connection()
@@ -512,19 +583,20 @@ fn migrates_each_committed_historical_fixture() {
         assert_eq!(state, expected);
         store::doctor(directory.path()).expect("check the migrated fixture with doctor");
 
-        let backup_path = migration_backup(&path, 1);
-        assert_eq!(backup_path.exists(), initial_version == 1);
-        if initial_version == 1 {
-            let backup = Store::open_unmigrated(&backup_path).expect("open the migration backup");
-            assert_eq!(backup.schema_version().expect("read the backup version"), 1);
-            backup.integrity_check().expect("check backup integrity");
-        }
+        let backup_path = migration_backup(&path, initial_version);
+        assert!(backup_path.exists());
+        let backup = Store::open_unmigrated(&backup_path).expect("open the migration backup");
+        assert_eq!(
+            backup.schema_version().expect("read the backup version"),
+            initial_version
+        );
+        backup.integrity_check().expect("check backup integrity");
     }
 }
 
 #[test]
 fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
-    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 2)] {
+    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 3)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "fixture.sqlite");
         create_fixture(&path, V1_FIXTURE);
@@ -549,7 +621,7 @@ fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
                 |row| row.get(0),
             )
             .expect("inspect the recovered schema");
-        assert_eq!(has_state, i64::from(expected_version == 2));
+        assert_eq!(has_state, i64::from(expected_version >= 2));
     }
 }
 

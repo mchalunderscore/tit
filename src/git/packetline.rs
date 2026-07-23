@@ -79,6 +79,44 @@ pub(crate) fn decode(input: &[u8]) -> Result<Vec<Packet>, PacketLineError> {
     Ok(packets)
 }
 
+pub(crate) fn first_flush_end(input: &[u8]) -> Result<Option<usize>, PacketLineError> {
+    let mut offset = 0;
+    while offset < input.len() {
+        if offset >= MAX_REQUEST_BYTES {
+            return Err(PacketLineError::RequestTooLarge);
+        }
+        let Some(header) = input.get(offset..offset + 4) else {
+            return Ok(None);
+        };
+        if !header.iter().all(u8::is_ascii_hexdigit) {
+            return Err(PacketLineError::InvalidLength);
+        }
+        let header = std::str::from_utf8(header).map_err(|_| PacketLineError::InvalidLength)?;
+        let length =
+            usize::from_str_radix(header, 16).map_err(|_| PacketLineError::InvalidLength)?;
+        match length {
+            0 if offset + 4 <= MAX_REQUEST_BYTES => return Ok(Some(offset + 4)),
+            0 => return Err(PacketLineError::RequestTooLarge),
+            1 | 2 => offset += 4,
+            3 | 4 => return Err(PacketLineError::InvalidLength),
+            length if length > MAX_PACKET_BYTES => return Err(PacketLineError::PacketTooLarge),
+            length => {
+                let end = offset
+                    .checked_add(length)
+                    .ok_or(PacketLineError::PacketTooLarge)?;
+                if end > input.len() {
+                    return Ok(None);
+                }
+                if end > MAX_REQUEST_BYTES {
+                    return Err(PacketLineError::RequestTooLarge);
+                }
+                offset = end;
+            }
+        }
+    }
+    Ok(None)
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub(crate) enum PacketLineError {
     #[error("packet-line request is too large")]
@@ -127,6 +165,17 @@ mod tests {
         assert_eq!(
             encode_data(&vec![0; MAX_PACKET_BYTES - 3], &mut Vec::new()),
             Err(PacketLineError::PacketTooLarge)
+        );
+    }
+
+    #[test]
+    fn finds_the_first_complete_flush_boundary() {
+        assert_eq!(first_flush_end(b"0008abc"), Ok(None));
+        assert_eq!(first_flush_end(b"0008abcd0000PACK"), Ok(Some(12)));
+        assert_eq!(first_flush_end(b"0008abcd0001"), Ok(None));
+        assert_eq!(
+            first_flush_end(b"0004"),
+            Err(PacketLineError::InvalidLength)
         );
     }
 }

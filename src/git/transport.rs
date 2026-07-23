@@ -9,6 +9,8 @@ const MAX_BLOCKING_GIT_JOBS: usize = 4;
 #[derive(Clone)]
 pub(crate) struct GitRepositories {
     root: PathBuf,
+    push_database: Option<PathBuf>,
+    push_jobs: std::sync::Arc<Semaphore>,
     blocking_jobs: std::sync::Arc<Semaphore>,
 }
 
@@ -20,8 +22,19 @@ impl GitRepositories {
         })?;
         Ok(Self {
             root,
+            push_database: None,
+            push_jobs: std::sync::Arc::new(Semaphore::new(1)),
             blocking_jobs: std::sync::Arc::new(Semaphore::new(MAX_BLOCKING_GIT_JOBS)),
         })
+    }
+
+    pub(crate) fn new_with_pushes(
+        root: &Path,
+        database: &Path,
+    ) -> Result<Self, RepositoryPathError> {
+        let mut repositories = Self::new(root)?;
+        repositories.push_database = Some(database.to_owned());
+        Ok(repositories)
     }
 
     pub(crate) fn resolve(
@@ -75,9 +88,52 @@ impl GitRepositories {
         self.resolve(owner, repository)
     }
 
+    pub(crate) fn resolve_ssh_service(
+        &self,
+        command: &[u8],
+    ) -> Result<GitSshService, RepositoryPathError> {
+        if command.starts_with(b"git-upload-pack ") {
+            return self.resolve_ssh_command(command).map(GitSshService::Upload);
+        }
+        let command =
+            std::str::from_utf8(command).map_err(|_| RepositoryPathError::InvalidCommand)?;
+        let path = command
+            .strip_prefix("git-receive-pack '")
+            .and_then(|value| value.strip_suffix('\''))
+            .ok_or(RepositoryPathError::InvalidCommand)?;
+        if path.contains('\'') {
+            return Err(RepositoryPathError::InvalidCommand);
+        }
+        let path = path.strip_prefix('/').unwrap_or(path);
+        let mut components = path.split('/');
+        let owner = components
+            .next()
+            .ok_or(RepositoryPathError::InvalidCommand)?;
+        let repository = components
+            .next()
+            .ok_or(RepositoryPathError::InvalidCommand)?;
+        if components.next().is_some() {
+            return Err(RepositoryPathError::InvalidCommand);
+        }
+        self.resolve(owner, repository).map(GitSshService::Receive)
+    }
+
+    pub(crate) fn push_database(&self) -> Option<&Path> {
+        self.push_database.as_deref()
+    }
+
+    pub(crate) async fn push_permit(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
+        self.push_jobs.clone().acquire_owned().await
+    }
+
     pub(crate) async fn blocking_permit(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
         self.blocking_jobs.clone().acquire_owned().await
     }
+}
+
+pub(crate) enum GitSshService {
+    Upload(PathBuf),
+    Receive(PathBuf),
 }
 
 fn valid_name(value: &str, maximum: usize) -> bool {
@@ -134,6 +190,12 @@ mod tests {
                 .expect("resolve a repository"),
             fs::canonicalize(&repository).expect("canonicalize the repository")
         );
+        assert!(matches!(
+            repositories
+                .resolve_ssh_service(b"git-receive-pack '/alice/example.git'")
+                .expect("resolve receive-pack"),
+            GitSshService::Receive(path) if path == fs::canonicalize(&repository).expect("canonicalize the repository")
+        ));
         assert_eq!(
             repositories
                 .resolve_ssh_command(b"git-upload-pack '/alice/example.git'")

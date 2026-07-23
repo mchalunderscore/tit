@@ -1278,6 +1278,7 @@ dependencies = [
  "gix-hashtable",
  "gix-object",
  "gix-path",
+ "gix-tempfile",
  "gix-traverse",
  "memmap2",
  "parking_lot",

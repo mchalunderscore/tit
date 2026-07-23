@@ -1,3 +1,7 @@
+#[allow(
+    dead_code,
+    reason = "the M1A workload does not use Git operation intents"
+)]
 #[path = "../src/store/mod.rs"]
 mod store;
 

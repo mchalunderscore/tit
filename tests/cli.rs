@@ -9,7 +9,7 @@ use support::{
 };
 use tempfile::TempDir;
 
-const V2_DATABASE: &str = include_str!("fixtures/sqlite/v2.sql");
+const V3_DATABASE: &str = include_str!("fixtures/sqlite/v3.sql");
 
 #[test]
 fn help_and_version_use_standard_output() {
@@ -64,7 +64,7 @@ fn doctor_checks_an_existing_current_database() {
     let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
         .expect("open the instance database");
     database
-        .execute_batch(V2_DATABASE)
+        .execute_batch(V3_DATABASE)
         .expect("create the current database");
     drop(database);
 
@@ -116,7 +116,7 @@ fn doctor_reports_a_foreign_key_violation() {
     let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
         .expect("open the instance database");
     database
-        .execute_batch(V2_DATABASE)
+        .execute_batch(V3_DATABASE)
         .expect("create the current database");
     database
         .pragma_update(None, "foreign_keys", false)

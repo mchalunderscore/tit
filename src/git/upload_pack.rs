@@ -310,7 +310,7 @@ fn trim_line(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\n").unwrap_or(line)
 }
 
-fn hash_name(kind: Kind) -> &'static str {
+pub(crate) fn hash_name(kind: Kind) -> &'static str {
     match kind {
         Kind::Sha1 => "sha1",
         Kind::Sha256 => "sha256",

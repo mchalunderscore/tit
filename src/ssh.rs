@@ -10,17 +10,20 @@ use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Server, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Preferred, Pty};
 use ssh_key::{Algorithm, EcdsaCurve, PrivateKey, PublicKey};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::auth::SshPublicKey;
-use crate::git::packetline::{MAX_REQUEST_BYTES, Packet, decode, encode_data};
-use crate::git::transport::GitRepositories;
+use crate::git::packetline::{MAX_REQUEST_BYTES, Packet, decode, encode_data, first_flush_end};
+use crate::git::receive_pack::{ReceivePack, ReceivePackError};
+use crate::git::transport::{GitRepositories, GitSshService};
 use crate::git::upload_pack::{ProtocolVersion, UploadPack, UploadPackError};
 
 const VERSION_COMMAND: &[u8] = b"tit --version";
 const GIT_PROTOCOL_VARIABLE: &str = "GIT_PROTOCOL";
+const MAX_RECEIVE_PACK_BYTES: u64 = 128 * 1024 * 1024;
 
 pub(crate) struct RunningSshServer {
     address: SocketAddr,
@@ -34,7 +37,7 @@ impl RunningSshServer {
         address: SocketAddr,
         authorized_keys: &[SshPublicKey],
     ) -> Result<Self, SshServerError> {
-        Self::start_inner(address, authorized_keys, None).await
+        Self::start_inner(address, authorized_keys, &[], None).await
     }
 
     pub(crate) async fn start_with_git(
@@ -42,12 +45,32 @@ impl RunningSshServer {
         authorized_keys: &[SshPublicKey],
         repositories: GitRepositories,
     ) -> Result<Self, SshServerError> {
-        Self::start_inner(address, authorized_keys, Some(repositories)).await
+        Self::start_inner(address, authorized_keys, &[], Some(repositories)).await
+    }
+
+    pub(crate) async fn start_with_git_writes(
+        address: SocketAddr,
+        authorized_keys: &[SshPublicKey],
+        writable_keys: &[SshPublicKey],
+        repositories: GitRepositories,
+    ) -> Result<Self, SshServerError> {
+        let database = repositories
+            .push_database()
+            .ok_or_else(|| SshServerError::Recovery("push storage is not configured".to_owned()))?
+            .to_owned();
+        tokio::task::spawn_blocking(move || {
+            crate::git::receive_pack::recover_incomplete_pushes(&database)
+        })
+        .await
+        .map_err(|_| SshServerError::Join)?
+        .map_err(|error| SshServerError::Recovery(error.to_string()))?;
+        Self::start_inner(address, authorized_keys, writable_keys, Some(repositories)).await
     }
 
     async fn start_inner(
         address: SocketAddr,
         authorized_keys: &[SshPublicKey],
+        writable_keys: &[SshPublicKey],
         repositories: Option<GitRepositories>,
     ) -> Result<Self, SshServerError> {
         let listener = TcpListener::bind(address).await?;
@@ -74,8 +97,14 @@ impl RunningSshServer {
             nodelay: true,
             ..Default::default()
         });
-        let authorized_keys = Arc::new(
+        let authorized_keys: Arc<HashMap<PublicKey, String>> = Arc::new(
             authorized_keys
+                .iter()
+                .map(|key| (key.public_key().clone(), key.fingerprint().to_owned()))
+                .collect(),
+        );
+        let writable_keys = Arc::new(
+            writable_keys
                 .iter()
                 .map(|key| key.public_key().clone())
                 .collect(),
@@ -83,6 +112,7 @@ impl RunningSshServer {
         let audit = Arc::new(RequestAudit::default());
         let server = SshServer {
             authorized_keys,
+            writable_keys,
             audit: Arc::clone(&audit),
             repositories: repositories.map(Arc::new),
         };
@@ -127,11 +157,14 @@ pub(crate) enum SshServerError {
     Startup,
     #[error("SSH server task failed")]
     Join,
+    #[error("cannot recover Git writes: {0}")]
+    Recovery(String),
 }
 
 #[derive(Clone)]
 struct SshServer {
-    authorized_keys: Arc<HashSet<PublicKey>>,
+    authorized_keys: Arc<HashMap<PublicKey, String>>,
+    writable_keys: Arc<HashSet<PublicKey>>,
     audit: Arc<RequestAudit>,
     repositories: Option<Arc<GitRepositories>>,
 }
@@ -142,25 +175,44 @@ impl Server for SshServer {
     fn new_client(&mut self, _peer_address: Option<SocketAddr>) -> Self::Handler {
         SshSession {
             authorized_keys: Arc::clone(&self.authorized_keys),
+            writable_keys: Arc::clone(&self.writable_keys),
             audit: Arc::clone(&self.audit),
             repositories: self.repositories.clone(),
             protocol: ProtocolVersion::V0,
             git_channels: HashMap::new(),
+            authenticated_actor: None,
+            authenticated_writer: false,
         }
     }
 }
 
 struct SshSession {
-    authorized_keys: Arc<HashSet<PublicKey>>,
+    authorized_keys: Arc<HashMap<PublicKey, String>>,
+    writable_keys: Arc<HashSet<PublicKey>>,
     audit: Arc<RequestAudit>,
     repositories: Option<Arc<GitRepositories>>,
     protocol: ProtocolVersion,
     git_channels: HashMap<ChannelId, GitChannel>,
+    authenticated_actor: Option<String>,
+    authenticated_writer: bool,
 }
 
-struct GitChannel {
+enum GitChannel {
+    Upload(Box<UploadChannel>),
+    Receive(Box<ReceiveChannel>),
+}
+
+struct UploadChannel {
     service: UploadPack,
     request: Vec<u8>,
+}
+
+struct ReceiveChannel {
+    service: ReceivePack,
+    commands: Vec<u8>,
+    commands_complete: bool,
+    pack: tokio::fs::File,
+    pack_bytes: u64,
 }
 
 impl Handler for SshSession {
@@ -179,7 +231,13 @@ impl Handler for SshSession {
         _user: &str,
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        Ok(self.authorize(public_key))
+        if let Some(actor) = self.authorized_keys.get(public_key) {
+            self.authenticated_actor = Some(actor.clone());
+            self.authenticated_writer = self.writable_keys.contains(public_key);
+            Ok(Auth::Accept)
+        } else {
+            Ok(Auth::reject())
+        }
     }
 
     async fn channel_open_session(
@@ -310,34 +368,47 @@ impl Handler for SshSession {
             session.eof(channel)?;
             session.close(channel)?;
         } else {
-            let service = if let Some(repositories) = &self.repositories
-                && let Ok(path) = repositories.resolve_ssh_command(command)
-                && let Ok(permit) = repositories.blocking_permit().await
-            {
-                let protocol = self.protocol;
-                tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    let service = UploadPack::open(&path)?;
-                    let advertisement = service.advertisement(protocol, false)?;
-                    Ok::<_, UploadPackError>((service, advertisement))
-                })
-                .await
-                .ok()
-                .and_then(Result::ok)
-            } else {
-                None
-            };
-            if let Some((service, advertisement)) = service {
+            let service = self.open_git_service(command).await;
+            if let Some(service) = service {
                 self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
                 session.channel_success(channel)?;
-                session.data(channel, advertisement)?;
-                self.git_channels.insert(
-                    channel,
-                    GitChannel {
+                match service {
+                    InitialGitService::Upload {
                         service,
-                        request: Vec::new(),
-                    },
-                );
+                        advertisement,
+                    } => {
+                        session.data(channel, advertisement)?;
+                        self.git_channels.insert(
+                            channel,
+                            GitChannel::Upload(Box::new(UploadChannel {
+                                service: *service,
+                                request: Vec::new(),
+                            })),
+                        );
+                    }
+                    InitialGitService::Receive {
+                        service,
+                        advertisement,
+                    } => {
+                        session.data(channel, advertisement)?;
+                        let pack = tokio::fs::File::create(service.incoming_pack()).await;
+                        match pack {
+                            Ok(pack) => {
+                                self.git_channels.insert(
+                                    channel,
+                                    GitChannel::Receive(Box::new(ReceiveChannel {
+                                        service,
+                                        commands: Vec::new(),
+                                        commands_complete: false,
+                                        pack,
+                                        pack_bytes: 0,
+                                    })),
+                                );
+                            }
+                            Err(_) => fail_git_channel(channel, session)?,
+                        }
+                    }
+                }
             } else {
                 self.audit.rejected_exec.fetch_add(1, Ordering::Relaxed);
                 session.channel_failure(channel)?;
@@ -353,8 +424,27 @@ impl Handler for SshSession {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let Some(mut git) = self.git_channels.remove(&channel) else {
+        let Some(git) = self.git_channels.remove(&channel) else {
             return Ok(());
+        };
+        let mut git = match git {
+            GitChannel::Upload(git) => git,
+            GitChannel::Receive(mut git) => {
+                if receive_data(&mut git, data).await.is_err() {
+                    fail_git_channel(channel, session)?;
+                } else if git.commands_complete
+                    && matches!(git.service.expects_pack(&git.commands), Ok(false))
+                {
+                    send_receive_result(
+                        channel,
+                        finish_receive(self.repositories.clone(), git).await,
+                        session,
+                    )?;
+                } else {
+                    self.git_channels.insert(channel, GitChannel::Receive(git));
+                }
+                return Ok(());
+            }
         };
         if git.request.len().saturating_add(data.len()) > MAX_REQUEST_BYTES {
             fail_git_channel(channel, session)?;
@@ -366,7 +456,7 @@ impl Handler for SshSession {
             Ok(packets) => packets,
             Err(super::git::packetline::PacketLineError::TruncatedHeader)
             | Err(super::git::packetline::PacketLineError::TruncatedPacket) => {
-                self.git_channels.insert(channel, git);
+                self.git_channels.insert(channel, GitChannel::Upload(git));
                 return Ok(());
             }
             Err(_) => {
@@ -393,12 +483,12 @@ impl Handler for SshSession {
                         Some((_, Err(_))) | None => fail_git_channel(channel, session)?,
                     }
                 } else {
-                    self.git_channels.insert(channel, git);
+                    self.git_channels.insert(channel, GitChannel::Upload(git));
                 }
             }
             ProtocolVersion::V2 => {
                 if packets.last() != Some(&Packet::Flush) {
-                    self.git_channels.insert(channel, git);
+                    self.git_channels.insert(channel, GitChannel::Upload(git));
                     return Ok(());
                 }
                 let fetch = packets.iter().any(
@@ -414,7 +504,7 @@ impl Handler for SshSession {
                             finish_git_channel(channel, 0, session)?;
                         } else {
                             git.request.clear();
-                            self.git_channels.insert(channel, git);
+                            self.git_channels.insert(channel, GitChannel::Upload(git));
                         }
                     }
                     Some((_, Err(_))) | None => fail_git_channel(channel, session)?,
@@ -430,6 +520,23 @@ impl Handler for SshSession {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.git_channels.remove(&channel);
+        Ok(())
+    }
+
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let Some(GitChannel::Receive(git)) = self.git_channels.remove(&channel) else {
+            return Ok(());
+        };
+        if !git.commands_complete {
+            fail_git_channel(channel, session)?;
+            return Ok(());
+        }
+        let result = finish_receive(self.repositories.clone(), git).await;
+        send_receive_result(channel, result, session)?;
         Ok(())
     }
 
@@ -477,19 +584,166 @@ impl Handler for SshSession {
 
 impl SshSession {
     fn authorize(&self, public_key: &PublicKey) -> Auth {
-        if self.authorized_keys.contains(public_key) {
+        if self.authorized_keys.contains_key(public_key) {
             Auth::Accept
         } else {
             Auth::reject()
         }
     }
+
+    async fn open_git_service(&mut self, command: &[u8]) -> Option<InitialGitService> {
+        let repositories = self.repositories.as_ref()?;
+        let service = repositories.resolve_ssh_service(command).ok()?;
+        match service {
+            GitSshService::Upload(path) => {
+                let permit = repositories.blocking_permit().await.ok()?;
+                let protocol = self.protocol;
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let service = UploadPack::open(&path)?;
+                    let advertisement = service.advertisement(protocol, false)?;
+                    Ok::<_, UploadPackError>(InitialGitService::Upload {
+                        service: Box::new(service),
+                        advertisement,
+                    })
+                })
+                .await
+                .ok()?
+                .ok()
+            }
+            GitSshService::Receive(path) => {
+                if !self.authenticated_writer {
+                    return None;
+                }
+                let database = repositories.push_database()?.to_owned();
+                let actor = self.authenticated_actor.clone()?;
+                let permit = repositories.blocking_permit().await.ok()?;
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let service = ReceivePack::open(&path, &database, actor)?;
+                    let advertisement = service.advertisement()?;
+                    Ok::<_, ReceivePackError>(InitialGitService::Receive {
+                        service,
+                        advertisement,
+                    })
+                })
+                .await
+                .ok()?
+                .ok()
+            }
+        }
+    }
+}
+
+enum InitialGitService {
+    Upload {
+        service: Box<UploadPack>,
+        advertisement: Vec<u8>,
+    },
+    Receive {
+        service: ReceivePack,
+        advertisement: Vec<u8>,
+    },
+}
+
+async fn receive_data(git: &mut ReceiveChannel, data: &[u8]) -> Result<(), ()> {
+    if git.commands_complete {
+        write_receive_pack(git, data).await?;
+        return Ok(());
+    }
+    git.commands.extend_from_slice(data);
+    let boundary = first_flush_end(&git.commands).map_err(|_| ())?;
+    let Some(boundary) = boundary else {
+        return Ok(());
+    };
+    let pack = git.commands.split_off(boundary);
+    git.commands_complete = true;
+    write_receive_pack(git, &pack).await
+}
+
+async fn write_receive_pack(git: &mut ReceiveChannel, data: &[u8]) -> Result<(), ()> {
+    let bytes = u64::try_from(data.len()).map_err(|_| ())?;
+    git.pack_bytes = git.pack_bytes.checked_add(bytes).ok_or(())?;
+    if git.pack_bytes > MAX_RECEIVE_PACK_BYTES {
+        return Err(());
+    }
+    git.pack.write_all(data).await.map_err(|_| ())
+}
+
+type ReceiveResult = Option<Result<Vec<u8>, (ReceivePackError, Vec<u8>)>>;
+
+async fn finish_receive(
+    repositories: Option<Arc<GitRepositories>>,
+    git: Box<ReceiveChannel>,
+) -> ReceiveResult {
+    let ReceiveChannel {
+        mut service,
+        commands,
+        mut pack,
+        ..
+    } = *git;
+    pack.flush().await.ok()?;
+    pack.sync_all().await.ok()?;
+    drop(pack);
+    let repositories = repositories?;
+    let push_permit = repositories.push_permit().await.ok()?;
+    let permit = repositories.blocking_permit().await.ok()?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _push_permit = push_permit;
+        match service.finish(&commands) {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                let response = service.rejection_response(&commands, &error);
+                Err((error, response))
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+fn send_receive_result(
+    channel: ChannelId,
+    result: ReceiveResult,
+    session: &mut Session,
+) -> Result<(), russh::Error> {
+    match result {
+        Some(Ok(response)) => {
+            session.data(channel, response)?;
+            finish_git_channel(channel, 0, session)
+        }
+        Some(Err((error, response))) => {
+            eprintln!("tit: receive-pack failed: {error}");
+            session.data(
+                channel,
+                if response.is_empty() {
+                    receive_error_response()
+                } else {
+                    response
+                },
+            )?;
+            finish_git_channel(channel, 1, session)
+        }
+        None => {
+            session.data(channel, receive_error_response())?;
+            finish_git_channel(channel, 1, session)
+        }
+    }
+}
+
+fn receive_error_response() -> Vec<u8> {
+    let mut response = Vec::new();
+    let _ = encode_data(b"unpack tit rejected the push\n", &mut response);
+    super::git::packetline::encode_flush(&mut response);
+    response
 }
 
 async fn respond_git(
     repositories: Option<Arc<GitRepositories>>,
     protocol: ProtocolVersion,
-    git: GitChannel,
-) -> Option<(GitChannel, Result<Vec<u8>, UploadPackError>)> {
+    git: Box<UploadChannel>,
+) -> Option<(Box<UploadChannel>, Result<Vec<u8>, UploadPackError>)> {
     let permit = repositories?.blocking_permit().await.ok()?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;

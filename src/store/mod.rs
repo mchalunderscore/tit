@@ -9,7 +9,7 @@ use thiserror::Error;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -19,9 +19,10 @@ const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 2] = [
+const MIGRATIONS: [&str; 3] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
+    include_str!("migrations/003_git_intents.sql"),
 ];
 
 #[derive(Debug, Error)]
@@ -48,6 +49,8 @@ pub(crate) enum StoreError {
         expected: &'static str,
         actual: String,
     },
+    #[error("Git operation intent {0} is not in the required state")]
+    IntentState(String),
 }
 
 pub(crate) struct Store {
@@ -181,6 +184,129 @@ impl Store {
     )]
     pub(crate) fn connection_mut(&mut self) -> &mut Connection {
         &mut self.connection
+    }
+
+    pub(crate) fn begin_git_intent(
+        &self,
+        intent: &GitOperationIntent<'_>,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO git_operation_intent
+             (id, repository_path, actor, initial_refs, proposed_refs, event_payload,
+              quarantine_path, state, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
+            rusqlite::params![
+                intent.id,
+                intent.repository_path,
+                intent.actor,
+                intent.initial_refs,
+                intent.proposed_refs,
+                intent.event_payload,
+                intent.quarantine_path,
+                intent.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn mark_git_objects_promoted(
+        &self,
+        id: &str,
+        pack_name: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE git_operation_intent
+             SET state = 'promoted', pack_name = ?2
+             WHERE id = ?1 AND state = 'pending'",
+            rusqlite::params![id, pack_name],
+        )?;
+        require_one_intent(id, changed)
+    }
+
+    pub(crate) fn complete_git_intent(&mut self, id: &str) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let payload: Vec<u8> = transaction.query_row(
+            "SELECT event_payload FROM git_operation_intent
+             WHERE id = ?1 AND state = 'promoted'",
+            [id],
+            |row| row.get(0),
+        )?;
+        let changed = transaction.execute(
+            "UPDATE git_operation_intent SET state = 'completed'
+             WHERE id = ?1 AND state = 'promoted'",
+            [id],
+        )?;
+        require_one_intent(id, changed)?;
+        transaction.execute(
+            "INSERT INTO git_operation_event (intent_id, payload) VALUES (?1, ?2)",
+            rusqlite::params![id, payload],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn abandon_git_intent(&self, id: &str) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE git_operation_intent SET state = 'abandoned'
+             WHERE id = ?1 AND state IN ('pending', 'promoted')",
+            [id],
+        )?;
+        require_one_intent(id, changed)
+    }
+
+    pub(crate) fn incomplete_git_intents(&self) -> Result<Vec<GitIntentRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, repository_path, initial_refs, proposed_refs, quarantine_path,
+                    state, pack_name
+             FROM git_operation_intent
+             WHERE state IN ('pending', 'promoted')
+             ORDER BY created_at, id",
+        )?;
+        let records = statement
+            .query_map([], |row| {
+                Ok(GitIntentRecord {
+                    id: row.get(0)?,
+                    repository_path: row.get(1)?,
+                    initial_refs: row.get(2)?,
+                    proposed_refs: row.get(3)?,
+                    quarantine_path: row.get(4)?,
+                    state: row.get(5)?,
+                    pack_name: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+}
+
+pub(crate) struct GitOperationIntent<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) repository_path: &'a str,
+    pub(crate) actor: &'a str,
+    pub(crate) initial_refs: &'a [u8],
+    pub(crate) proposed_refs: &'a [u8],
+    pub(crate) event_payload: &'a [u8],
+    pub(crate) quarantine_path: &'a str,
+    pub(crate) created_at: i64,
+}
+
+pub(crate) struct GitIntentRecord {
+    pub(crate) id: String,
+    pub(crate) repository_path: String,
+    pub(crate) initial_refs: Vec<u8>,
+    pub(crate) proposed_refs: Vec<u8>,
+    pub(crate) quarantine_path: String,
+    pub(crate) state: String,
+    pub(crate) pack_name: Option<String>,
+}
+
+fn require_one_intent(id: &str, changed: usize) -> Result<(), StoreError> {
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::IntentState(id.to_owned()))
     }
 }
 
