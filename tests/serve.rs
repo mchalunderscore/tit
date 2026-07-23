@@ -605,6 +605,7 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
         &instance.path().join("created-clone")
     ));
     let created_clone = instance.path().join("created-clone");
+    command(&created_clone, ["symbolic-ref", "HEAD", "refs/heads/main"]);
     fs::write(created_clone.join("README.md"), b"base\n").expect("write pull-request base");
     git_commit(&created_clone, "create main");
     assert!(git_push(&member_key, &created_clone, &["main"]).success());
