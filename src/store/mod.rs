@@ -3190,6 +3190,39 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub(crate) fn home_repositories(
+        &self,
+        owner: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<HomeRepositoryRecord>, StoreError> {
+        let limit = i64::try_from(limit).expect("the home repository limit fits in SQLite");
+        let mut statement = self.connection.prepare(
+            "SELECT account.username, repository.slug, repository.visibility,
+                    COALESCE(MAX(repository_event.created_at), repository.created_at)
+             FROM repository
+             JOIN account ON account.id = repository.owner_account_id
+             LEFT JOIN repository_event ON repository_event.repository_id = repository.id
+             WHERE repository.state = 'active'
+               AND ((?1 IS NULL AND repository.visibility = 'public')
+                    OR account.username = ?1)
+             GROUP BY repository.id, account.username, repository.slug,
+                      repository.visibility, repository.created_at
+             ORDER BY 4 DESC, account.username, repository.slug
+             LIMIT ?2",
+        )?;
+        statement
+            .query_map(rusqlite::params![owner, limit], |row| {
+                Ok(HomeRepositoryRecord {
+                    owner: row.get(0)?,
+                    slug: row.get(1)?,
+                    visibility: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     #[allow(
         dead_code,
         reason = "some integration tests import storage without public event pages"
@@ -3407,6 +3440,14 @@ pub(crate) struct RepositoryRecord {
     pub(crate) object_format: String,
     pub(crate) created_at: i64,
     pub(crate) archived_at: Option<i64>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct HomeRepositoryRecord {
+    pub(crate) owner: String,
+    pub(crate) slug: String,
+    pub(crate) visibility: String,
+    pub(crate) updated_at: i64,
 }
 
 #[derive(Debug, Serialize)]

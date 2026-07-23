@@ -59,6 +59,7 @@ async fn watch_page(
                 StatusCode::OK,
                 &WatchTemplate {
                     request_id: &request_id.0,
+                    signed_in: authenticated,
                     owner: &record.owner,
                     repository: &record.slug,
                     csrf: &csrf,
@@ -198,6 +199,7 @@ struct RepositoryPath {
 #[template(path = "watch.html")]
 struct WatchTemplate<'a> {
     request_id: &'a str,
+    signed_in: bool,
     owner: &'a str,
     repository: &'a str,
     csrf: &'a str,

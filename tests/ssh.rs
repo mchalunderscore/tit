@@ -88,6 +88,55 @@ async fn stock_openssh_authenticates_supported_keys_and_ignores_the_username() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_available_commands_and_explains_invalid_commands() {
+    let directory = TempDir::new().expect("create a key directory");
+    let private_key = directory.path().join("ed25519");
+    generate_key(&private_key, KeyFixture::Ed25519);
+    let server = start(&[parse_public_key(&private_key)]).await;
+
+    let help = ssh(&server, &private_key, "alice", &["help"]);
+    assert!(
+        help.status.success(),
+        "help failed: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let help_text = String::from_utf8(help.stdout).expect("read the help output");
+    assert!(help_text.contains("Available tit SSH commands:"));
+    assert!(help_text.contains("repo create NAME"));
+    assert!(help_text.contains("issue list OWNER/REPOSITORY"));
+    assert!(help_text.contains("pr checkout OWNER/REPOSITORY NUMBER"));
+
+    let invalid = ssh(&server, &private_key, "alice", &["not-a-command"]);
+    assert!(!invalid.status.success());
+    assert_eq!(
+        String::from_utf8(invalid.stderr).expect("read the invalid-command error"),
+        "tit: The command is not valid.\nUse 'help' to list the available commands.\n"
+    );
+
+    let malformed = ssh(&server, &private_key, "alice", &["repo create"]);
+    assert!(!malformed.status.success());
+    let malformed_error =
+        String::from_utf8(malformed.stderr).expect("read the malformed-command error");
+    assert!(malformed_error.contains("usage: repo create NAME"));
+    assert!(malformed_error.contains("Use 'help' to list the available commands."));
+
+    let invalid_json = ssh(
+        &server,
+        &private_key,
+        "alice",
+        &["not-a-command --output json"],
+    );
+    assert!(!invalid_json.status.success());
+    let response: serde_json::Value =
+        serde_json::from_slice(&invalid_json.stdout).expect("parse the JSON error");
+    assert_eq!(response["version"], 1);
+    assert_eq!(response["status"], "error");
+    assert_eq!(response["error"]["code"], "invalid-command");
+
+    server.shutdown().await.expect("stop the SSH server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rejects_unknown_keys_and_forced_rsa_sha1_authentication() {
     let directory = TempDir::new().expect("create a key directory");
     let authorized_private = directory.path().join("authorized");
@@ -190,7 +239,7 @@ async fn rejects_shell_pty_arbitrary_exec_subsystem_agent_and_forwarding() {
 
     let audit = server.audit();
     assert!(audit.rejected_shell >= 1);
-    assert!(audit.rejected_exec >= 2);
+    assert!(audit.accepted_exec >= 2);
     assert!(audit.rejected_pty >= 1);
     assert!(audit.rejected_agent >= 1);
     assert!(audit.rejected_forward >= 1);

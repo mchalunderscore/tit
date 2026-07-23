@@ -1,0 +1,150 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 2 ]; then
+    echo "usage: verify-release-artifact ARCHIVE CHECKSUM" >&2
+    exit 2
+fi
+
+archive=$1
+checksum=$2
+archive_dir=$(CDPATH= cd "$(dirname "$archive")" && pwd)
+archive_name=$(basename "$archive")
+checksum_name=$(basename "$checksum")
+
+if command -v sha256sum >/dev/null 2>&1; then
+    (CDPATH= cd "$archive_dir" && sha256sum -c "$checksum_name")
+elif command -v shasum >/dev/null 2>&1; then
+    (CDPATH= cd "$archive_dir" && shasum -a 256 -c "$checksum_name")
+elif command -v sha256 >/dev/null 2>&1; then
+    expected=$(awk '{ print $1 }' "$checksum")
+    actual=$(sha256 -q "$archive")
+    [ "$actual" = "$expected" ] || {
+        echo "tit: the release checksum does not match" >&2
+        exit 1
+    }
+else
+    echo "tit: no SHA-256 command is available" >&2
+    exit 1
+fi
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/tit-verify.XXXXXX")
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+list="$work/archive.list"
+tar -tzf "$archive" >"$list"
+root=$(sed -n '1{s:/*$::;p;}' "$list")
+case "$root" in
+    tit-*-*) ;;
+    *) echo "tit: the release archive root is not valid" >&2; exit 1 ;;
+esac
+case "$root" in
+    *[!0-9A-Za-z_.-]*) echo "tit: the release archive root is not valid" >&2; exit 1 ;;
+esac
+while IFS= read -r path; do
+    case "$path" in
+        "$root" | "$root"/*) ;;
+        *) echo "tit: the release archive has an unsafe path" >&2; exit 1 ;;
+    esac
+    case "$path" in
+        /* | *"/../"* | *"/.." | ../*) echo "tit: the release archive has an unsafe path" >&2; exit 1 ;;
+    esac
+done <"$list"
+tar -xzf "$archive" -C "$work"
+package="$work/$root"
+binary="$package/bin/tit"
+
+for required in \
+    "$binary" \
+    "$package/LICENSE" \
+    "$package/README.md" \
+    "$package/etc/tit/config.toml" \
+    "$package/share/doc/tit/install.md" \
+    "$package/share/doc/tit/upgrade.md" \
+    "$package/share/doc/tit/disaster-recovery.md" \
+    "$package/share/doc/tit/examples/Caddyfile" \
+    "$package/share/man/man1/tit.1" \
+    "$package/share/bash-completion/completions/tit" \
+    "$package/share/zsh/site-functions/_tit" \
+    "$package/share/fish/vendor_completions.d/tit.fish"
+do
+    [ -f "$required" ] || {
+        echo "tit: a required release file is missing: $required" >&2
+        exit 1
+    }
+done
+[ -x "$binary" ] || {
+    echo "tit: the release executable is not executable" >&2
+    exit 1
+}
+
+empty_path="$work/empty-path"
+home="$work/home"
+instance="$work/instance"
+restored="$work/restored"
+mkdir -m 700 "$empty_path" "$home" "$instance" "$restored"
+config="$instance/config.toml"
+http_port=$((30000 + ($$ % 10000)))
+ssh_port=$((http_port + 1))
+cat >"$config" <<EOF
+version = 1
+public_url = "http://127.0.0.1:$http_port/"
+
+[http]
+listen = "127.0.0.1:$http_port"
+
+[ssh]
+listen = "127.0.0.1:$ssh_port"
+public_host = "127.0.0.1"
+public_port = $ssh_port
+EOF
+chmod 600 "$config"
+
+key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJgOfb9397gwZRfsz2A6DN/VVw/+bdjMdVsJ89JDLAC0 tit-release-verification'
+setup_output="$work/setup.out"
+env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
+    "$binary" --config "$config" setup admin release-test "$key" >"$setup_output"
+grep -q '^Recovery code: tit-recovery-v1:' "$setup_output"
+
+server_log="$work/server.log"
+env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
+    "$binary" --config "$config" serve 2>"$server_log" &
+server_pid=$!
+sleep 1
+if ! kill -0 "$server_pid" 2>/dev/null; then
+    wait "$server_pid" || true
+    echo "tit: the release server did not start" >&2
+    sed -n '1,80p' "$server_log" >&2
+    exit 1
+fi
+kill -TERM "$server_pid"
+wait "$server_pid"
+
+env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
+    "$binary" --config "$config" doctor
+backup="$work/tit-backup.tar"
+env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
+    "$binary" --config "$config" backup "$backup"
+env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
+    "$binary" --config "$config" doctor --backup "$backup"
+
+: >"$instance/tit.sqlite3"
+if env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
+    "$binary" --config "$config" doctor >/dev/null 2>&1
+then
+    echo "tit: doctor accepted the damaged disposable instance" >&2
+    exit 1
+fi
+
+env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
+    "$binary" restore "$backup" "$restored"
+env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
+    "$binary" --config "$restored/config.toml" doctor
+
+recovery=$(sed -n 's/^Recovery code: //p' "$setup_output")
+if grep -F "$recovery" "$server_log" >/dev/null; then
+    echo "tit: the server log contains a recovery credential" >&2
+    exit 1
+fi
+
+version=$("$binary" --version)
+printf 'verified %s from %s without commands in PATH\n' "$version" "$archive_name"

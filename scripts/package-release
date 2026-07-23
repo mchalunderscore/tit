@@ -1,0 +1,112 @@
+#!/bin/sh
+set -eu
+
+project_dir=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
+binary=${1:-"$project_dir/target/release/tit"}
+output_dir=${2:-"$project_dir/dist"}
+
+case "$binary" in
+    /*) ;;
+    *) binary="$project_dir/$binary" ;;
+esac
+
+if [ ! -x "$binary" ]; then
+    echo "tit: the release executable does not exist: $binary" >&2
+    exit 1
+fi
+
+set -- $("$binary" --version)
+if [ "$#" -ne 2 ] || [ "$1" != "tit" ]; then
+    echo "tit: the release executable has invalid version output" >&2
+    exit 1
+fi
+version=$2
+case "$version" in
+    *[!0-9A-Za-z.-]* | "") echo "tit: the release version is not valid" >&2; exit 1 ;;
+esac
+
+target=$(rustc -vV | awk '/^host: / { print $2 }')
+case "$target" in
+    *[!0-9A-Za-z_.-]* | "") echo "tit: the Rust host target is not valid" >&2; exit 1 ;;
+esac
+
+mkdir -p "$output_dir"
+output_dir=$(CDPATH= cd "$output_dir" && pwd)
+package="tit-$version-$target"
+archive="$package.tar.gz"
+checksum="$archive.sha256"
+if [ -e "$output_dir/$archive" ] || [ -e "$output_dir/$checksum" ]; then
+    echo "tit: the release output already exists for $target" >&2
+    exit 1
+fi
+
+stage=$(mktemp -d "${TMPDIR:-/tmp}/tit-package.XXXXXX")
+trap 'rm -rf "$stage"' EXIT HUP INT TERM
+root="$stage/$package"
+
+install -d -m 755 \
+    "$root/bin" \
+    "$root/etc/tit" \
+    "$root/share/doc/tit/adr" \
+    "$root/share/doc/tit/examples" \
+    "$root/share/man/man1" \
+    "$root/share/bash-completion/completions" \
+    "$root/share/zsh/site-functions" \
+    "$root/share/fish/vendor_completions.d"
+install -m 755 "$binary" "$root/bin/tit"
+install -m 644 "$project_dir/LICENSE" "$root/LICENSE"
+install -m 644 "$project_dir/README.md" "$root/README.md"
+install -m 600 "$project_dir/config.example.toml" "$root/etc/tit/config.toml"
+install -m 644 "$project_dir/docs/install.md" "$root/share/doc/tit/install.md"
+install -m 644 "$project_dir/docs/upgrade.md" "$root/share/doc/tit/upgrade.md"
+install -m 644 \
+    "$project_dir/docs/disaster-recovery.md" \
+    "$root/share/doc/tit/disaster-recovery.md"
+install -m 644 \
+    "$project_dir/docs/adr/0029-backup-and-restore.md" \
+    "$root/share/doc/tit/adr/0029-backup-and-restore.md"
+install -m 644 \
+    "$project_dir/docs/adr/0033-release-packaging.md" \
+    "$root/share/doc/tit/adr/0033-release-packaging.md"
+install -m 644 "$project_dir/release/examples/Caddyfile" "$root/share/doc/tit/examples/Caddyfile"
+install -m 644 \
+    "$project_dir/release/examples/tit.service" \
+    "$root/share/doc/tit/examples/tit.service"
+install -m 644 \
+    "$project_dir/release/examples/com.tit-cde.tit.plist" \
+    "$root/share/doc/tit/examples/com.tit-cde.tit.plist"
+install -m 755 \
+    "$project_dir/release/examples/tit.freebsd" \
+    "$root/share/doc/tit/examples/tit.freebsd"
+install -m 755 \
+    "$project_dir/release/examples/tit.openbsd" \
+    "$root/share/doc/tit/examples/tit.openbsd"
+install -m 755 \
+    "$project_dir/release/examples/tit.netbsd" \
+    "$root/share/doc/tit/examples/tit.netbsd"
+install -m 644 "$project_dir/release/man/tit.1" "$root/share/man/man1/tit.1"
+install -m 644 \
+    "$project_dir/release/completions/tit.bash" \
+    "$root/share/bash-completion/completions/tit"
+install -m 644 \
+    "$project_dir/release/completions/_tit" \
+    "$root/share/zsh/site-functions/_tit"
+install -m 644 \
+    "$project_dir/release/completions/tit.fish" \
+    "$root/share/fish/vendor_completions.d/tit.fish"
+
+(CDPATH= cd "$stage" && tar -czf "$output_dir/$archive" "$package")
+
+if command -v sha256sum >/dev/null 2>&1; then
+    (CDPATH= cd "$output_dir" && sha256sum "$archive" >"$checksum")
+elif command -v shasum >/dev/null 2>&1; then
+    (CDPATH= cd "$output_dir" && shasum -a 256 "$archive" >"$checksum")
+elif command -v sha256 >/dev/null 2>&1; then
+    digest=$(sha256 -q "$output_dir/$archive")
+    printf '%s  %s\n' "$digest" "$archive" >"$output_dir/$checksum"
+else
+    echo "tit: no SHA-256 command is available" >&2
+    exit 1
+fi
+
+printf '%s\n%s\n' "$output_dir/$archive" "$output_dir/$checksum"

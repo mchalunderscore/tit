@@ -1,0 +1,20 @@
+[Unit]
+Description=tit collaborative development environment
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tit
+Group=tit
+ExecStart=/usr/local/bin/tit --config /srv/tit/config.toml serve
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/srv/tit
+
+[Install]
+WantedBy=multi-user.target

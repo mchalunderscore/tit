@@ -11,8 +11,11 @@ use crate::domain::repository::{RepositoryNameError, validate_slug};
 use crate::git::repository::{GitRepository, GitRepositoryError};
 use crate::maintenance::MaintenanceGate;
 use crate::store::{
-    NewAuditEvent, NewRepository, RepositoryOrigin, RepositoryRecord, Store, StoreError,
+    HomeRepositoryRecord, NewAuditEvent, NewRepository, RepositoryOrigin, RepositoryRecord, Store,
+    StoreError,
 };
+
+const HOME_REPOSITORY_LIMIT: usize = 20;
 
 #[derive(Clone)]
 pub(crate) struct RepositoryService {
@@ -46,6 +49,13 @@ impl RepositoryService {
         correlation_id: &str,
     ) -> Result<RepositoryRecord, RepositoryServiceError> {
         self.create(actor, actor, slug, object_format, correlation_id)
+    }
+
+    pub(crate) fn home(
+        &self,
+        owner: Option<&str>,
+    ) -> Result<Vec<HomeRepositoryRecord>, RepositoryServiceError> {
+        Ok(Store::open(&self.database)?.home_repositories(owner, HOME_REPOSITORY_LIMIT)?)
     }
 
     pub(crate) fn create_for_administrator(

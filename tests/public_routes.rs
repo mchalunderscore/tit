@@ -109,6 +109,7 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         let summary = request(server.address(), "GET", "/alice/example", &[], &[]);
         assert_eq!(summary.status, 200);
         assert_html_policy(&summary);
+        assert_repository_navigation(&summary, "alice", "example");
         let summary_text = summary.text();
         assert!(summary_text.contains("<h1><a href=\"/alice/example\">alice/example</a></h1>"));
         assert!(summary_text.contains("https://tit.example/alice/example"));
@@ -127,7 +128,6 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         assert!(summary_text.contains("/alice/example/atom.xml"));
         assert!(summary_text.contains("/alice/example/rss.xml"));
         assert!(summary_text.contains("/alice/example/search"));
-
         let mut feed_entry_ids = Vec::new();
         for (path, content_type) in [
             (
@@ -631,6 +631,7 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
 
     let anonymous = request(server.address(), "GET", "/alice/example/issues", &[], &[]);
     assert_eq!(anonymous.status, 200);
+    assert_repository_navigation(&anonymous, "alice", "example");
     assert!(anonymous.text().contains("This repository has no issues."));
     assert!(!anonymous.text().contains("Create an issue</h2>"));
 
@@ -750,6 +751,7 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     let anonymous_pull_requests =
         request(server.address(), "GET", "/alice/example/pulls", &[], &[]);
     assert_eq!(anonymous_pull_requests.status, 200);
+    assert_repository_navigation(&anonymous_pull_requests, "alice", "example");
     assert!(
         anonymous_pull_requests
             .text()
@@ -990,6 +992,7 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
 
     let anonymous_watch = request(server.address(), "GET", "/alice/example/watch", &[], &[]);
     assert_eq!(anonymous_watch.status, 200);
+    assert_repository_navigation(&anonymous_watch, "alice", "example");
     assert!(
         anonymous_watch
             .text()
@@ -1510,6 +1513,26 @@ fn assert_html_policy(response: &HttpResponse) {
     assert_eq!(response.header("referrer-policy"), "no-referrer");
     assert_eq!(response.header("cache-control"), "no-store");
     assert_eq!(response.header("x-request-id").len(), 32);
+}
+
+fn assert_repository_navigation(response: &HttpResponse, owner: &str, repository: &str) {
+    let text = response.text();
+    for suffix in [
+        "",
+        "/refs",
+        "/issues",
+        "/pulls",
+        "/watch",
+        "/atom.xml",
+        "/rss.xml",
+        "/search",
+    ] {
+        let link = format!("/{owner}/{repository}{suffix}");
+        assert!(
+            text.contains(&format!("href=\"{link}\"")),
+            "repository navigation is missing {link}"
+        );
+    }
 }
 
 struct HttpResponse {

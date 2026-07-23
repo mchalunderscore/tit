@@ -445,6 +445,7 @@ async fn summary(
     let Some(web) = state.public else {
         return route_error(RouteError::NotFound, &request_id.0);
     };
+    let signed_in = actor.0.is_some();
     let clone_urls = web.clone_urls(&path.owner, &path.repository);
     let result = web
         .read(
@@ -475,7 +476,7 @@ async fn summary(
             },
         )
         .await;
-    render_page(result, &request_id.0)
+    render_page(result, &request_id.0, signed_in)
 }
 
 async fn refs(
@@ -487,6 +488,7 @@ async fn refs(
     let Some(web) = state.public else {
         return route_error(RouteError::NotFound, &request_id.0);
     };
+    let signed_in = actor.0.is_some();
     let result = web
         .read(actor.0, path.owner, path.repository, |record, service| {
             let cancellation = ReadCancellation::default();
@@ -494,7 +496,7 @@ async fn refs(
             Ok(RepositoryPage::refs(record, references))
         })
         .await;
-    render_page(result, &request_id.0)
+    render_page(result, &request_id.0, signed_in)
 }
 
 async fn search(
@@ -512,6 +514,7 @@ async fn search(
     }) {
         return route_error(RouteError::InvalidRequest, &request_id.0);
     }
+    let signed_in = actor.0.is_some();
     let result = web
         .read(
             actor.0,
@@ -538,7 +541,7 @@ async fn search(
             },
         )
         .await;
-    render_page(result, &request_id.0)
+    render_page(result, &request_id.0, signed_in)
 }
 
 async fn commit(
@@ -554,6 +557,7 @@ async fn commit(
         Ok(id) => id,
         Err(error) => return route_error(error, &request_id.0),
     };
+    let signed_in = actor.0.is_some();
     let result = web
         .read(
             actor.0,
@@ -567,7 +571,7 @@ async fn commit(
             },
         )
         .await;
-    render_page(result, &request_id.0)
+    render_page(result, &request_id.0, signed_in)
 }
 
 async fn diff(
@@ -583,6 +587,7 @@ async fn diff(
         (Ok(old), Ok(new)) => (old, new),
         _ => return route_error(RouteError::NotFound, &request_id.0),
     };
+    let signed_in = actor.0.is_some();
     let result = web
         .read(
             actor.0,
@@ -597,7 +602,7 @@ async fn diff(
             },
         )
         .await;
-    render_page(result, &request_id.0)
+    render_page(result, &request_id.0, signed_in)
 }
 
 async fn tree_root(
@@ -636,6 +641,7 @@ async fn tree_response(
         Ok(id) => id,
         Err(error) => return route_error(error, &request_id.0),
     };
+    let signed_in = actor.0.is_some();
     let result = web
         .read(
             actor.0,
@@ -649,7 +655,7 @@ async fn tree_response(
             },
         )
         .await;
-    render_page(result, &request_id.0)
+    render_page(result, &request_id.0, signed_in)
 }
 
 async fn blob(
@@ -669,6 +675,7 @@ async fn blob(
         Ok(id) => id,
         Err(error) => return route_error(error, &request_id.0),
     };
+    let signed_in = actor.0.is_some();
     let result = web
         .read(
             actor.0,
@@ -682,7 +689,7 @@ async fn blob(
             },
         )
         .await;
-    render_page(result, &request_id.0)
+    render_page(result, &request_id.0, signed_in)
 }
 
 async fn raw(
@@ -751,6 +758,7 @@ async fn blame(
         Ok(id) => id,
         Err(error) => return route_error(error, &request_id.0),
     };
+    let signed_in = actor.0.is_some();
     let result = web
         .read(
             actor.0,
@@ -767,7 +775,7 @@ async fn blame(
             },
         )
         .await;
-    render_page(result, &request_id.0)
+    render_page(result, &request_id.0, signed_in)
 }
 
 async fn archive(
@@ -896,10 +904,15 @@ async fn git_upload_pack(
     }
 }
 
-fn render_page(result: Result<RepositoryPage, RouteError>, request_id: &str) -> Response {
+fn render_page(
+    result: Result<RepositoryPage, RouteError>,
+    request_id: &str,
+    signed_in: bool,
+) -> Response {
     match result {
         Ok(mut page) => {
             page.request_id = request_id.to_owned();
+            page.signed_in = signed_in;
             match page.render() {
                 Ok(body) => Response::builder()
                     .status(StatusCode::OK)
@@ -1232,6 +1245,7 @@ struct ArchivePath {
 #[template(path = "repository.html")]
 struct RepositoryPage {
     request_id: String,
+    signed_in: bool,
     owner: String,
     repository: String,
     object_format: String,
@@ -1271,6 +1285,7 @@ impl RepositoryPage {
     fn base(record: RepositoryRecord, page_kind: &'static str, title: String) -> Self {
         Self {
             request_id: String::new(),
+            signed_in: false,
             owner: record.owner,
             repository: record.slug,
             object_format: record.object_format,

@@ -1,0 +1,100 @@
+.TH TIT 1 "2026-07-23" "tit 0.1.0" "User Commands"
+.SH NAME
+tit \- run a small self-hosted collaborative development environment
+.SH SYNOPSIS
+.B tit
+[\fIOPTIONS\fR] \fICOMMAND\fR
+.SH DESCRIPTION
+.B tit
+runs one HTTP server, one SSH server, Git transport, collaboration workflows,
+backup, restore, and diagnostics in one executable.
+It does not require a Git executable at run time.
+.SH OPTIONS
+.TP
+.BR \-\-config " " \fIFILE\fR
+Read configuration from FILE.
+.TP
+.B \-\-user
+Read configuration from the XDG data directory.
+.TP
+.BR \-\-public\-url " " \fIURL\fR
+Override the canonical public URL.
+.TP
+.BR \-\-http\-listen " " \fIADDRESS\fR
+Override the HTTP listener address.
+.TP
+.BR \-\-ssh\-listen " " \fIADDRESS\fR
+Override the SSH listener address.
+.TP
+.BR \-\-ssh\-public\-host " " \fIHOST\fR
+Override the advertised SSH hostname.
+.TP
+.BR \-\-ssh\-public\-port " " \fIPORT\fR
+Override the public SSH port.
+.TP
+.BR \-h ", " \-\-help
+Print help.
+.TP
+.BR \-V ", " \-\-version
+Print the version.
+.SH COMMANDS
+.TP
+.B serve
+Start the HTTP and SSH servers.
+.TP
+.B invite-code
+Create a single-use signup invitation.
+.TP
+.B doctor
+Check the instance without changing it.
+Use
+.B \-\-backup FILE
+to also check a backup.
+.TP
+.B inspect
+Show an account, repository, or Git operation intent as JSON.
+.TP
+.B dump
+Write all SQLite rows as deterministic JSON Lines.
+.TP
+.B repair
+Run an explicit intent or quarantine repair operation.
+.TP
+.BR backup " " \fIFILE\fR
+Create an owner-only backup archive.
+.TP
+.BR restore " " \fIARCHIVE DIRECTORY\fR
+Restore an archive to an empty private directory.
+.TP
+.B setup
+Create the initial administrator.
+.TP
+.B admin
+Run an offline account, repository, or audit command.
+.SH SSH INTERFACE
+Run
+.B ssh -p 2222 tit.example help
+to show the commands that the built-in SSH server accepts.
+An invalid command returns a nonzero status and tells the user to run
+.BR help .
+.SH FILES
+.TP
+.B /srv/tit/config.toml
+Default system configuration.
+.TP
+.B /srv/tit/tit.sqlite3
+SQLite metadata database.
+.TP
+.B /srv/tit/repositories
+Bare Git repositories.
+.TP
+.B /srv/tit/ssh_host_ed25519_key
+Built-in SSH server host key.
+.SH SECURITY
+The instance directory and configuration must have owner-only permissions.
+Backups contain credentials.
+Store them as secrets.
+.SH SEE ALSO
+The release package contains install, upgrade, and disaster-recovery
+procedures in
+.BR share/doc/tit .

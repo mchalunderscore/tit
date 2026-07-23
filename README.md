@@ -7,6 +7,11 @@ services, authenticated SSH push, public feeds, and bounded source search.
 Read [PLAN.md](PLAN.md) for the product design and implementation gates. Read
 [CONTRIBUTING.md](CONTRIBUTING.md) before you change code.
 
+For a release installation, use the [installation procedure](docs/install.md).
+Also keep the [upgrade procedure](docs/upgrade.md) and the
+[disaster-recovery exercise](docs/disaster-recovery.md) with the instance
+operations documentation.
+
 ## Build
 
 Install the Rust toolchain that `rust-toolchain.toml` specifies. Then, run:
@@ -193,6 +198,9 @@ An authenticated account can create a repository with SSH:
 ```text
 ssh -p 2222 tit.example repo create project
 ```
+
+Run `ssh -p 2222 tit.example help` to list all SSH commands. A command that is
+not valid returns a nonzero status and tells the user to run `help`.
 
 The account that owns the SSH key becomes the repository owner. The SSH login
 name does not select the owner. New repositories use SHA-1 unless the command
@@ -665,3 +673,17 @@ This command tests structured HTTP, SSH, and lifecycle logs, request and
 operation IDs, fixed metrics, audit records, and secret redaction. Read the
 [observability architectural decision record](docs/adr/0032-observability.md)
 for the event and redaction contracts.
+
+## Milestone 6.6 gate
+
+Install stock Git, OpenSSH, and `ssh-keygen`. Then, run the release gate:
+
+```text
+./scripts/check-m6-6
+```
+
+This command runs the quality gate, creates and verifies the native release
+archive, damages and restores a disposable instance, and runs the process
+security and recovery tests with the packaged executable. Read the
+[release packaging architectural decision record](docs/adr/0033-release-packaging.md)
+for the artifact and platform gate contracts.

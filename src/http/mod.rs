@@ -306,11 +306,7 @@ fn router_with_state(state: WebState) -> Router {
         .merge(watches::routes())
         .merge(issues::routes())
         .merge(pull_requests::routes())
-        .merge(public::routes())
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            repository_actor,
-        ));
+        .merge(public::routes());
     Router::new()
         .route("/", get(home))
         .route("/healthz", get(health))
@@ -349,7 +345,9 @@ fn router_with_state(state: WebState) -> Router {
         )
         .route(
             "/logout",
-            axum::routing::post(logout).layer(DefaultBodyLimit::max(1024)),
+            get(logout_form)
+                .post(logout)
+                .layer(DefaultBodyLimit::max(1024)),
         )
         .route("/assets/style.css", get(style))
         .merge(feeds::routes())
@@ -357,6 +355,7 @@ fn router_with_state(state: WebState) -> Router {
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(RequestBodyLimitLayer::new(max_request_bytes))
+        .layer(middleware::from_fn_with_state(state.clone(), request_actor))
         .layer(middleware::from_fn_with_state(state.clone(), request_guard))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -426,7 +425,7 @@ fn allow_login_attempt(state: &WebState, peer: ClientAddress) -> bool {
     state.login_attempts.allow(peer.0)
 }
 
-async fn repository_actor(
+async fn request_actor(
     State(state): State<WebState>,
     mut request: Request,
     next: Next,
@@ -442,8 +441,51 @@ async fn repository_actor(
     next.run(request).await
 }
 
-async fn home(Extension(request_id): Extension<RequestId>) -> Response {
-    render_home(StatusCode::OK, &request_id.0, "", "", "")
+async fn home(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
+) -> Response {
+    let signed_in = actor.0.is_some();
+    let username = actor.0.clone().unwrap_or_default();
+    if state.repositories.is_none() {
+        return render_home(
+            StatusCode::OK,
+            &request_id.0,
+            HomePage {
+                owner: "",
+                repository: "",
+                error: "",
+                signed_in,
+                username: &username,
+                repositories: &[],
+            },
+        );
+    }
+    let result = repository_job(state, move |repositories| {
+        repositories.home(actor.0.as_deref())
+    })
+    .await;
+    match result {
+        Ok(repositories) => render_home(
+            StatusCode::OK,
+            &request_id.0,
+            HomePage {
+                owner: "",
+                repository: "",
+                error: "",
+                signed_in,
+                username: &username,
+                repositories: &repositories,
+            },
+        ),
+        Err(_) => render_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id.0,
+            "Home error",
+            "The repository overview could not be completed.",
+        ),
+    }
 }
 
 async fn health(State(state): State<WebState>) -> Response {
@@ -466,6 +508,7 @@ async fn health(State(state): State<WebState>) -> Response {
 
 async fn go_to_repository(
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     RawQuery(query): RawQuery,
 ) -> Response {
     match parse_location_query(query.as_deref()) {
@@ -481,18 +524,35 @@ async fn go_to_repository(
         Err(LocationQueryError { owner, repository }) => render_home(
             StatusCode::BAD_REQUEST,
             &request_id.0,
-            &owner,
-            &repository,
-            "Enter a valid lowercase owner and repository.",
+            HomePage {
+                owner: &owner,
+                repository: &repository,
+                error: "Enter a valid lowercase owner and repository.",
+                signed_in: actor.0.is_some(),
+                username: actor.0.as_deref().unwrap_or_default(),
+                repositories: &[],
+            },
         ),
     }
 }
 
-async fn signup_form(Extension(request_id): Extension<RequestId>) -> Response {
+async fn signup_form(
+    Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
+) -> Response {
+    if actor.0.is_some() {
+        return account_redirect();
+    }
     render_account_form(&request_id.0, AccountFormKind::Signup, "", "")
 }
 
-async fn recovery_form(Extension(request_id): Extension<RequestId>) -> Response {
+async fn recovery_form(
+    Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
+) -> Response {
+    if actor.0.is_some() {
+        return account_redirect();
+    }
     render_account_form(&request_id.0, AccountFormKind::Recovery, "", "")
 }
 
@@ -560,7 +620,13 @@ async fn recover(
     account_result(result, &request_id.0, AccountFormKind::Recovery, &username)
 }
 
-async fn login_form(Extension(request_id): Extension<RequestId>) -> Response {
+async fn login_form(
+    Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
+) -> Response {
+    if actor.0.is_some() {
+        return account_redirect();
+    }
     render(
         StatusCode::OK,
         &LoginTemplate {
@@ -568,6 +634,7 @@ async fn login_form(Extension(request_id): Extension<RequestId>) -> Response {
             username: "",
             error: "",
             has_error: false,
+            signed_in: false,
         },
     )
 }
@@ -604,6 +671,7 @@ async fn login_challenge(
                     public_key: &challenge.public_key,
                     challenge: &challenge.challenge,
                     login_csrf: &challenge.login_csrf,
+                    signed_in: false,
                 },
             );
             append_cookie(
@@ -865,6 +933,7 @@ async fn account_page(
                 username: &session.username,
                 administrator: session.is_administrator,
                 csrf: &csrf,
+                signed_in: true,
             },
         ),
         Err(_) => login_redirect(true),
@@ -964,6 +1033,35 @@ async fn create_repository(
 
 fn repository_form_error(request_id: &str, status: StatusCode, message: &str) -> Response {
     render_error(status, request_id, "Repository error", message)
+}
+
+async fn logout_form(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(session_token) = cookie(&headers, SESSION_COOKIE) else {
+        return login_redirect(false);
+    };
+    let Some(csrf) = cookie(&headers, CSRF_COOKIE) else {
+        return login_redirect(true);
+    };
+    let csrf_for_auth = csrf.clone();
+    let result = login_job(state, move |login| {
+        login.authenticate(&session_token, Some(&csrf_for_auth))
+    })
+    .await;
+    match result {
+        Ok(_) => render(
+            StatusCode::OK,
+            &LogoutTemplate {
+                request_id: &request_id.0,
+                csrf: &csrf,
+                signed_in: true,
+            },
+        ),
+        Err(_) => login_redirect(true),
+    }
 }
 
 async fn logout(
@@ -1155,6 +1253,15 @@ fn login_redirect(clear: bool) -> Response {
     response
 }
 
+fn account_redirect() -> Response {
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(header::LOCATION, "/account")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::empty())
+        .expect("the account redirect is valid")
+}
+
 fn login_error(request_id: &str, username: &str, error: &str) -> Response {
     render(
         StatusCode::BAD_REQUEST,
@@ -1163,6 +1270,7 @@ fn login_error(request_id: &str, username: &str, error: &str) -> Response {
             username,
             error,
             has_error: true,
+            signed_in: false,
         },
     )
 }
@@ -1222,6 +1330,7 @@ fn account_result(
             &RecoveryCodeTemplate {
                 request_id,
                 recovery: &recovery,
+                signed_in: false,
             },
         ),
         Err(AccountError::Store(StoreError::UsernameUnavailable(_))) => render_account_error(
@@ -1310,6 +1419,7 @@ fn render_account_error(
             error,
             has_error: !error.is_empty(),
             recovery: matches!(kind, AccountFormKind::Recovery),
+            signed_in: false,
         },
     )
 }
@@ -1355,8 +1465,8 @@ async fn method_not_allowed(
         "This page does not accept the request method.",
     );
     let allow = match uri.path() {
-        "/signup" | "/recover" | "/login" => "GET, HEAD, POST",
-        "/login/verify" | "/login/verify-file" | "/logout" => "POST",
+        "/signup" | "/recover" | "/login" | "/logout" => "GET, HEAD, POST",
+        "/login/verify" | "/login/verify-file" => "POST",
         path if path.ends_with("/git-upload-pack") => "POST",
         _ => "GET, HEAD",
     };
@@ -1446,23 +1556,38 @@ fn logged_method(method: &Method) -> &'static str {
     }
 }
 
-fn render_home(
-    status: StatusCode,
-    request_id: &str,
-    owner: &str,
-    repository: &str,
-    error: &str,
-) -> Response {
+fn render_home(status: StatusCode, request_id: &str, page: HomePage<'_>) -> Response {
     render(
         status,
         &HomeTemplate {
             request_id,
-            owner,
-            repository,
-            error,
-            has_error: !error.is_empty(),
+            owner: page.owner,
+            repository: page.repository,
+            error: page.error,
+            has_error: !page.error.is_empty(),
+            signed_in: page.signed_in,
+            username: page.username,
+            repositories: page
+                .repositories
+                .iter()
+                .map(|repository| HomeRepositoryView {
+                    owner: &repository.owner,
+                    slug: &repository.slug,
+                    visibility: &repository.visibility,
+                    updated_at: repository.updated_at,
+                })
+                .collect(),
         },
     )
+}
+
+struct HomePage<'a> {
+    owner: &'a str,
+    repository: &'a str,
+    error: &'a str,
+    signed_in: bool,
+    username: &'a str,
+    repositories: &'a [crate::store::HomeRepositoryRecord],
 }
 
 fn render_error(status: StatusCode, request_id: &str, heading: &str, message: &str) -> Response {
@@ -1472,6 +1597,7 @@ fn render_error(status: StatusCode, request_id: &str, heading: &str, message: &s
             request_id,
             status: heading,
             message,
+            signed_in: false,
         },
     )
 }
@@ -1550,6 +1676,16 @@ struct HomeTemplate<'a> {
     repository: &'a str,
     error: &'a str,
     has_error: bool,
+    signed_in: bool,
+    username: &'a str,
+    repositories: Vec<HomeRepositoryView<'a>>,
+}
+
+struct HomeRepositoryView<'a> {
+    owner: &'a str,
+    slug: &'a str,
+    visibility: &'a str,
+    updated_at: i64,
 }
 
 #[derive(Template)]
@@ -1558,6 +1694,7 @@ struct ErrorTemplate<'a> {
     request_id: &'a str,
     status: &'a str,
     message: &'a str,
+    signed_in: bool,
 }
 
 #[derive(Template)]
@@ -1568,6 +1705,7 @@ struct AccountFormTemplate<'a> {
     error: &'a str,
     has_error: bool,
     recovery: bool,
+    signed_in: bool,
 }
 
 #[derive(Template)]
@@ -1575,6 +1713,7 @@ struct AccountFormTemplate<'a> {
 struct RecoveryCodeTemplate<'a> {
     request_id: &'a str,
     recovery: &'a str,
+    signed_in: bool,
 }
 
 #[derive(Template)]
@@ -1584,6 +1723,7 @@ struct LoginTemplate<'a> {
     username: &'a str,
     error: &'a str,
     has_error: bool,
+    signed_in: bool,
 }
 
 #[derive(Template)]
@@ -1594,6 +1734,7 @@ struct LoginChallengeTemplate<'a> {
     public_key: &'a str,
     challenge: &'a str,
     login_csrf: &'a str,
+    signed_in: bool,
 }
 
 #[derive(Template)]
@@ -1603,6 +1744,15 @@ struct AccountTemplate<'a> {
     username: &'a str,
     administrator: bool,
     csrf: &'a str,
+    signed_in: bool,
+}
+
+#[derive(Template)]
+#[template(path = "logout.html")]
+struct LogoutTemplate<'a> {
+    request_id: &'a str,
+    csrf: &'a str,
+    signed_in: bool,
 }
 
 #[derive(Debug, Error)]

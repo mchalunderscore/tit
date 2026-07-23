@@ -1,7 +1,23 @@
 {% extends "base.html" %}
-{% block title %}Repositories · tit{% endblock %}
+{% block title %}{% if signed_in %}{{ username }}{% else %}Repositories{% endif %} · tit{% endblock %}
 {% block content %}
-  <h1>Repositories</h1>
+{% if signed_in %}
+  <h1>{{ username }}</h1>
+  <p><a href="/account">Open your account profile</a>.</p>
+  <h2>Your repositories</h2>
+{% else %}
+  <h1>Recently updated public repositories</h1>
+{% endif %}
+{% if repositories.is_empty() %}
+  <p>No repositories are available.</p>
+{% else %}
+  <ul>
+  {% for item in repositories %}
+    <li><a href="/{{ item.owner }}/{{ item.slug }}">{{ item.owner }}/{{ item.slug }}</a> · {{ item.visibility }} · updated <time>{{ item.updated_at }}</time></li>
+  {% endfor %}
+  </ul>
+{% endif %}
+  <h2>Open a repository</h2>
   <p>Enter an owner and a repository to open its public page.</p>
 {% if has_error %}
   <p class="error" role="alert">{{ error }}</p>

@@ -1,0 +1,9 @@
+#!/bin/ksh
+
+daemon="/usr/local/bin/tit"
+daemon_user="_tit"
+daemon_flags="--config /srv/tit/config.toml serve"
+
+. /etc/rc.d/rc.subr
+
+rc_cmd "$1"

@@ -28,6 +28,7 @@ use crate::store::{Store, StoreError};
 use crate::telemetry::Telemetry;
 
 const VERSION_COMMAND: &[u8] = b"tit --version";
+const HELP_COMMAND: &[u8] = b"help";
 const GIT_PROTOCOL_VARIABLE: &str = "GIT_PROTOCOL";
 const MAX_RECEIVE_PACK_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_REPOSITORY_COMMAND_BYTES: usize = 512;
@@ -42,6 +43,18 @@ const ISSUE_LIST_USAGE: &str = "issue list OWNER/REPOSITORY [--output human|json
 const ISSUE_CREATE_USAGE: &str = "issue create OWNER/REPOSITORY [--output human|json]";
 const PULL_REQUEST_CHECKOUT_USAGE: &str =
     "pr checkout OWNER/REPOSITORY NUMBER [--output human|json]";
+const HELP_TEXT: &str = "\
+Available tit SSH commands:
+  help
+  tit --version
+  repo create NAME [--object-format sha1|sha256] [--output human|json]
+  issue list OWNER/REPOSITORY [--output human|json]
+  issue create OWNER/REPOSITORY [--output human|json]
+  pr checkout OWNER/REPOSITORY NUMBER [--output human|json]
+
+Git clients can also use git-upload-pack and git-receive-pack.
+";
+const HELP_GUIDANCE: &str = "Use 'help' to list the available commands.";
 
 pub(crate) struct RunningSshServer {
     address: SocketAddr,
@@ -580,6 +593,11 @@ impl Handler for SshSession {
             session.exit_status_request(channel, 0)?;
             session.eof(channel)?;
             session.close(channel)?;
+        } else if command == HELP_COMMAND {
+            self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
+            session.channel_success(channel)?;
+            session.data(channel, HELP_TEXT.as_bytes())?;
+            finish_git_channel(channel, 0, session)?;
         } else if is_repository_command(command) {
             self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
             session.channel_success(channel)?;
@@ -702,9 +720,25 @@ impl Handler for SshSession {
                     }
                 }
             } else {
-                self.audit.rejected_exec.fetch_add(1, Ordering::Relaxed);
-                session.channel_failure(channel)?;
-                session.close(channel)?;
+                self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
+                session.channel_success(channel)?;
+                if requests_json(command) {
+                    session.data(
+                        channel,
+                        json_line(serde_json::json!({
+                            "version": 1,
+                            "status": "error",
+                            "error": { "code": "invalid-command" },
+                        })),
+                    )?;
+                } else {
+                    session.extended_data(
+                        channel,
+                        1,
+                        format!("tit: The command is not valid.\n{HELP_GUIDANCE}\n").into_bytes(),
+                    )?;
+                }
+                finish_git_channel(channel, 1, session)?;
             }
         }
         Ok(())
@@ -1083,7 +1117,9 @@ fn repository_command_error_code(error: &RepositoryCommandError) -> &'static str
 
 fn repository_command_error_message(error: &RepositoryCommandError) -> String {
     match repository_command_error_code(error) {
-        "invalid-command" => format!("usage: {REPOSITORY_CREATE_USAGE}"),
+        "invalid-command" => {
+            format!("usage: {REPOSITORY_CREATE_USAGE}\n{HELP_GUIDANCE}")
+        }
         "repository-exists" => "A repository with this name already exists.".to_owned(),
         "invalid-name" => "The repository name is not valid.".to_owned(),
         "account-unavailable" => "The account is not active.".to_owned(),
@@ -1430,7 +1466,9 @@ fn issue_command_error_code(error: &IssueCommandError) -> &'static str {
 
 fn issue_command_error_message(error: &IssueCommandError) -> String {
     match issue_command_error_code(error) {
-        "invalid-command" => format!("usage: {ISSUE_LIST_USAGE} or {ISSUE_CREATE_USAGE}"),
+        "invalid-command" => {
+            format!("usage: {ISSUE_LIST_USAGE} or {ISSUE_CREATE_USAGE}\n{HELP_GUIDANCE}")
+        }
         "invalid-input" => {
             "The first input line must be a valid title. The remaining input is the body."
                 .to_owned()
@@ -1604,7 +1642,9 @@ fn pull_request_command_error_code(error: &PullRequestCommandError) -> &'static 
 
 fn pull_request_command_error_message(error: &PullRequestCommandError) -> String {
     match pull_request_command_error_code(error) {
-        "invalid-command" => format!("usage: {PULL_REQUEST_CHECKOUT_USAGE}"),
+        "invalid-command" => {
+            format!("usage: {PULL_REQUEST_CHECKOUT_USAGE}\n{HELP_GUIDANCE}")
+        }
         "pull-request-unavailable" => "The pull request is not available.".to_owned(),
         "invalid-target" => "The pull-request target is not valid.".to_owned(),
         "service-unavailable" => "The pull-request service is not available.".to_owned(),

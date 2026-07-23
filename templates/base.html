@@ -13,9 +13,14 @@
     <nav aria-label="Primary">
       <a href="/">Home</a>
       <a href="/search">Search</a>
+{% if signed_in %}
+      <a href="/account">Account</a>
+      <a href="/logout">Log out</a>
+{% else %}
       <a href="/signup">Create account</a>
       <a href="/recover">Recover account</a>
       <a href="/login">Log in</a>
+{% endif %}
     </nav>
   </header>
   <main id="main">

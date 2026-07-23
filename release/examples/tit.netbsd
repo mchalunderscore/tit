@@ -1,0 +1,17 @@
+#!/bin/sh
+
+# PROVIDE: tit
+# REQUIRE: DAEMON NETWORKING
+# KEYWORD: shutdown
+
+$_rc_subr_loaded . /etc/rc.subr
+
+name="tit"
+rcvar="$name"
+command="/usr/local/bin/tit"
+command_args="--config /srv/tit/config.toml serve"
+command_user="tit"
+required_files="/srv/tit/config.toml"
+
+load_rc_config "$name"
+run_rc_command "$1"

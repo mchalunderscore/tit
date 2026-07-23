@@ -65,6 +65,7 @@ async fn feed_tokens(
             StatusCode::OK,
             &FeedTokensTemplate {
                 request_id: &request_id.0,
+                signed_in: true,
                 csrf: &csrf,
                 tokens: tokens.iter().map(token_view).collect(),
             },
@@ -244,6 +245,7 @@ fn issued_response(result: Result<IssuedFeedToken, FeedTokenError>, request_id: 
             StatusCode::CREATED,
             &IssuedFeedTokenTemplate {
                 request_id,
+                signed_in: true,
                 token: &issued.token,
                 scope: scope_label(&issued.record.scope),
                 target: token_target(&issued.record),
@@ -354,6 +356,7 @@ struct FeedTokenView<'a> {
 #[template(path = "feed-tokens.html")]
 struct FeedTokensTemplate<'a> {
     request_id: &'a str,
+    signed_in: bool,
     csrf: &'a str,
     tokens: Vec<FeedTokenView<'a>>,
 }
@@ -362,6 +365,7 @@ struct FeedTokensTemplate<'a> {
 #[template(path = "feed-token-issued.html")]
 struct IssuedFeedTokenTemplate<'a> {
     request_id: &'a str,
+    signed_in: bool,
     token: &'a str,
     scope: &'static str,
     target: String,

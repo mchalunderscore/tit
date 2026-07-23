@@ -21,8 +21,9 @@ async fn search(
     Extension(actor): Extension<RequestActor>,
     Query(query): Query<SearchQuery>,
 ) -> Response {
+    let signed_in = actor.0.is_some();
     let Some(value) = query.q else {
-        return search_page(&request_id.0, "", None);
+        return search_page(&request_id.0, "", None, signed_in);
     };
     let Some(service) = state.search.clone() else {
         return search_internal(&request_id.0);
@@ -33,7 +34,7 @@ async fn search(
     })
     .await;
     match result {
-        Ok(outcome) => search_page(&request_id.0, &value, Some(outcome)),
+        Ok(outcome) => search_page(&request_id.0, &value, Some(outcome), signed_in),
         Err(MetadataSearchError::InvalidQuery | MetadataSearchError::Auth(_)) => render_error(
             StatusCode::BAD_REQUEST,
             &request_id.0,
@@ -67,6 +68,7 @@ fn search_page(
     request_id: &str,
     query: &str,
     outcome: Option<crate::search::MetadataSearchOutcome>,
+    signed_in: bool,
 ) -> Response {
     let searched = outcome.is_some();
     let (rows_scanned, bytes_scanned, truncated, results) = outcome.map_or_else(
@@ -85,6 +87,7 @@ fn search_page(
         StatusCode::OK,
         &MetadataSearchTemplate {
             request_id,
+            signed_in,
             query,
             searched,
             rows_scanned,
@@ -131,6 +134,7 @@ struct MetadataSearchResultView<'a> {
 #[template(path = "metadata-search.html")]
 struct MetadataSearchTemplate<'a> {
     request_id: &'a str,
+    signed_in: bool,
     query: &'a str,
     searched: bool,
     rows_scanned: usize,

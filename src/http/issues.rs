@@ -77,6 +77,7 @@ async fn issue_list(
                 StatusCode::OK,
                 &IssueListTemplate {
                     request_id: &request_id.0,
+                    signed_in: authenticated,
                     owner: &record.owner,
                     repository: &record.slug,
                     issues: issues
@@ -360,6 +361,7 @@ fn render_issue(request_id: &str, headers: &HeaderMap, detail: &IssueDetail) -> 
         StatusCode::OK,
         &IssueTemplate {
             request_id,
+            signed_in: !csrf.is_empty(),
             owner: &detail.repository.owner,
             repository: &detail.repository.slug,
             number: detail.issue.number,
@@ -508,6 +510,7 @@ struct IssuePath {
 #[template(path = "issues.html")]
 struct IssueListTemplate<'a> {
     request_id: &'a str,
+    signed_in: bool,
     owner: &'a str,
     repository: &'a str,
     issues: Vec<IssueListItem<'a>>,
@@ -527,6 +530,7 @@ struct IssueListItem<'a> {
 #[template(path = "issue.html")]
 struct IssueTemplate<'a> {
     request_id: &'a str,
+    signed_in: bool,
     owner: &'a str,
     repository: &'a str,
     number: i64,

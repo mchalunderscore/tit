@@ -55,6 +55,7 @@ async fn pull_request_list(
     };
     let owner = path.owner.clone();
     let repository = path.repository.clone();
+    let signed_in = actor.0.is_some();
     let result = job(state, move || {
         service.list(&owner, &repository, actor.0.as_deref())
     })
@@ -66,6 +67,7 @@ async fn pull_request_list(
                 StatusCode::OK,
                 &PullRequestListTemplate {
                     request_id: &request_id.0,
+                    signed_in,
                     owner: &record.owner,
                     repository: &record.slug,
                     pull_requests: pull_requests
@@ -100,6 +102,7 @@ async fn pull_request_detail(
     };
     let owner = path.owner.clone();
     let repository = path.repository.clone();
+    let signed_in = actor.0.is_some();
     let result = job(state, move || {
         service.compare(
             &owner,
@@ -119,6 +122,7 @@ async fn pull_request_detail(
                 StatusCode::OK,
                 &PullRequestTemplate {
                     request_id: &request_id.0,
+                    signed_in,
                     owner: &detail.repository.owner,
                     repository: &detail.repository.slug,
                     pull_request,
@@ -505,6 +509,7 @@ struct RevisionQuery {
 #[template(path = "pull_requests.html")]
 struct PullRequestListTemplate<'a> {
     request_id: &'a str,
+    signed_in: bool,
     owner: &'a str,
     repository: &'a str,
     pull_requests: Vec<PullRequestListItem<'a>>,
@@ -524,6 +529,7 @@ struct PullRequestListItem<'a> {
 #[template(path = "pull_request.html")]
 struct PullRequestTemplate<'a> {
     request_id: &'a str,
+    signed_in: bool,
     owner: &'a str,
     repository: &'a str,
     pull_request: &'a crate::store::PullRequestRecord,

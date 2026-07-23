@@ -4,6 +4,7 @@
 )]
 mod support;
 
+use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -79,7 +80,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
 
     let backup_directory = TempDir::new().expect("create a backup directory");
     let backup = backup_directory.path().join("instance.tar");
-    let backup_output = Command::new(env!("CARGO_BIN_EXE_tit"))
+    let backup_output = Command::new(tit_binary())
         .args([
             "--config",
             config.to_str().expect("a UTF-8 configuration path"),
@@ -106,7 +107,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     let restored = TempDir::new().expect("create a restore target");
     fs::set_permissions(restored.path(), fs::Permissions::from_mode(0o700))
         .expect("make the restore target private");
-    let restore_output = Command::new(env!("CARGO_BIN_EXE_tit"))
+    let restore_output = Command::new(tit_binary())
         .args([
             "restore",
             backup.to_str().expect("a UTF-8 backup path"),
@@ -144,7 +145,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     assert!(restored_readme.status.success());
     assert_eq!(restored_readme.stdout, b"serve fixture\n");
 
-    let second = Command::new(env!("CARGO_BIN_EXE_tit"))
+    let second = Command::new(tit_binary())
         .args([
             "--config",
             config.to_str().expect("a UTF-8 configuration path"),
@@ -164,6 +165,17 @@ fn serves_an_imported_repository_through_http_and_ssh() {
             & 0o777,
         0o600
     );
+
+    let anonymous_home = http_get(http, "/");
+    assert!(
+        anonymous_home.contains("Recently updated public repositories"),
+        "anonymous home response:\n{anonymous_home}"
+    );
+    assert!(anonymous_home.contains(">alice/example</a>"));
+    assert!(anonymous_home.contains("<a href=\"/signup\">Create account</a>"));
+    assert!(anonymous_home.contains("<a href=\"/recover\">Recover account</a>"));
+    assert!(anonymous_home.contains("<a href=\"/login\">Log in</a>"));
+    assert!(!anonymous_home.contains("<a href=\"/account\">Account</a>"));
 
     let login_challenge = http_form(
         http,
@@ -213,8 +225,31 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     let account = http_get_with_headers(http, "/account", &[("Cookie", &cookies)]);
     assert!(account.starts_with("HTTP/1.1 200"));
     assert!(account.contains("<dd>alice</dd>"));
+    assert!(account.contains("<a href=\"/account\">Account</a>"));
+    assert!(account.contains("<a href=\"/logout\">Log out</a>"));
+    assert!(!account.contains("<a href=\"/login\">Log in</a>"));
+    assert!(!account.contains("<a href=\"/signup\">Create account</a>"));
+    assert!(!account.contains("<a href=\"/recover\">Recover account</a>"));
     assert!(account.contains("action=\"/account/repositories\""));
+    for path in ["/login", "/signup", "/recover"] {
+        let response = http_get_with_headers(http, path, &[("Cookie", &cookies)]);
+        assert!(response.starts_with("HTTP/1.1 303"));
+        assert_eq!(response_header(&response, "location"), "/account");
+    }
+    let signed_in_home = http_get_with_headers(http, "/", &[("Cookie", &cookies)]);
+    assert!(signed_in_home.contains("<h1>alice</h1>"));
+    assert!(signed_in_home.contains("<h2>Your repositories</h2>"));
+    assert!(signed_in_home.contains(">alice/example</a>"));
+    assert!(signed_in_home.contains("<a href=\"/account\">Account</a>"));
+    assert!(signed_in_home.contains("<a href=\"/logout\">Log out</a>"));
+    assert!(!signed_in_home.contains("<a href=\"/signup\">Create account</a>"));
+    assert!(!signed_in_home.contains("<a href=\"/recover\">Recover account</a>"));
+    assert!(!signed_in_home.contains("<a href=\"/login\">Log in</a>"));
     let csrf = cookie_value(&cookies, "tit-csrf");
+    let logout_page = http_get_with_headers(http, "/logout", &[("Cookie", &cookies)]);
+    assert!(logout_page.starts_with("HTTP/1.1 200"));
+    assert!(logout_page.contains("<form method=\"post\" action=\"/logout\">"));
+    assert!(logout_page.contains(&format!("name=\"csrf\" value=\"{csrf}\"")));
     let rejected_repository = http_form_with_headers(
         http,
         "/account/repositories",
@@ -326,7 +361,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         .expect("make the repository public");
     drop(database);
 
-    let invitation_output = Command::new(env!("CARGO_BIN_EXE_tit"))
+    let invitation_output = Command::new(tit_binary())
         .args([
             "--config",
             config.to_str().expect("a UTF-8 configuration path"),
@@ -485,7 +520,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         b"serve fixture\n"
     );
 
-    let locked = Command::new(env!("CARGO_BIN_EXE_tit"))
+    let locked = Command::new(tit_binary())
         .args([
             "--config",
             config.to_str().expect("a UTF-8 configuration path"),
@@ -1335,7 +1370,7 @@ fn enforces_account_roles_and_ref_policy_through_the_production_ssh_server() {
 }
 
 fn spawn_server(config: &Path) -> ChildGuard {
-    let child = Command::new(env!("CARGO_BIN_EXE_tit"))
+    let child = Command::new(tit_binary())
         .args([
             "--config",
             config.to_str().expect("a UTF-8 configuration path"),
@@ -1391,9 +1426,9 @@ fn create_source_repository(parent: &Path) -> std::path::PathBuf {
 
 fn command<const N: usize>(directory: &Path, arguments: [&str; N]) {
     let executable = if matches!(arguments.first(), Some(&"--config")) {
-        env!("CARGO_BIN_EXE_tit")
+        tit_binary()
     } else {
-        "git"
+        "git".into()
     };
     let output = Command::new(executable)
         .args(arguments)
@@ -1405,6 +1440,12 @@ fn command<const N: usize>(directory: &Path, arguments: [&str; N]) {
         "fixture command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn tit_binary() -> std::path::PathBuf {
+    env::var_os("TIT_RELEASE_BINARY")
+        .map(Into::into)
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_tit").into())
 }
 
 fn wait_for_listener(address: SocketAddr, server: &mut ChildGuard) {

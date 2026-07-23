@@ -1,0 +1,44 @@
+#compdef tit
+
+_tit()
+{
+  local -a commands
+  commands=(
+    'serve:Start the HTTP and SSH servers'
+    'invite-code:Create a single-use signup invitation'
+    'doctor:Check the instance without changing it'
+    'inspect:Show one typed instance record as JSON'
+    'dump:Write all SQLite rows as deterministic JSON Lines'
+    'repair:Run an explicit repair operation'
+    'backup:Create a backup archive'
+    'restore:Restore a backup archive to an empty instance directory'
+    'setup:Set up an uninitialized instance'
+    'admin:Run an offline administrator command'
+  )
+
+  _arguments \
+    '--config[Read configuration from a file]:configuration file:_files' \
+    '--user[Read configuration from the XDG data directory]' \
+    '--public-url[Override the canonical public URL]:URL:' \
+    '--http-listen[Override the HTTP listener address]:address:' \
+    '--ssh-listen[Override the SSH listener address]:address:' \
+    '--ssh-public-host[Override the advertised SSH hostname]:host:' \
+    '--ssh-public-port[Override the public SSH port]:port:' \
+    '(-h --help)'{-h,--help}'[Print help]' \
+    '(-V --version)'{-V,--version}'[Print the version]' \
+    '1:command:->command' \
+    '*::argument:->arguments'
+
+  case $state in
+    command)
+      _describe 'command' commands
+      ;;
+    arguments)
+      case $words[1] in
+        backup|restore) _files ;;
+      esac
+      ;;
+  esac
+}
+
+_tit "$@"

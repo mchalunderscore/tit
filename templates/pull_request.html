@@ -3,13 +3,7 @@
 {% block content %}
   <header class="repository-header">
     <h1><a href="/{{ owner }}/{{ repository }}">{{ owner }}/{{ repository }}</a></h1>
-    <nav aria-label="Repository">
-      <a href="/{{ owner }}/{{ repository }}">Summary</a>
-      <a href="/{{ owner }}/{{ repository }}/refs">Refs</a>
-      <a href="/{{ owner }}/{{ repository }}/issues">Issues</a>
-      <a href="/{{ owner }}/{{ repository }}/pulls">Pull requests</a>
-      <a href="/{{ owner }}/{{ repository }}/watch">Watch</a>
-    </nav>
+{% include "repository-nav.html" %}
   </header>
 
   <article>

@@ -1,0 +1,21 @@
+#!/bin/sh
+
+# PROVIDE: tit
+# REQUIRE: LOGIN NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="tit"
+rcvar="tit_enable"
+load_rc_config "$name"
+
+: "${tit_enable:=NO}"
+: "${tit_config:=/srv/tit/config.toml}"
+: "${tit_user:=tit}"
+
+command="/usr/sbin/daemon"
+command_args="-r -S -T tit -u ${tit_user} -p /var/run/tit.pid -f /usr/local/bin/tit --config ${tit_config} serve"
+pidfile="/var/run/tit.pid"
+
+run_rc_command "$1"
