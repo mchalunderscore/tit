@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+./scripts/check
+cargo test --locked --release --test git_push_ssh
+cargo test --locked --release --test pull_requests
+cargo test --locked --release --test public_routes runs_the_complete_issue_workflow_without_javascript
+cargo test --locked --release --test serve creates_owned_repositories_with_stable_ssh_command_output
+cargo test --locked --release --test sqlite migrates_each_committed_historical_fixture

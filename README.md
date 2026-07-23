@@ -463,3 +463,16 @@ output, repository read permission, and the returned stock Git fetch and
 checkout commands. Read the
 [SSH pull-request checkout architectural decision record](docs/adr/0027-ssh-pull-request-checkout.md)
 for the command, output, permission, and error contracts.
+
+## Milestone 5 gate
+
+Install stock Git and stock OpenSSH. Then, run the collaboration gate:
+
+```text
+./scripts/check-m5
+```
+
+This command tests branch pushes, pull-request revisions, anchored reviews,
+merges, concurrent ref updates, and recovery after an interrupted ref update.
+It also tests the Web workflow, the SSH checkout command, and historical schema
+migration.
