@@ -10,7 +10,7 @@ use std::{env, ffi::OsString, fs};
 
 use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
 use store::{
-    GitOperationIntent, InitialAdministrator, NewRepository, NewRepositoryReference,
+    GitOperationIntent, InitialAdministrator, NewAuditEvent, NewRepository, NewRepositoryReference,
     RepositoryOrigin, Store, StoreError,
 };
 use tempfile::TempDir;
@@ -26,6 +26,12 @@ const V8_FIXTURE: &str = concat!(
     include_str!("fixtures/sqlite/v7.sql"),
     include_str!("../src/store/migrations/008_web_sessions.sql"),
     "PRAGMA user_version = 8;\n",
+);
+const V9_FIXTURE: &str = concat!(
+    include_str!("fixtures/sqlite/v7.sql"),
+    include_str!("../src/store/migrations/008_web_sessions.sql"),
+    include_str!("../src/store/migrations/009_repository_authorization.sql"),
+    "PRAGMA user_version = 9;\n",
 );
 
 fn database(directory: &TempDir, name: &str) -> std::path::PathBuf {
@@ -144,7 +150,7 @@ fn configures_connections_and_creates_the_current_schema() {
     let directory = TempDir::new().expect("create a temporary directory");
     let store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
 
-    assert_eq!(store.schema_version().expect("read the schema version"), 9);
+    assert_eq!(store.schema_version().expect("read the schema version"), 10);
     assert_eq!(
         store
             .connection()
@@ -333,6 +339,8 @@ fn creates_renames_archives_and_reads_owned_repositories() {
         created_at: 20,
         origin: RepositoryOrigin::Imported,
         initial_references: &initial_references,
+        actor: "admin-cli",
+        correlation_id: "test-create",
     };
     store
         .create_repository(&repository)
@@ -383,6 +391,11 @@ fn creates_renames_archives_and_reads_owned_repositories() {
     store
         .complete_git_intent(push.id)
         .expect("complete a managed push");
+    assert!(
+        store
+            .git_intent_completed(push.id)
+            .expect("read the completed intent")
+    );
     let (_, pushed_events) = store
         .public_repository_events("alice", "project", None, 10)
         .expect("read pushed repository events");
@@ -393,6 +406,30 @@ fn creates_renames_archives_and_reads_owned_repositories() {
         Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     );
     assert_eq!(pushed_events[1].kind, "push");
+    let audits = store.audit_events(10).expect("read audit history");
+    assert_eq!(audits.len(), 2);
+    assert_eq!(audits[0].action, "ref.update");
+    assert_eq!(audits[0].actor, "alice");
+    assert_eq!(audits[0].target, repository.id);
+    assert_eq!(audits[0].outcome, "success");
+    assert_eq!(audits[0].correlation_id, push.id);
+    assert_eq!(audits[1].action, "repository.import");
+    assert_eq!(audits[1].created_at, 20);
+    assert!(matches!(store.audit_events(0), Err(StoreError::AuditLimit)));
+    store
+        .record_audit_event(&NewAuditEvent {
+            action: "repository.rename",
+            actor: "admin-cli",
+            target: "alice/missing",
+            outcome: "failure",
+            correlation_id: "test-failure",
+            created_at: 22,
+        })
+        .expect("record an audit failure");
+    assert_eq!(
+        store.audit_events(1).expect("read the newest audit event")[0].outcome,
+        "failure"
+    );
 
     assert!(matches!(
         store.create_repository(&repository),
@@ -415,6 +452,8 @@ fn creates_renames_archives_and_reads_owned_repositories() {
         created_at: 20,
         origin: RepositoryOrigin::Created,
         initial_references: &[],
+        actor: "admin-cli",
+        correlation_id: "test-missing",
     };
     assert!(matches!(
         store.create_repository(&missing_owner),
@@ -422,14 +461,21 @@ fn creates_renames_archives_and_reads_owned_repositories() {
     ));
 
     store
-        .rename_repository("alice", "project", "renamed")
+        .rename_repository(
+            "alice",
+            "project",
+            "renamed",
+            25,
+            "admin-cli",
+            "test-rename",
+        )
         .expect("rename a repository");
     assert!(matches!(
         store.repository("alice", "project"),
         Err(StoreError::RepositoryNotFound(_, _))
     ));
     store
-        .archive_repository("alice", "renamed", 30)
+        .archive_repository("alice", "renamed", 30, "admin-cli", "test-archive")
         .expect("archive a repository");
     let archived = store
         .repository("alice", "renamed")
@@ -437,11 +483,18 @@ fn creates_renames_archives_and_reads_owned_repositories() {
     assert_eq!(archived.state, "archived");
     assert_eq!(archived.archived_at, Some(30));
     assert!(matches!(
-        store.archive_repository("alice", "renamed", 31),
+        store.archive_repository("alice", "renamed", 31, "admin-cli", "test-archive-fail"),
         Err(StoreError::RepositoryArchived(_, _))
     ));
     assert!(matches!(
-        store.rename_repository("alice", "renamed", "again"),
+        store.rename_repository(
+            "alice",
+            "renamed",
+            "again",
+            32,
+            "admin-cli",
+            "test-rename-fail"
+        ),
         Err(StoreError::RepositoryArchived(_, _))
     ));
 }
@@ -782,13 +835,14 @@ fn migrates_each_committed_historical_fixture() {
         (V6_FIXTURE, 6),
         (V7_FIXTURE, 7),
         (V8_FIXTURE, 8),
+        (V9_FIXTURE, 9),
     ] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "tit.sqlite3");
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
-        assert_eq!(store.schema_version().expect("read the schema version"), 9);
+        assert_eq!(store.schema_version().expect("read the schema version"), 10);
         store.integrity_check().expect("check migrated integrity");
         let state: String = store
             .connection()
@@ -854,7 +908,7 @@ fn backfills_repository_events_when_version_five_is_migrated() {
 
 #[test]
 fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
-    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 9)] {
+    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 10)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "fixture.sqlite");
         create_fixture(&path, V1_FIXTURE);

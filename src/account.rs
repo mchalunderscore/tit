@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::auth::{AuthError, SshPublicKey, validate_username};
-use crate::store::{AccountRecovery, InvitedAccount, NewSshKey, Store, StoreError};
+use crate::store::{AccountRecovery, InvitedAccount, NewAuditEvent, NewSshKey, Store, StoreError};
 
 const INVITATION_PREFIX: &str = "tit-invite-v1:";
 const RECOVERY_PREFIX: &str = "tit-recovery-v1:";
@@ -38,19 +38,32 @@ impl AccountService {
         invitation: &str,
         username: &str,
         public_key: &str,
+        correlation_id: &str,
     ) -> Result<String, AccountError> {
         validate_username(username)?;
         require_secret(invitation, INVITATION_PREFIX)?;
         let key = SshPublicKey::parse(public_key)?;
         let recovery = random_secret(RECOVERY_PREFIX)?;
+        let created_at = now()?;
         let mut store = Store::open(&self.database)?;
-        store.create_account_with_invitation(&InvitedAccount {
+        let result = store.create_account_with_invitation(&InvitedAccount {
             invitation_hash: &hash(invitation),
             username,
             key: new_key(&key, "initial"),
             recovery_hash: &hash(&recovery),
-            created_at: now()?,
-        })?;
+            created_at,
+            correlation_id,
+        });
+        if let Err(error) = result {
+            self.audit_failure(
+                "account.signup",
+                username,
+                username,
+                correlation_id,
+                created_at,
+            )?;
+            return Err(error.into());
+        }
         Ok(recovery)
     }
 
@@ -59,19 +72,32 @@ impl AccountService {
         username: &str,
         recovery: &str,
         public_key: &str,
+        correlation_id: &str,
     ) -> Result<String, AccountError> {
         validate_username(username)?;
         require_secret(recovery, RECOVERY_PREFIX)?;
         let key = SshPublicKey::parse(public_key)?;
         let replacement = random_secret(RECOVERY_PREFIX)?;
+        let created_at = now()?;
         let mut store = Store::open(&self.database)?;
-        store.recover_account(&AccountRecovery {
+        let result = store.recover_account(&AccountRecovery {
             username,
             old_recovery_hash: &hash(recovery),
             key: new_key(&key, "recovery"),
             new_recovery_hash: &hash(&replacement),
-            created_at: now()?,
-        })?;
+            created_at,
+            correlation_id,
+        });
+        if let Err(error) = result {
+            self.audit_failure(
+                "account.recover",
+                username,
+                username,
+                correlation_id,
+                created_at,
+            )?;
+            return Err(error.into());
+        }
         Ok(replacement)
     }
 
@@ -80,23 +106,94 @@ impl AccountService {
         username: &str,
         label: &str,
         public_key: &str,
+        actor: &str,
+        correlation_id: &str,
     ) -> Result<String, AccountError> {
         validate_username(username)?;
         validate_label(label)?;
         let key = SshPublicKey::parse(public_key)?;
-        Store::open(&self.database)?.add_account_key(username, &new_key(&key, label), now()?)?;
+        let created_at = now()?;
+        let mut store = Store::open(&self.database)?;
+        if let Err(error) = store.add_account_key(
+            username,
+            &new_key(&key, label),
+            created_at,
+            actor,
+            correlation_id,
+        ) {
+            let target = format!("{username}:{}", key.fingerprint());
+            self.audit_failure("key.add", actor, &target, correlation_id, created_at)?;
+            return Err(error.into());
+        }
         Ok(key.fingerprint().to_owned())
     }
 
-    pub(crate) fn revoke_key(&self, username: &str, fingerprint: &str) -> Result<(), AccountError> {
+    pub(crate) fn revoke_key(
+        &self,
+        username: &str,
+        fingerprint: &str,
+        actor: &str,
+        correlation_id: &str,
+    ) -> Result<(), AccountError> {
         validate_username(username)?;
-        Store::open(&self.database)?.revoke_account_key(username, fingerprint, now()?)?;
+        let changed_at = now()?;
+        let mut store = Store::open(&self.database)?;
+        if let Err(error) =
+            store.revoke_account_key(username, fingerprint, changed_at, actor, correlation_id)
+        {
+            let target = format!("{username}:{fingerprint}");
+            self.audit_failure(
+                "key.revoke",
+                actor,
+                bounded_audit_target(&target),
+                correlation_id,
+                changed_at,
+            )?;
+            return Err(error.into());
+        }
         Ok(())
     }
 
-    pub(crate) fn suspend(&self, username: &str, suspended: bool) -> Result<(), AccountError> {
+    pub(crate) fn suspend(
+        &self,
+        username: &str,
+        suspended: bool,
+        actor: &str,
+        correlation_id: &str,
+    ) -> Result<(), AccountError> {
         validate_username(username)?;
-        Store::open(&self.database)?.suspend_account(username, suspended, now()?)?;
+        let changed_at = now()?;
+        let mut store = Store::open(&self.database)?;
+        let action = if suspended {
+            "account.suspend"
+        } else {
+            "account.resume"
+        };
+        if let Err(error) =
+            store.suspend_account(username, suspended, changed_at, actor, correlation_id)
+        {
+            self.audit_failure(action, actor, username, correlation_id, changed_at)?;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn audit_failure(
+        &self,
+        action: &str,
+        actor: &str,
+        target: &str,
+        correlation_id: &str,
+        created_at: i64,
+    ) -> Result<(), AccountError> {
+        Store::open(&self.database)?.record_audit_event(&NewAuditEvent {
+            action,
+            actor,
+            target,
+            outcome: "failure",
+            correlation_id,
+            created_at,
+        })?;
         Ok(())
     }
 
@@ -114,6 +211,14 @@ fn new_key<'a>(key: &'a SshPublicKey, label: &'a str) -> NewSshKey<'a> {
         canonical_key: key.canonical(),
         fingerprint: key.fingerprint(),
         label,
+    }
+}
+
+fn bounded_audit_target(target: &str) -> &str {
+    if target.len() <= 512 && !target.chars().any(char::is_control) {
+        target
+    } else {
+        "invalid-target"
     }
 }
 

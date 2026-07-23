@@ -70,6 +70,7 @@ fn persists_one_time_challenges_and_opaque_revocable_sessions() {
             &issued.challenge,
             &signature,
             &issued.login_csrf,
+            "test-login",
         )
         .expect("verify the login challenge after restart");
     assert_eq!(
@@ -90,6 +91,7 @@ fn persists_one_time_challenges_and_opaque_revocable_sessions() {
             &issued.challenge,
             &signature,
             &issued.login_csrf,
+            "test-replay",
         ),
         Err(SessionError::Store(StoreError::InvalidLoginChallenge))
     ));
@@ -118,7 +120,7 @@ fn persists_one_time_challenges_and_opaque_revocable_sessions() {
     let second_public = fs::read_to_string(second_key.with_extension("pub"))
         .expect("read the second SSH public key");
     AccountService::new(database.clone())
-        .add_key("alice", "second", &second_public)
+        .add_key("alice", "second", &second_public, "alice", "test")
         .expect("change account privileges");
     assert!(matches!(
         restarted.authenticate(&session.token, None),
@@ -136,6 +138,7 @@ fn persists_one_time_challenges_and_opaque_revocable_sessions() {
             &next.challenge,
             &next_signature,
             &next.login_csrf,
+            "test-login",
         )
         .expect("create another session");
     restarted.end_all("alice").expect("end all sessions");

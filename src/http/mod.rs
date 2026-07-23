@@ -277,8 +277,14 @@ async fn signup(
         }
     };
     let username = fields.username.clone();
+    let correlation_id = request_id.0.clone();
     let result = account_job(state, move |accounts| {
-        accounts.signup(&fields.credential, &fields.username, &fields.public_key)
+        accounts.signup(
+            &fields.credential,
+            &fields.username,
+            &fields.public_key,
+            &correlation_id,
+        )
     })
     .await;
     account_result(result, &request_id.0, AccountFormKind::Signup, &username)
@@ -303,8 +309,14 @@ async fn recover(
         }
     };
     let username = fields.username.clone();
+    let correlation_id = request_id.0.clone();
     let result = account_job(state, move |accounts| {
-        accounts.recover(&fields.username, &fields.credential, &fields.public_key)
+        accounts.recover(
+            &fields.username,
+            &fields.credential,
+            &fields.public_key,
+            &correlation_id,
+        )
     })
     .await;
     account_result(result, &request_id.0, AccountFormKind::Recovery, &username)
@@ -385,7 +397,10 @@ async fn login_verify(
         ],
     ) {
         Ok(fields) => fields,
-        Err(()) => return login_error(&request_id.0, "", "The login response is not valid."),
+        Err(()) => {
+            return rejected_login(state, &request_id.0, "", "The login response is not valid.")
+                .await;
+        }
     };
     let username = fields[0].clone();
     let public_key = fields[1].clone();
@@ -393,7 +408,13 @@ async fn login_verify(
     let signature = fields[3].clone();
     let login_csrf = fields[4].clone();
     if cookie(&headers, LOGIN_CSRF_COOKIE).as_deref() != Some(login_csrf.as_str()) {
-        return login_error(&request_id.0, &username, "The login response is not valid.");
+        return rejected_login(
+            state,
+            &request_id.0,
+            &username,
+            "The login response is not valid.",
+        )
+        .await;
     }
     complete_login(
         state,
@@ -417,10 +438,10 @@ async fn login_verify_file(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
     else {
-        return login_error(&request_id.0, "", "The login response is not valid.");
+        return rejected_login(state, &request_id.0, "", "The login response is not valid.").await;
     };
     let Ok(boundary) = multra::parse_boundary(content_type) else {
-        return login_error(&request_id.0, "", "The login response is not valid.");
+        return rejected_login(state, &request_id.0, "", "The login response is not valid.").await;
     };
     let mut multipart = multra::Multipart::new(body.into_data_stream(), boundary);
     let mut username = None;
@@ -432,7 +453,15 @@ async fn login_verify_file(
         let field = match multipart.next_field().await {
             Ok(Some(field)) => field,
             Ok(None) => break,
-            Err(_) => return login_error(&request_id.0, "", "The login response is not valid."),
+            Err(_) => {
+                return rejected_login(
+                    state,
+                    &request_id.0,
+                    "",
+                    "The login response is not valid.",
+                )
+                .await;
+            }
         };
         match field.name() {
             Some("username") if username.is_none() => username = field.text().await.ok(),
@@ -440,16 +469,30 @@ async fn login_verify_file(
             Some("challenge") if challenge.is_none() => challenge = field.text().await.ok(),
             Some("signature-file") if signature.is_none() => signature = field.text().await.ok(),
             Some("login-csrf") if login_csrf.is_none() => login_csrf = field.text().await.ok(),
-            _ => return login_error(&request_id.0, "", "The login response is not valid."),
+            _ => {
+                return rejected_login(
+                    state,
+                    &request_id.0,
+                    "",
+                    "The login response is not valid.",
+                )
+                .await;
+            }
         }
     }
     let (Some(username), Some(public_key), Some(challenge), Some(signature), Some(login_csrf)) =
         (username, public_key, challenge, signature, login_csrf)
     else {
-        return login_error(&request_id.0, "", "The login response is not valid.");
+        return rejected_login(state, &request_id.0, "", "The login response is not valid.").await;
     };
     if cookie(&headers, LOGIN_CSRF_COOKIE).as_deref() != Some(login_csrf.as_str()) {
-        return login_error(&request_id.0, &username, "The login response is not valid.");
+        return rejected_login(
+            state,
+            &request_id.0,
+            &username,
+            "The login response is not valid.",
+        )
+        .await;
     }
     complete_login(
         state,
@@ -474,8 +517,16 @@ async fn complete_login(
 ) -> Response {
     let display_username = username.clone();
     let secure = state.secure_cookies;
+    let correlation_id = request_id.to_owned();
     let result = login_job(state, move |login| {
-        login.verify(&username, &public_key, &challenge, &signature, &login_csrf)
+        login.verify(
+            &username,
+            &public_key,
+            &challenge,
+            &signature,
+            &login_csrf,
+            &correlation_id,
+        )
     })
     .await;
     match result {
@@ -699,6 +750,21 @@ fn login_error(request_id: &str, username: &str, error: &str) -> Response {
             has_error: true,
         },
     )
+}
+
+async fn rejected_login(
+    state: WebState,
+    request_id: &str,
+    username: &str,
+    error: &str,
+) -> Response {
+    let username_for_audit = username.to_owned();
+    let correlation_id = request_id.to_owned();
+    let _ = login_job(state, move |login| {
+        login.record_login_failure(&username_for_audit, &correlation_id)
+    })
+    .await;
+    login_error(request_id, username, error)
 }
 
 async fn account_job<T: Send + 'static>(

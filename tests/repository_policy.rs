@@ -5,7 +5,7 @@ mod policy;
 mod store;
 
 use policy::{PolicyError, RepositoryOperation, RepositoryPolicy};
-use store::{NewRepository, RepositoryOrigin, Store, StoreError};
+use store::{AuditContext, NewRepository, RepositoryOrigin, Store, StoreError};
 use tempfile::TempDir;
 
 #[test]
@@ -39,6 +39,8 @@ fn enforces_the_repository_role_matrix() {
             created_at: 2,
             origin: RepositoryOrigin::Created,
             initial_references: &[],
+            actor: "admin-cli",
+            correlation_id: "test",
         })
         .expect("create a policy repository");
     for (username, role) in [
@@ -48,18 +50,18 @@ fn enforces_the_repository_role_matrix() {
         ("suspended", "writer"),
     ] {
         store
-            .set_repository_collaborator("owner", "project", username, role, 3)
+            .set_repository_collaborator("owner", "project", username, role, &audit(3))
             .expect("set a collaborator role");
     }
     store
-        .suspend_account("suspended", true, 4)
+        .suspend_account("suspended", true, 4, "admin-cli", "test")
         .expect("suspend a collaborator");
 
     let policy = RepositoryPolicy::new(&database);
     assert_allowed(&policy, None, RepositoryOperation::Read);
     assert_denied(&policy, None, RepositoryOperation::Write);
     store
-        .set_repository_visibility("owner", "project", "private")
+        .set_repository_visibility("owner", "project", "private", 5, "admin-cli", "test")
         .expect("make the repository private");
 
     for operation in operations() {
@@ -112,6 +114,8 @@ fn applies_role_visibility_and_archive_changes_immediately() {
             created_at: 2,
             origin: RepositoryOrigin::Created,
             initial_references: &[],
+            actor: "admin-cli",
+            correlation_id: "test",
         })
         .expect("create a policy repository");
     let policy = RepositoryPolicy::new(&database);
@@ -124,7 +128,7 @@ fn applies_role_visibility_and_archive_changes_immediately() {
     );
 
     store
-        .set_repository_visibility("owner", "project", "private")
+        .set_repository_visibility("owner", "project", "private", 3, "admin-cli", "test")
         .expect("make the repository private");
     assert!(
         policy
@@ -133,24 +137,24 @@ fn applies_role_visibility_and_archive_changes_immediately() {
             .is_empty()
     );
     store
-        .set_repository_collaborator("owner", "project", "member", "writer", 3)
+        .set_repository_collaborator("owner", "project", "member", "writer", &audit(3))
         .expect("add a writer");
     assert_allowed(&policy, Some("member"), RepositoryOperation::Write);
     store
-        .set_repository_collaborator("owner", "project", "member", "reader", 4)
+        .set_repository_collaborator("owner", "project", "member", "reader", &audit(4))
         .expect("change the role");
     assert_denied(&policy, Some("member"), RepositoryOperation::Write);
     assert_allowed(&policy, Some("member"), RepositoryOperation::Read);
     store
-        .remove_repository_collaborator("owner", "project", "member")
+        .remove_repository_collaborator("owner", "project", "member", 5, "admin-cli", "test")
         .expect("remove the collaborator");
     assert_denied(&policy, Some("member"), RepositoryOperation::Read);
     assert!(matches!(
-        store.set_repository_collaborator("owner", "project", "owner", "reader", 5),
+        store.set_repository_collaborator("owner", "project", "owner", "reader", &audit(5)),
         Err(StoreError::OwnerCollaborator)
     ));
     store
-        .archive_repository("owner", "project", 6)
+        .archive_repository("owner", "project", 6, "admin-cli", "test")
         .expect("archive the repository");
     for operation in operations() {
         assert_denied(&policy, Some("owner"), operation);
@@ -164,6 +168,14 @@ fn operations() -> [RepositoryOperation; 4] {
         RepositoryOperation::Maintain,
         RepositoryOperation::Own,
     ]
+}
+
+fn audit(created_at: i64) -> AuditContext<'static> {
+    AuditContext {
+        actor: "admin-cli",
+        correlation_id: "test",
+        created_at,
+    }
 }
 
 fn assert_allowed(policy: &RepositoryPolicy, actor: Option<&str>, operation: RepositoryOperation) {

@@ -9,7 +9,9 @@ use url::Url;
 use crate::auth::{
     AuthError, SshPublicKey, format_login_challenge, login_origin, verify_login_challenge,
 };
-use crate::store::{NewLoginNonce, NewWebSession, Store, StoreError, WebSessionRecord};
+use crate::store::{
+    NewAuditEvent, NewLoginNonce, NewWebSession, Store, StoreError, WebSessionRecord,
+};
 
 const CHALLENGE_LIFETIME_SECONDS: u64 = 5 * 60;
 const SESSION_LIFETIME_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -71,37 +73,53 @@ impl WebLoginService {
         challenge: &str,
         signature: &str,
         login_csrf: &str,
+        correlation_id: &str,
     ) -> Result<NewSession, SessionError> {
-        validate_token(login_csrf)?;
-        let key = SshPublicKey::parse(public_key)?;
         let created_at = now()?;
-        let verified = verify_login_challenge(
-            &self.origin,
-            challenge,
-            signature,
-            username,
-            &key,
-            u64::try_from(created_at).map_err(|_| SessionError::Clock)?,
-        )?;
-        let session = encode_hex(&random_bytes()?);
-        let csrf = encode_hex(&random_bytes()?);
-        let expires_at = created_at
-            .checked_add(SESSION_LIFETIME_SECONDS)
-            .ok_or(SessionError::Clock)?;
-        Store::open(&self.database)?.consume_login_nonce(&NewWebSession {
-            nonce_hash: &verified.nonce_hash,
-            login_csrf_hash: &hash(login_csrf.as_bytes()),
-            username: &verified.username,
-            fingerprint: &verified.fingerprint,
-            session_hash: &hash(session.as_bytes()),
-            csrf_hash: &hash(csrf.as_bytes()),
-            created_at,
-            expires_at,
-        })?;
-        Ok(NewSession {
-            token: session,
-            csrf,
-        })
+        let result = (|| {
+            validate_token(login_csrf)?;
+            let key = SshPublicKey::parse(public_key)?;
+            let verified = verify_login_challenge(
+                &self.origin,
+                challenge,
+                signature,
+                username,
+                &key,
+                u64::try_from(created_at).map_err(|_| SessionError::Clock)?,
+            )?;
+            let session = encode_hex(&random_bytes()?);
+            let csrf = encode_hex(&random_bytes()?);
+            let expires_at = created_at
+                .checked_add(SESSION_LIFETIME_SECONDS)
+                .ok_or(SessionError::Clock)?;
+            Store::open(&self.database)?.consume_login_nonce(&NewWebSession {
+                nonce_hash: &verified.nonce_hash,
+                login_csrf_hash: &hash(login_csrf.as_bytes()),
+                username: &verified.username,
+                fingerprint: &verified.fingerprint,
+                session_hash: &hash(session.as_bytes()),
+                csrf_hash: &hash(csrf.as_bytes()),
+                created_at,
+                expires_at,
+                correlation_id,
+            })?;
+            Ok(NewSession {
+                token: session,
+                csrf,
+            })
+        })();
+        if result.is_err() {
+            let account = audit_account(username);
+            Store::open(&self.database)?.record_audit_event(&NewAuditEvent {
+                action: "login",
+                actor: account,
+                target: account,
+                outcome: "failure",
+                correlation_id,
+                created_at,
+            })?;
+        }
+        result
     }
 
     pub(crate) fn authenticate(
@@ -122,9 +140,38 @@ impl WebLoginService {
             .map_err(Into::into)
     }
 
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile login without HTTP handlers"
+    )]
+    pub(crate) fn record_login_failure(
+        &self,
+        username: &str,
+        correlation_id: &str,
+    ) -> Result<(), SessionError> {
+        let account = audit_account(username);
+        Store::open(&self.database)?.record_audit_event(&NewAuditEvent {
+            action: "login",
+            actor: account,
+            target: account,
+            outcome: "failure",
+            correlation_id,
+            created_at: now()?,
+        })?;
+        Ok(())
+    }
+
     pub(crate) fn end_all(&self, username: &str) -> Result<(), SessionError> {
         Store::open(&self.database)?.end_account_sessions(username, now()?)?;
         Ok(())
+    }
+}
+
+fn audit_account(username: &str) -> &str {
+    if !username.is_empty() && username.len() <= 40 && username.is_ascii() {
+        username
+    } else {
+        "invalid-account"
     }
 }
 

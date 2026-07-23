@@ -869,7 +869,13 @@ async fn finish_receive(
             Ok(response) => Ok(response),
             Err(error) => {
                 let response = service.rejection_response(&commands, &error);
-                Err((error, response))
+                match service.record_rejection() {
+                    Ok(()) => Err((error, response)),
+                    Err(audit_error) => {
+                        let response = service.rejection_response(&commands, &audit_error);
+                        Err((audit_error, response))
+                    }
+                }
             }
         })
     })

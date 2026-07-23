@@ -9,7 +9,7 @@ use thiserror::Error;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -19,7 +19,7 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 9] = [
+const MIGRATIONS: [&str; 10] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
@@ -29,6 +29,7 @@ const MIGRATIONS: [&str; 9] = [
     include_str!("migrations/007_account_lifecycle.sql"),
     include_str!("migrations/008_web_sessions.sql"),
     include_str!("migrations/009_repository_authorization.sql"),
+    include_str!("migrations/010_audit_history.sql"),
 ];
 
 #[allow(
@@ -109,6 +110,8 @@ pub(crate) enum StoreError {
     EventLimit,
     #[error("stored Git reference event is malformed")]
     EventPayload,
+    #[error("audit event page limit is too large")]
+    AuditLimit,
 }
 
 pub(crate) struct Store {
@@ -116,6 +119,44 @@ pub(crate) struct Store {
 }
 
 impl Store {
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without audited services"
+    )]
+    pub(crate) fn record_audit_event(&self, event: &NewAuditEvent<'_>) -> Result<(), StoreError> {
+        insert_audit_event(&self.connection, event)?;
+        Ok(())
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without the audit CLI"
+    )]
+    pub(crate) fn audit_events(&self, limit: usize) -> Result<Vec<AuditEventRecord>, StoreError> {
+        if limit == 0 || limit > 1_000 {
+            return Err(StoreError::AuditLimit);
+        }
+        let limit = i64::try_from(limit).map_err(|_| StoreError::AuditLimit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, action, actor, target, outcome, correlation_id, created_at
+             FROM audit_event ORDER BY id DESC LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit], |row| {
+                Ok(AuditEventRecord {
+                    id: row.get(0)?,
+                    action: row.get(1)?,
+                    actor: row.get(2)?,
+                    target: row.get(3)?,
+                    outcome: row.get(4)?,
+                    correlation_id: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     #[allow(
         dead_code,
         reason = "M1A proves migrations before the M2 server calls them"
@@ -340,6 +381,22 @@ impl Store {
         require_one_intent(id, changed)
     }
 
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without receive-pack"
+    )]
+    pub(crate) fn git_intent_completed(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT state = 'completed' FROM git_operation_intent WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
     pub(crate) fn incomplete_git_intents(&self) -> Result<Vec<GitIntentRecord>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT id, repository_path, initial_refs, proposed_refs, quarantine_path,
@@ -464,6 +521,17 @@ impl Store {
              VALUES (?1, ?2, ?3)",
             rusqlite::params![account_id, account.recovery_hash, account.created_at],
         )?;
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "account.signup",
+                actor: account.username,
+                target: account.username,
+                outcome: "success",
+                correlation_id: account.correlation_id,
+                created_at: account.created_at,
+            },
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -525,6 +593,17 @@ impl Store {
             rusqlite::params![account_id, recovery.new_recovery_hash, recovery.created_at],
         )?;
         end_sessions(&transaction, account_id, recovery.created_at)?;
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "account.recover",
+                actor: recovery.username,
+                target: recovery.username,
+                outcome: "success",
+                correlation_id: recovery.correlation_id,
+                created_at: recovery.created_at,
+            },
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -538,6 +617,8 @@ impl Store {
         username: &str,
         key: &NewSshKey<'_>,
         created_at: i64,
+        actor: &str,
+        correlation_id: &str,
     ) -> Result<(), StoreError> {
         let transaction = self
             .connection
@@ -545,6 +626,18 @@ impl Store {
         let account_id = active_account_id(&transaction, username)?;
         insert_ssh_key(&transaction, account_id, key, created_at)?;
         end_sessions(&transaction, account_id, created_at)?;
+        let target = format!("{username}:{}", key.fingerprint);
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "key.add",
+                actor,
+                target: &target,
+                outcome: "success",
+                correlation_id,
+                created_at,
+            },
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -558,6 +651,8 @@ impl Store {
         username: &str,
         fingerprint: &str,
         revoked_at: i64,
+        actor: &str,
+        correlation_id: &str,
     ) -> Result<(), StoreError> {
         let transaction = self
             .connection
@@ -580,6 +675,18 @@ impl Store {
             return Err(StoreError::KeyNotFound);
         }
         end_sessions(&transaction, account_id, revoked_at)?;
+        let target = format!("{username}:{fingerprint}");
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "key.revoke",
+                actor,
+                target: &target,
+                outcome: "success",
+                correlation_id,
+                created_at: revoked_at,
+            },
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -593,6 +700,8 @@ impl Store {
         username: &str,
         suspended: bool,
         changed_at: i64,
+        actor: &str,
+        correlation_id: &str,
     ) -> Result<(), StoreError> {
         let state = if suspended { "suspended" } else { "active" };
         let transaction = self
@@ -611,6 +720,21 @@ impl Store {
             |row| row.get(0),
         )?;
         end_sessions(&transaction, account_id, changed_at)?;
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: if suspended {
+                    "account.suspend"
+                } else {
+                    "account.resume"
+                },
+                actor,
+                target: username,
+                outcome: "success",
+                correlation_id,
+                created_at: changed_at,
+            },
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -718,6 +842,17 @@ impl Store {
                 login.created_at,
                 login.expires_at,
             ],
+        )?;
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "login",
+                actor: login.username,
+                target: login.username,
+                outcome: "success",
+                correlation_id: login.correlation_id,
+                created_at: login.created_at,
+            },
         )?;
         transaction.commit()?;
         Ok(())
@@ -834,6 +969,18 @@ impl Store {
                         ],
                     )?;
                 }
+                let target = format!("{}/{}", repository.owner, repository.slug);
+                insert_audit_event(
+                    &transaction,
+                    &NewAuditEvent {
+                        action: repository.origin.audit_action(),
+                        actor: repository.actor,
+                        target: &target,
+                        outcome: "success",
+                        correlation_id: repository.correlation_id,
+                        created_at: repository.created_at,
+                    },
+                )?;
                 transaction.commit()?;
             }
             Ok(_) => unreachable!("an INSERT changes one row"),
@@ -862,6 +1009,9 @@ impl Store {
         owner: &str,
         old_slug: &str,
         new_slug: &str,
+        changed_at: i64,
+        actor: &str,
+        correlation_id: &str,
     ) -> Result<(), StoreError> {
         let transaction = self
             .connection
@@ -873,7 +1023,21 @@ impl Store {
             rusqlite::params![owner_id, old_slug, new_slug],
         );
         match result {
-            Ok(1) => transaction.commit()?,
+            Ok(1) => {
+                let target = format!("{owner}/{old_slug}->{new_slug}");
+                insert_audit_event(
+                    &transaction,
+                    &NewAuditEvent {
+                        action: "repository.rename",
+                        actor,
+                        target: &target,
+                        outcome: "success",
+                        correlation_id,
+                        created_at: changed_at,
+                    },
+                )?;
+                transaction.commit()?;
+            }
             Ok(0) => {
                 return Err(repository_state_error(
                     &transaction,
@@ -899,6 +1063,8 @@ impl Store {
         owner: &str,
         slug: &str,
         archived_at: i64,
+        actor: &str,
+        correlation_id: &str,
     ) -> Result<(), StoreError> {
         let transaction = self
             .connection
@@ -912,6 +1078,18 @@ impl Store {
         if changed == 0 {
             return Err(repository_state_error(&transaction, owner_id, owner, slug)?);
         }
+        let target = format!("{owner}/{slug}");
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "repository.archive",
+                actor,
+                target: &target,
+                outcome: "success",
+                correlation_id,
+                created_at: archived_at,
+            },
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -925,6 +1103,9 @@ impl Store {
         owner: &str,
         slug: &str,
         visibility: &str,
+        changed_at: i64,
+        actor: &str,
+        correlation_id: &str,
     ) -> Result<(), StoreError> {
         if !matches!(visibility, "public" | "private") {
             return Err(StoreError::InvalidRepositoryVisibility);
@@ -941,6 +1122,18 @@ impl Store {
         if changed == 0 {
             return Err(repository_state_error(&transaction, owner_id, owner, slug)?);
         }
+        let target = format!("{owner}/{slug}:{visibility}");
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "repository.visibility",
+                actor,
+                target: &target,
+                outcome: "success",
+                correlation_id,
+                created_at: changed_at,
+            },
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -955,7 +1148,7 @@ impl Store {
         slug: &str,
         username: &str,
         role: &str,
-        created_at: i64,
+        audit: &AuditContext<'_>,
     ) -> Result<(), StoreError> {
         if !matches!(role, "maintainer" | "writer" | "reader") {
             return Err(StoreError::InvalidCollaboratorRole);
@@ -991,7 +1184,19 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (repository_id, account_id)
              DO UPDATE SET role = excluded.role",
-            rusqlite::params![repository_id, collaborator_id, role, created_at],
+            rusqlite::params![repository_id, collaborator_id, role, audit.created_at],
+        )?;
+        let target = format!("{owner}/{slug}:{username}:{role}");
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "collaborator.set",
+                actor: audit.actor,
+                target: &target,
+                outcome: "success",
+                correlation_id: audit.correlation_id,
+                created_at: audit.created_at,
+            },
         )?;
         transaction.commit()?;
         Ok(())
@@ -1006,6 +1211,9 @@ impl Store {
         owner: &str,
         slug: &str,
         username: &str,
+        changed_at: i64,
+        actor: &str,
+        correlation_id: &str,
     ) -> Result<(), StoreError> {
         let transaction = self
             .connection
@@ -1043,6 +1251,18 @@ impl Store {
         if changed == 0 {
             return Err(StoreError::CollaboratorNotFound(username.to_owned()));
         }
+        let target = format!("{owner}/{slug}:{username}");
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "collaborator.remove",
+                actor,
+                target: &target,
+                outcome: "success",
+                correlation_id,
+                created_at: changed_at,
+            },
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -1318,6 +1538,7 @@ pub(crate) struct InvitedAccount<'a> {
     pub(crate) key: NewSshKey<'a>,
     pub(crate) recovery_hash: &'a [u8; 32],
     pub(crate) created_at: i64,
+    pub(crate) correlation_id: &'a str,
 }
 
 #[allow(
@@ -1330,6 +1551,7 @@ pub(crate) struct AccountRecovery<'a> {
     pub(crate) key: NewSshKey<'a>,
     pub(crate) new_recovery_hash: &'a [u8; 32],
     pub(crate) created_at: i64,
+    pub(crate) correlation_id: &'a str,
 }
 
 #[allow(
@@ -1358,6 +1580,7 @@ pub(crate) struct NewWebSession<'a> {
     pub(crate) csrf_hash: &'a [u8; 32],
     pub(crate) created_at: i64,
     pub(crate) expires_at: i64,
+    pub(crate) correlation_id: &'a str,
 }
 
 #[allow(
@@ -1378,6 +1601,8 @@ pub(crate) struct NewRepository<'a> {
     pub(crate) created_at: i64,
     pub(crate) origin: RepositoryOrigin,
     pub(crate) initial_references: &'a [NewRepositoryReference],
+    pub(crate) actor: &'a str,
+    pub(crate) correlation_id: &'a str,
 }
 
 #[derive(Clone, Copy)]
@@ -1395,6 +1620,13 @@ impl RepositoryOrigin {
         match self {
             Self::Created => "repository-created",
             Self::Imported => "repository-imported",
+        }
+    }
+
+    fn audit_action(self) -> &'static str {
+        match self {
+            Self::Created => "repository.create",
+            Self::Imported => "repository.import",
         }
     }
 }
@@ -1460,6 +1692,35 @@ pub(crate) struct GitOperationIntent<'a> {
     pub(crate) created_at: i64,
 }
 
+pub(crate) struct NewAuditEvent<'a> {
+    pub(crate) action: &'a str,
+    pub(crate) actor: &'a str,
+    pub(crate) target: &'a str,
+    pub(crate) outcome: &'a str,
+    pub(crate) correlation_id: &'a str,
+    pub(crate) created_at: i64,
+}
+
+pub(crate) struct AuditContext<'a> {
+    pub(crate) actor: &'a str,
+    pub(crate) correlation_id: &'a str,
+    pub(crate) created_at: i64,
+}
+
+#[allow(
+    dead_code,
+    reason = "some integration tests compile storage without the audit CLI"
+)]
+pub(crate) struct AuditEventRecord {
+    pub(crate) id: i64,
+    pub(crate) action: String,
+    pub(crate) actor: String,
+    pub(crate) target: String,
+    pub(crate) outcome: String,
+    pub(crate) correlation_id: String,
+    pub(crate) created_at: i64,
+}
+
 pub(crate) struct GitIntentRecord {
     pub(crate) id: String,
     pub(crate) repository_path: String,
@@ -1497,6 +1758,26 @@ fn insert_ssh_key(
         Err(error) => Err(error.into()),
         Ok(_) => unreachable!("an INSERT changes one row"),
     }
+}
+
+fn insert_audit_event(
+    connection: &Connection,
+    event: &NewAuditEvent<'_>,
+) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO audit_event
+         (action, actor, target, outcome, correlation_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            event.action,
+            event.actor,
+            event.target,
+            event.outcome,
+            event.correlation_id,
+            event.created_at,
+        ],
+    )?;
+    Ok(())
 }
 
 fn end_sessions(
@@ -1587,6 +1868,17 @@ fn insert_push_events(
             ],
         )?;
     }
+    insert_audit_event(
+        transaction,
+        &NewAuditEvent {
+            action: "ref.update",
+            actor,
+            target: repository_id,
+            outcome: "success",
+            correlation_id: intent_id,
+            created_at,
+        },
+    )?;
     Ok(())
 }
 

@@ -45,11 +45,11 @@ fn invitation_signup_key_and_recovery_lifecycle_is_atomic() {
     assert_ne!(stored_invitation, invitation.as_bytes());
 
     let recovery = accounts
-        .signup(&invitation, "alice", &first_key)
+        .signup(&invitation, "alice", &first_key, "test")
         .expect("create the account");
     assert!(recovery.starts_with("tit-recovery-v1:"));
     assert!(matches!(
-        accounts.signup(&invitation, "bob", &second_key),
+        accounts.signup(&invitation, "bob", &second_key, "test"),
         Err(AccountError::Store(StoreError::InvalidInvitation))
     ));
     let stored_recovery: Vec<u8> = Store::open(&database)
@@ -65,7 +65,7 @@ fn invitation_signup_key_and_recovery_lifecycle_is_atomic() {
     assert_ne!(stored_recovery, recovery.as_bytes());
 
     let second_fingerprint = accounts
-        .add_key("alice", "workstation", &second_key)
+        .add_key("alice", "workstation", &second_key, "alice", "test")
         .expect("add a second key");
     let first_fingerprint: String = Store::open(&database)
         .expect("open the account database")
@@ -77,22 +77,22 @@ fn invitation_signup_key_and_recovery_lifecycle_is_atomic() {
         )
         .expect("read the first fingerprint");
     accounts
-        .revoke_key("alice", &first_fingerprint)
+        .revoke_key("alice", &first_fingerprint, "alice", "test")
         .expect("revoke the first key");
     assert!(matches!(
-        accounts.revoke_key("alice", &second_fingerprint),
+        accounts.revoke_key("alice", &second_fingerprint, "alice", "test"),
         Err(AccountError::Store(StoreError::LastKey))
     ));
 
     let replacement = accounts
-        .recover("alice", &recovery, &third_key)
+        .recover("alice", &recovery, &third_key, "test")
         .expect("recover the account");
     assert!(matches!(
-        accounts.recover("alice", &recovery, &first_key),
+        accounts.recover("alice", &recovery, &first_key, "test"),
         Err(AccountError::Store(StoreError::InvalidRecovery))
     ));
     accounts
-        .recover("alice", &replacement, &first_key)
+        .recover("alice", &replacement, &first_key, "test")
         .expect("use the rotated recovery code");
     assert_eq!(
         Store::open(&database)
@@ -106,6 +106,29 @@ fn invitation_signup_key_and_recovery_lifecycle_is_atomic() {
                 .to_owned()
         ]
     );
+    let audits = Store::open(&database)
+        .expect("open the account database")
+        .audit_events(20)
+        .expect("read account audit history");
+    assert!(
+        audits
+            .iter()
+            .any(|event| event.action == "key.add" && event.outcome == "success")
+    );
+    assert!(
+        audits
+            .iter()
+            .any(|event| event.action == "key.revoke" && event.outcome == "failure")
+    );
+    assert!(
+        audits
+            .iter()
+            .any(|event| event.action == "account.recover" && event.outcome == "success")
+    );
+    for event in audits {
+        assert!(!event.target.contains(&recovery));
+        assert!(!event.target.contains(&replacement));
+    }
 }
 
 #[test]
@@ -116,19 +139,19 @@ fn failed_signup_preserves_the_invitation_and_username_reservation() {
     let accounts = AccountService::new(database.clone());
     let first = accounts.issue_invitation().expect("issue an invitation");
     accounts
-        .signup(&first, "alice", &public_key())
+        .signup(&first, "alice", &public_key(), "test")
         .expect("create the first account");
 
     let second = accounts.issue_invitation().expect("issue an invitation");
     assert!(matches!(
-        accounts.signup(&second, "alice", &public_key()),
+        accounts.signup(&second, "alice", &public_key(), "test"),
         Err(AccountError::Store(StoreError::UsernameUnavailable(_)))
     ));
     accounts
-        .signup(&second, "bob", &public_key())
+        .signup(&second, "bob", &public_key(), "test")
         .expect("reuse the invitation after a rolled-back signup");
     accounts
-        .suspend("alice", true)
+        .suspend("alice", true, "admin-cli", "test")
         .expect("suspend the account");
     assert_eq!(
         Store::open(&database)
@@ -144,7 +167,7 @@ fn failed_signup_preserves_the_invitation_and_username_reservation() {
     );
     let third = accounts.issue_invitation().expect("issue an invitation");
     assert!(matches!(
-        accounts.signup(&third, "alice", &public_key()),
+        accounts.signup(&third, "alice", &public_key(), "test"),
         Err(AccountError::Store(StoreError::UsernameUnavailable(_)))
     ));
     let consumed: Option<i64> = Store::open(&database)
@@ -174,7 +197,7 @@ fn expired_invitations_do_not_create_accounts() {
         .expect("store an expired invitation");
     let accounts = AccountService::new(database.clone());
     assert!(matches!(
-        accounts.signup(invitation, "alice", &public_key()),
+        accounts.signup(invitation, "alice", &public_key(), "test"),
         Err(AccountError::Store(StoreError::InvalidInvitation))
     ));
     assert_eq!(

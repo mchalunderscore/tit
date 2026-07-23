@@ -109,7 +109,37 @@ async fn main() -> ExitCode {
             Some(Command::Admin {
                 command: AdminCommand::Account { command },
             }) => run_account_command(&config.instance_dir, command),
+            Some(Command::Admin {
+                command: AdminCommand::Audit { limit },
+            }) => run_audit_command(&config.instance_dir, limit),
         },
+        Err(error) => {
+            eprintln!("tit: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_audit_command(instance_dir: &std::path::Path, limit: usize) -> ExitCode {
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let _lock = instance::InstanceLock::acquire(instance_dir)?;
+        let database = instance::prepare_database(instance_dir)?;
+        let events = store::Store::open(&database)?.audit_events(limit)?;
+        let mut output = io::stdout().lock();
+        for event in events {
+            writeln!(output, "id={}", event.id)?;
+            writeln!(output, "action={}", event.action)?;
+            writeln!(output, "actor={}", event.actor)?;
+            writeln!(output, "target={}", event.target)?;
+            writeln!(output, "outcome={}", event.outcome)?;
+            writeln!(output, "correlation-id={}", event.correlation_id)?;
+            writeln!(output, "created-at={}", event.created_at)?;
+            writeln!(output)?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("tit: {error}");
             ExitCode::FAILURE
@@ -122,28 +152,35 @@ fn run_account_command(instance_dir: &std::path::Path, command: AccountCommand) 
         let _lock = instance::InstanceLock::acquire(instance_dir)?;
         let database = instance::prepare_database(instance_dir)?;
         let accounts = account::AccountService::new(database);
+        let correlation_id = format!("{:032x}", rand::random::<u128>());
         match command {
             AccountCommand::KeyAdd {
                 username,
                 label,
                 ssh_public_key,
             } => {
-                let fingerprint = accounts.add_key(&username, &label, &ssh_public_key)?;
+                let fingerprint = accounts.add_key(
+                    &username,
+                    &label,
+                    &ssh_public_key,
+                    "admin-cli",
+                    &correlation_id,
+                )?;
                 Ok(Some(fingerprint))
             }
             AccountCommand::KeyRevoke {
                 username,
                 fingerprint,
             } => {
-                accounts.revoke_key(&username, &fingerprint)?;
+                accounts.revoke_key(&username, &fingerprint, "admin-cli", &correlation_id)?;
                 Ok(None)
             }
             AccountCommand::Suspend { username } => {
-                accounts.suspend(&username, true)?;
+                accounts.suspend(&username, true, "admin-cli", &correlation_id)?;
                 Ok(None)
             }
             AccountCommand::Resume { username } => {
-                accounts.suspend(&username, false)?;
+                accounts.suspend(&username, false, "admin-cli", &correlation_id)?;
                 Ok(None)
             }
         }

@@ -667,6 +667,8 @@ impl Fixture {
                 created_at: 2,
                 origin: RepositoryOrigin::Imported,
                 initial_references: &[],
+                actor: "admin-cli",
+                correlation_id: "test-import",
             })
             .expect("create the repository record");
         store
@@ -678,6 +680,8 @@ impl Fixture {
                 created_at: 2,
                 origin: RepositoryOrigin::Created,
                 initial_references: &[],
+                actor: "admin-cli",
+                correlation_id: "test-create",
             })
             .expect("create the empty repository record");
         drop(store);

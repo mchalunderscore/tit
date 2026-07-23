@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+./scripts/check
+cargo test --locked --release --test account_lifecycle
+cargo test --locked --release --test web_session
+cargo test --locked --release --test cli administers_repository_visibility_and_collaborators
+cargo test --locked --release --test serve serves_an_imported_repository_through_http_and_ssh
+cargo test --locked --release --test serve enforces_account_roles_and_ref_policy_through_the_production_ssh_server

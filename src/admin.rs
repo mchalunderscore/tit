@@ -11,8 +11,11 @@ use crate::domain::repository::{RepositoryNameError, validate_slug};
 use crate::git::repository::{GitRepository, GitRepositoryError};
 use crate::instance::{InstanceError, InstanceLock, prepare_database, prepare_repository_root};
 use crate::store::{
-    NewRepository, NewRepositoryReference, RepositoryOrigin, RepositoryRecord, Store, StoreError,
+    AuditContext, NewRepository, NewRepositoryReference, RepositoryOrigin, RepositoryRecord, Store,
+    StoreError,
 };
+
+const ADMIN_ACTOR: &str = "admin-cli";
 
 pub(crate) fn create_repository(
     instance_dir: &Path,
@@ -69,7 +72,25 @@ pub(crate) fn rename_repository(
     let _lock = InstanceLock::acquire(instance_dir)?;
     let database = prepare_database(instance_dir)?;
     let mut store = Store::open(&database)?;
-    store.rename_repository(owner, old_slug, new_slug)?;
+    let changed_at = timestamp()?;
+    let correlation_id = random_id()?;
+    if let Err(error) = store.rename_repository(
+        owner,
+        old_slug,
+        new_slug,
+        changed_at,
+        ADMIN_ACTOR,
+        &correlation_id,
+    ) {
+        record_failure(
+            &store,
+            "repository.rename",
+            &format!("{owner}/{old_slug}->{new_slug}"),
+            &correlation_id,
+            changed_at,
+        )?;
+        return Err(error.into());
+    }
     inspect_with_store(instance_dir, &store, owner, new_slug)
 }
 
@@ -82,7 +103,20 @@ pub(crate) fn archive_repository(
     let _lock = InstanceLock::acquire(instance_dir)?;
     let database = prepare_database(instance_dir)?;
     let mut store = Store::open(&database)?;
-    store.archive_repository(owner, slug, timestamp()?)?;
+    let changed_at = timestamp()?;
+    let correlation_id = random_id()?;
+    if let Err(error) =
+        store.archive_repository(owner, slug, changed_at, ADMIN_ACTOR, &correlation_id)
+    {
+        record_failure(
+            &store,
+            "repository.archive",
+            &format!("{owner}/{slug}"),
+            &correlation_id,
+            changed_at,
+        )?;
+        return Err(error.into());
+    }
     inspect_with_store(instance_dir, &store, owner, slug)
 }
 
@@ -96,7 +130,25 @@ pub(crate) fn set_repository_visibility(
     let _lock = InstanceLock::acquire(instance_dir)?;
     let database = prepare_database(instance_dir)?;
     let mut store = Store::open(&database)?;
-    store.set_repository_visibility(owner, slug, visibility)?;
+    let changed_at = timestamp()?;
+    let correlation_id = random_id()?;
+    if let Err(error) = store.set_repository_visibility(
+        owner,
+        slug,
+        visibility,
+        changed_at,
+        ADMIN_ACTOR,
+        &correlation_id,
+    ) {
+        record_failure(
+            &store,
+            "repository.visibility",
+            &format!("{owner}/{slug}:{visibility}"),
+            &correlation_id,
+            changed_at,
+        )?;
+        return Err(error.into());
+    }
     inspect_with_store(instance_dir, &store, owner, slug)
 }
 
@@ -112,7 +164,28 @@ pub(crate) fn set_repository_collaborator(
     let _lock = InstanceLock::acquire(instance_dir)?;
     let database = prepare_database(instance_dir)?;
     let mut store = Store::open(&database)?;
-    store.set_repository_collaborator(owner, slug, username, role, timestamp()?)?;
+    let changed_at = timestamp()?;
+    let correlation_id = random_id()?;
+    if let Err(error) = store.set_repository_collaborator(
+        owner,
+        slug,
+        username,
+        role,
+        &AuditContext {
+            actor: ADMIN_ACTOR,
+            correlation_id: &correlation_id,
+            created_at: changed_at,
+        },
+    ) {
+        record_failure(
+            &store,
+            "collaborator.set",
+            &format!("{owner}/{slug}:{username}:{role}"),
+            &correlation_id,
+            changed_at,
+        )?;
+        return Err(error.into());
+    }
     inspect_with_store(instance_dir, &store, owner, slug)
 }
 
@@ -127,7 +200,25 @@ pub(crate) fn remove_repository_collaborator(
     let _lock = InstanceLock::acquire(instance_dir)?;
     let database = prepare_database(instance_dir)?;
     let mut store = Store::open(&database)?;
-    store.remove_repository_collaborator(owner, slug, username)?;
+    let changed_at = timestamp()?;
+    let correlation_id = random_id()?;
+    if let Err(error) = store.remove_repository_collaborator(
+        owner,
+        slug,
+        username,
+        changed_at,
+        ADMIN_ACTOR,
+        &correlation_id,
+    ) {
+        record_failure(
+            &store,
+            "collaborator.remove",
+            &format!("{owner}/{slug}:{username}"),
+            &correlation_id,
+            changed_at,
+        )?;
+        return Err(error.into());
+    }
     inspect_with_store(instance_dir, &store, owner, slug)
 }
 
@@ -163,10 +254,18 @@ fn administer_repository(
     let database = prepare_database(instance_dir)?;
     let mut store = Store::open(&database)?;
     let root = prepare_repository_root(instance_dir)?;
+    let created_at = timestamp()?;
+    let correlation_id = random_id()?;
+    let action = match origin {
+        RepositoryOrigin::Created => "repository.create",
+        RepositoryOrigin::Imported => "repository.import",
+    };
+    let audit_target = format!("{owner}/{slug}");
     let id = random_id()?;
     let pending_path = root.join(format!(".pending-{id}.git"));
     let final_path = root.join(format!("{id}.git"));
     if pending_path.exists() || final_path.exists() {
+        record_failure(&store, action, &audit_target, &correlation_id, created_at)?;
         return Err(AdminError::IdentifierCollision);
     }
 
@@ -174,6 +273,7 @@ fn administer_repository(
         Ok(object_format) => object_format,
         Err(error) => {
             remove_created_repository(&pending_path)?;
+            record_failure(&store, action, &audit_target, &correlation_id, created_at)?;
             return Err(error);
         }
     };
@@ -191,7 +291,6 @@ fn administer_repository(
         return Err(AdminError::PathEscape(canonical_path));
     }
 
-    let created_at = timestamp()?;
     let object_format = object_format_name(object_format)?;
     let git = GitRepository::open(&canonical_path)?;
     let initial_references = git
@@ -213,8 +312,11 @@ fn administer_repository(
         created_at,
         origin,
         initial_references: &initial_references,
+        actor: ADMIN_ACTOR,
+        correlation_id: &correlation_id,
     }) {
         remove_created_repository(&canonical_path)?;
+        record_failure(&store, action, &audit_target, &correlation_id, created_at)?;
         return Err(error.into());
     }
     store.repository(owner, slug).map_err(Into::into)
@@ -238,6 +340,24 @@ fn inspect_with_store(
 fn validate_names(owner: &str, slug: &str) -> Result<(), AdminError> {
     validate_username(owner)?;
     validate_slug(slug)?;
+    Ok(())
+}
+
+fn record_failure(
+    store: &Store,
+    action: &str,
+    target: &str,
+    correlation_id: &str,
+    created_at: i64,
+) -> Result<(), AdminError> {
+    store.record_audit_event(&crate::store::NewAuditEvent {
+        action,
+        actor: ADMIN_ACTOR,
+        target,
+        outcome: "failure",
+        correlation_id,
+        created_at,
+    })?;
     Ok(())
 }
 

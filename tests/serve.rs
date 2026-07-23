@@ -101,6 +101,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         &[("Cookie", &login_csrf_cookies)],
     );
     assert!(rejected_login.starts_with("HTTP/1.1 400"));
+    let rejected_login_id = response_header(&rejected_login, "x-request-id").to_owned();
     let login = http_form_with_headers(
         http,
         "/login/verify",
@@ -114,6 +115,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         &[("Cookie", &login_csrf_cookies)],
     );
     assert!(login.starts_with("HTTP/1.1 303"), "{login}");
+    let login_id = response_header(&login, "x-request-id").to_owned();
     let cookies = response_cookies(&login);
     let account = http_get_with_headers(http, "/account", &[("Cookie", &cookies)]);
     assert!(account.starts_with("HTTP/1.1 200"));
@@ -272,6 +274,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         ],
     );
     assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");
+    let recovery_id = response_header(&recovered, "x-request-id").to_owned();
     assert!(!ssh_clone_succeeds(
         ssh,
         &member_key,
@@ -282,6 +285,50 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         &replacement_key,
         &instance.path().join("replacement-clone")
     ));
+
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the audit database");
+    let mut statement = database
+        .prepare(
+            "SELECT action, actor, target, outcome, correlation_id
+             FROM audit_event ORDER BY id",
+        )
+        .expect("prepare the audit query");
+    let audits = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .expect("query audit history")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read audit history");
+    assert!(audits.iter().any(|event| {
+        event.0 == "login" && event.3 == "failure" && event.4 == rejected_login_id
+    }));
+    assert!(
+        audits
+            .iter()
+            .any(|event| event.0 == "login" && event.3 == "success" && event.4 == login_id)
+    );
+    assert!(audits.iter().any(|event| {
+        event.0 == "account.recover" && event.3 == "success" && event.4 == recovery_id
+    }));
+    for event in &audits {
+        let visible = format!(
+            "{} {} {} {} {}",
+            event.0, event.1, event.2, event.3, event.4
+        );
+        assert!(!visible.contains(recovery));
+        assert!(!visible.contains(challenge));
+        assert!(!visible.contains(&signature));
+    }
+    drop(statement);
+    drop(database);
 
     let ssh_clone = instance.path().join("ssh-clone");
     let ssh_command = format!(
@@ -609,6 +656,26 @@ fn enforces_account_roles_and_ref_policy_through_the_production_ssh_server() {
     drop(database);
     assert!(!git_push(&writer_key, &writer_clone, &["main"]).success());
     server.terminate();
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the push audit database");
+    let successful: i64 = database
+        .query_row(
+            "SELECT count(*) FROM audit_event
+             WHERE action = 'ref.update' AND actor = 'writer' AND outcome = 'success'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count successful push audit events");
+    let failed: i64 = database
+        .query_row(
+            "SELECT count(*) FROM audit_event
+             WHERE action = 'ref.update' AND actor = 'writer' AND outcome = 'failure'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count failed push audit events");
+    assert_eq!(successful, 1);
+    assert!(failed >= 2);
 }
 
 fn spawn_server(config: &Path) -> ChildGuard {
@@ -774,6 +841,15 @@ fn response_cookies(response: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn response_header<'a>(response: &'a str, name: &str) -> &'a str {
+    response
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim())
+        .expect("read a response header")
 }
 
 fn http_multipart(

@@ -12,13 +12,14 @@ use support::{
 };
 use tempfile::TempDir;
 
-const V9_DATABASE: &str = concat!(
+const CURRENT_DATABASE: &str = concat!(
     include_str!("fixtures/sqlite/v5.sql"),
     include_str!("../src/store/migrations/006_repository_events.sql"),
     include_str!("../src/store/migrations/007_account_lifecycle.sql"),
     include_str!("../src/store/migrations/008_web_sessions.sql"),
     include_str!("../src/store/migrations/009_repository_authorization.sql"),
-    "PRAGMA user_version = 9;\n",
+    include_str!("../src/store/migrations/010_audit_history.sql"),
+    "PRAGMA user_version = 10;\n",
 );
 
 #[test]
@@ -74,7 +75,7 @@ fn doctor_checks_an_existing_current_database() {
     let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
         .expect("open the instance database");
     database
-        .execute_batch(V9_DATABASE)
+        .execute_batch(CURRENT_DATABASE)
         .expect("create the current database");
     drop(database);
 
@@ -126,7 +127,7 @@ fn doctor_reports_a_foreign_key_violation() {
     let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
         .expect("open the instance database");
     database
-        .execute_batch(V9_DATABASE)
+        .execute_batch(CURRENT_DATABASE)
         .expect("create the current database");
     database
         .pragma_update(None, "foreign_keys", false)
@@ -581,6 +582,31 @@ fn administers_repository_visibility_and_collaborators() {
         })
         .expect("count repository collaborators");
     assert_eq!(collaborators, 0);
+    drop(database);
+
+    let rejected_remove = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "collaborator-remove",
+        "alice",
+        "project",
+        "bob",
+    ]);
+    assert_eq!(rejected_remove.status.code(), Some(1));
+
+    let audit = instance.run(&["--config", config, "admin", "audit", "--limit", "10"]);
+    assert!(audit.status.success());
+    let audit = String::from_utf8(audit.stdout).expect("read the audit history");
+    assert!(audit.contains("action=repository.create\n"));
+    assert!(audit.contains("action=repository.visibility\n"));
+    assert!(audit.contains("action=collaborator.set\n"));
+    assert!(audit.contains("action=collaborator.remove\n"));
+    assert!(audit.contains("actor=admin-cli\n"));
+    assert!(audit.contains("outcome=success\n"));
+    assert!(audit.contains("outcome=failure\n"));
+    assert!(audit.contains("correlation-id="));
 }
 
 #[test]

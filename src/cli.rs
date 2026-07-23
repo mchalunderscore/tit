@@ -66,6 +66,11 @@ pub(crate) enum Command {
 
 #[derive(Clone, Debug, Subcommand)]
 pub(crate) enum AdminCommand {
+    /// Show recent audit events
+    Audit {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     /// Administer repositories
     Repository {
         #[command(subcommand)]

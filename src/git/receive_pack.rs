@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use super::packetline::{Packet, PacketLineError, decode, encode_data, encode_flush};
 use super::upload_pack::hash_name;
-use crate::store::{GitIntentRecord, GitOperationIntent, Store};
+use crate::store::{GitIntentRecord, GitOperationIntent, NewAuditEvent, Store};
 
 const MAX_COMMANDS: usize = 256;
 const MAX_OBJECTS: usize = 100_000;
@@ -192,6 +192,34 @@ impl ReceivePack {
             self.cleanup_on_drop = true;
         }
         result
+    }
+
+    pub(crate) fn record_rejection(&self) -> Result<(), ReceivePackError> {
+        let store = Store::open(&self.database_path)?;
+        if store.git_intent_completed(&self.intent_id)? {
+            return Ok(());
+        }
+        let target = self
+            .repository_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".git"))
+            .unwrap_or("repository");
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ReceivePackError::Clock)?
+            .as_secs()
+            .try_into()
+            .map_err(|_| ReceivePackError::Clock)?;
+        store.record_audit_event(&NewAuditEvent {
+            action: "ref.update",
+            actor: &self.actor,
+            target,
+            outcome: "failure",
+            correlation_id: &self.intent_id,
+            created_at,
+        })?;
+        Ok(())
     }
 
     pub(crate) fn rejection_response(

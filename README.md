@@ -59,6 +59,16 @@ account. The SSH username does not select the account. An owner, maintainer, or
 writer can push branches and tags. A reader cannot push. HTTP Git access stays
 read-only.
 
+Stop the server and show the newest audit events with this command:
+
+```text
+tit --config /srv/tit/config.toml admin audit --limit 100
+```
+
+Each event shows its action, actor, target, outcome, time, and correlation ID.
+The history does not store recovery credentials, login challenges, signatures,
+session tokens, or SSH private keys.
+
 ## Quality gate
 
 Install `cargo-deny` version 0.20.2. Then, run this command from the repository
@@ -216,3 +226,17 @@ This command tests account-bound SSH keys, each repository role, key revocation,
 account suspension, role removal, push permission, and ref policy. Read the
 [authenticated Git architectural decision record](docs/adr/0013-authenticated-git.md)
 for the service and ref-update checks.
+
+## Milestone 3.5 gate
+
+Run the audit history gate:
+
+```text
+./scripts/check-m3-5
+```
+
+This command tests successful and failed account, login, repository,
+collaborator, and ref audit events. It also tests correlation IDs and secret
+exclusion. Read the
+[audit history architectural decision record](docs/adr/0014-audit-history.md)
+for the transaction and recovery rules.
