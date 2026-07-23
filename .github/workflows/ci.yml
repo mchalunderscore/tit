@@ -36,3 +36,44 @@ jobs:
       - run: cargo test --locked --release --test sqlite_workload -- --ignored --nocapture
       - run: cargo build --locked --release
       - run: wc -c target/release/tit
+
+  bsd:
+    name: release (${{ matrix.platform.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: FreeBSD 15.1
+            os: freebsd
+            version: '15.1'
+            install: sudo pkg install -y git rust
+          - name: OpenBSD 7.9
+            os: openbsd
+            version: '7.9'
+            install: sudo pkg_add git rust
+          - name: NetBSD 10.1
+            os: netbsd
+            version: '10.1'
+            install: sudo pkgin -y install git-base rust
+    defaults:
+      run:
+        shell: cpa.sh {0}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Start ${{ matrix.platform.name }}
+        uses: cross-platform-actions/action@5ea7e8e4677bd726033a10b094ba1c5762b15dee # v1.3.0
+        with:
+          operating_system: ${{ matrix.platform.os }}
+          version: ${{ matrix.platform.version }}
+          cpu_count: 4
+          memory: 6G
+      - name: Install build and test tools
+        run: ${{ matrix.platform.install }}
+      - run: cargo --version
+      - run: cargo test --locked --all-targets --all-features
+      - run: cargo build --locked --release
+      - run: wc -c target/release/tit
