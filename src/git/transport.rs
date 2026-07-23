@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
@@ -9,6 +11,7 @@ const MAX_BLOCKING_GIT_JOBS: usize = 4;
 #[derive(Clone)]
 pub(crate) struct GitRepositories {
     root: PathBuf,
+    managed_public: Option<Arc<HashMap<(String, String), String>>>,
     push_database: Option<PathBuf>,
     push_jobs: std::sync::Arc<Semaphore>,
     blocking_jobs: std::sync::Arc<Semaphore>,
@@ -22,6 +25,7 @@ impl GitRepositories {
         })?;
         Ok(Self {
             root,
+            managed_public: None,
             push_database: None,
             push_jobs: std::sync::Arc::new(Semaphore::new(1)),
             blocking_jobs: std::sync::Arc::new(Semaphore::new(MAX_BLOCKING_GIT_JOBS)),
@@ -37,6 +41,25 @@ impl GitRepositories {
         Ok(repositories)
     }
 
+    pub(crate) fn new_managed_public(
+        root: &Path,
+        repositories: impl IntoIterator<Item = (String, String, String)>,
+    ) -> Result<Self, RepositoryPathError> {
+        let mut service = Self::new(root)?;
+        let mut paths = HashMap::new();
+        for (owner, repository, id) in repositories {
+            if !valid_managed_id(&id)
+                || paths
+                    .insert((owner.clone(), repository.clone()), id)
+                    .is_some()
+            {
+                return Err(RepositoryPathError::InvalidCatalog);
+            }
+        }
+        service.managed_public = Some(Arc::new(paths));
+        Ok(service)
+    }
+
     pub(crate) fn resolve(
         &self,
         owner: &str,
@@ -49,7 +72,21 @@ impl GitRepositories {
         if !valid_name(repository, 100) {
             return Err(RepositoryPathError::InvalidName);
         }
-        let candidate = self.root.join(owner).join(format!("{repository}.git"));
+        let candidate = match &self.managed_public {
+            Some(repositories) => {
+                let id = repositories
+                    .get(&(owner.to_owned(), repository.to_owned()))
+                    .ok_or_else(|| RepositoryPathError::Repository {
+                        path: self.root.join(owner).join(repository),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "repository is not public and active",
+                        ),
+                    })?;
+                self.root.join(format!("{id}.git"))
+            }
+            None => self.root.join(owner).join(format!("{repository}.git")),
+        };
         let candidate =
             fs::canonicalize(&candidate).map_err(|source| RepositoryPathError::Repository {
                 path: candidate,
@@ -131,6 +168,13 @@ impl GitRepositories {
     }
 }
 
+fn valid_managed_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 pub(crate) enum GitSshService {
     Upload(PathBuf),
     Receive(PathBuf),
@@ -166,6 +210,8 @@ pub(crate) enum RepositoryPathError {
     },
     #[error("repository resolves outside the repository root")]
     OutsideRoot,
+    #[error("managed repository catalog is not valid")]
+    InvalidCatalog,
 }
 
 #[cfg(test)]
@@ -210,5 +256,33 @@ mod tests {
         ] {
             assert!(repositories.resolve_ssh_command(command).is_err());
         }
+    }
+
+    #[test]
+    fn resolves_managed_public_repositories_by_immutable_id() {
+        let directory = TempDir::new().expect("create a managed repository root");
+        let id = "11111111111111111111111111111111";
+        let repository = directory.path().join(format!("{id}.git"));
+        fs::create_dir(&repository).expect("create a managed repository");
+        let repositories = GitRepositories::new_managed_public(
+            directory.path(),
+            [("alice".to_owned(), "example".to_owned(), id.to_owned())],
+        )
+        .expect("open the managed repository root");
+
+        assert_eq!(
+            repositories
+                .resolve_ssh_command(b"git-upload-pack '/alice/example.git'")
+                .expect("resolve a managed repository"),
+            fs::canonicalize(&repository).expect("canonicalize the managed repository")
+        );
+        assert!(repositories.resolve("alice", "missing").is_err());
+        assert!(matches!(
+            GitRepositories::new_managed_public(
+                directory.path(),
+                [("alice".to_owned(), "bad".to_owned(), "not-an-id".to_owned())]
+            ),
+            Err(RepositoryPathError::InvalidCatalog)
+        ));
     }
 }

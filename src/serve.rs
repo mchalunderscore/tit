@@ -1,0 +1,250 @@
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+use rand::rng;
+use ssh_key::{Algorithm, LineEnding, PrivateKey};
+use thiserror::Error;
+
+use crate::auth::{AuthError, SshPublicKey};
+use crate::config::{Config, ConfigError};
+use crate::git::transport::{GitRepositories, RepositoryPathError};
+use crate::http::{PublicWebConfig, RunningWebServer, WebError};
+use crate::instance::{InstanceError, InstanceLock, prepare_database, prepare_repository_root};
+use crate::ssh::{RunningSshServer, SshServerError};
+use crate::store::{Store, StoreError};
+
+pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
+    let _lock = InstanceLock::acquire(&config.instance_dir)?;
+    let database = prepare_database(&config.instance_dir)?;
+    let repository_root = prepare_repository_root(&config.instance_dir)?;
+    let store = Store::open(&database)?;
+    let keys = store
+        .active_ssh_public_keys()?
+        .into_iter()
+        .map(|key| SshPublicKey::parse(&key))
+        .collect::<Result<Vec<_>, _>>()?;
+    let repositories = store
+        .active_public_repositories()?
+        .into_iter()
+        .map(|repository| (repository.owner, repository.slug, repository.id));
+    let git = GitRepositories::new_managed_public(&repository_root, repositories)?;
+    drop(store);
+
+    let (http_clone_base, ssh_clone_base) = clone_bases(config)?;
+    let host_key = load_or_create_host_key(&config.instance_dir)?;
+    let web = RunningWebServer::start_public(
+        config.http_listen,
+        PublicWebConfig {
+            instance_dir: config.instance_dir.clone(),
+            http_clone_base,
+            ssh_clone_base,
+        },
+    )
+    .await?;
+    let ssh = match RunningSshServer::start_with_git_and_host_key(
+        config.ssh_listen,
+        &keys,
+        git,
+        host_key,
+    )
+    .await
+    {
+        Ok(ssh) => ssh,
+        Err(error) => {
+            web.shutdown().await?;
+            return Err(error.into());
+        }
+    };
+
+    let signal = shutdown_signal().await;
+    let (ssh_result, web_result) = tokio::join!(ssh.shutdown(), web.shutdown());
+    ssh_result?;
+    web_result?;
+    signal.map_err(ServeError::Signal)
+}
+
+const HOST_KEY_FILE: &str = "ssh_host_ed25519_key";
+const MAX_HOST_KEY_BYTES: u64 = 64 * 1024;
+
+fn load_or_create_host_key(instance_dir: &Path) -> Result<PrivateKey, ServeError> {
+    let path = instance_dir.join(HOST_KEY_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(ServeError::InvalidHostKeyFile(path));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return create_host_key(&path);
+        }
+        Err(source) => return Err(ServeError::HostKeyIo { path, source }),
+    }
+    read_host_key(&path)
+}
+
+fn create_host_key(path: &Path) -> Result<PrivateKey, ServeError> {
+    let key = PrivateKey::random(&mut rng(), Algorithm::Ed25519)?;
+    let encoded = key.to_openssh(LineEnding::LF)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|source| ServeError::HostKeyIo {
+            path: path.to_owned(),
+            source,
+        })?;
+    file.write_all(encoded.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|source| ServeError::HostKeyIo {
+            path: path.to_owned(),
+            source,
+        })?;
+    Ok(key)
+}
+
+fn read_host_key(path: &Path) -> Result<PrivateKey, ServeError> {
+    let file = File::open(path).map_err(|source| ServeError::HostKeyIo {
+        path: path.to_owned(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| ServeError::HostKeyIo {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if !metadata.file_type().is_file() {
+        return Err(ServeError::InvalidHostKeyFile(path.to_owned()));
+    }
+    if mode & 0o077 != 0 {
+        return Err(ServeError::HostKeyPermissions {
+            path: path.to_owned(),
+            mode,
+        });
+    }
+    if metadata.len() > MAX_HOST_KEY_BYTES {
+        return Err(ServeError::InvalidHostKeyFile(path.to_owned()));
+    }
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| ServeError::InvalidHostKeyFile(path.to_owned()))?;
+    let mut encoded = Vec::with_capacity(capacity);
+    file.take(MAX_HOST_KEY_BYTES + 1)
+        .read_to_end(&mut encoded)
+        .map_err(|source| ServeError::HostKeyIo {
+            path: path.to_owned(),
+            source,
+        })?;
+    if encoded.len() as u64 > MAX_HOST_KEY_BYTES {
+        return Err(ServeError::InvalidHostKeyFile(path.to_owned()));
+    }
+    let key = PrivateKey::from_openssh(&encoded)?;
+    if key.algorithm() != Algorithm::Ed25519 || key.is_encrypted() {
+        return Err(ServeError::InvalidHostKeyFile(path.to_owned()));
+    }
+    Ok(key)
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
+}
+
+fn clone_bases(config: &Config) -> Result<(String, String), ConfigError> {
+    let (http, ssh) = config.clone_urls("owner", "repository")?;
+    let suffix = "/owner/repository";
+    Ok((
+        http.as_str()
+            .strip_suffix(suffix)
+            .expect("the HTTP clone URL contains the supplied path")
+            .to_owned(),
+        ssh.as_str()
+            .strip_suffix(suffix)
+            .expect("the SSH clone URL contains the supplied path")
+            .to_owned(),
+    ))
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ServeError {
+    #[error(transparent)]
+    Instance(#[from] InstanceError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Authentication(#[from] AuthError),
+    #[error(transparent)]
+    Repository(#[from] RepositoryPathError),
+    #[error(transparent)]
+    Configuration(#[from] ConfigError),
+    #[error(transparent)]
+    Web(#[from] WebError),
+    #[error(transparent)]
+    Ssh(#[from] SshServerError),
+    #[error("cannot wait for a shutdown signal: {0}")]
+    Signal(std::io::Error),
+    #[error("cannot read or write SSH host key {path}: {source}")]
+    HostKeyIo {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("SSH host key path is not a valid Ed25519 private-key file: {0}")]
+    InvalidHostKeyFile(PathBuf),
+    #[error("SSH host key permissions for {path} are {mode:o}, expected 600 or more restrictive")]
+    HostKeyPermissions { path: PathBuf, mode: u32 },
+    #[error(transparent)]
+    HostKey(#[from] ssh_key::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn persists_a_private_host_key_and_rejects_unsafe_replacements() {
+        let directory = TempDir::new().expect("create a host-key directory");
+        let first = load_or_create_host_key(directory.path()).expect("create a host key");
+        let path = directory.path().join(HOST_KEY_FILE);
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("inspect the host key")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let second = load_or_create_host_key(directory.path()).expect("read the host key");
+        assert_eq!(first.public_key(), second.public_key());
+
+        let mut permissions = fs::metadata(&path)
+            .expect("inspect the host key")
+            .permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&path, permissions).expect("make the host key unsafe");
+        assert!(matches!(
+            load_or_create_host_key(directory.path()),
+            Err(ServeError::HostKeyPermissions { mode: 0o644, .. })
+        ));
+
+        fs::remove_file(&path).expect("remove the host key");
+        symlink(directory.path().join("target"), &path).expect("replace the host key with a link");
+        assert!(matches!(
+            load_or_create_host_key(directory.path()),
+            Err(ServeError::InvalidHostKeyFile(candidate)) if candidate == path
+        ));
+    }
+}

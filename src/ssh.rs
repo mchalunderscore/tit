@@ -37,7 +37,8 @@ impl RunningSshServer {
         address: SocketAddr,
         authorized_keys: &[SshPublicKey],
     ) -> Result<Self, SshServerError> {
-        Self::start_inner(address, authorized_keys, &[], None).await
+        let host_key = PrivateKey::random(&mut rng(), Algorithm::Ed25519)?;
+        Self::start_inner(address, authorized_keys, &[], None, host_key).await
     }
 
     pub(crate) async fn start_with_git(
@@ -45,7 +46,17 @@ impl RunningSshServer {
         authorized_keys: &[SshPublicKey],
         repositories: GitRepositories,
     ) -> Result<Self, SshServerError> {
-        Self::start_inner(address, authorized_keys, &[], Some(repositories)).await
+        let host_key = PrivateKey::random(&mut rng(), Algorithm::Ed25519)?;
+        Self::start_inner(address, authorized_keys, &[], Some(repositories), host_key).await
+    }
+
+    pub(crate) async fn start_with_git_and_host_key(
+        address: SocketAddr,
+        authorized_keys: &[SshPublicKey],
+        repositories: GitRepositories,
+        host_key: PrivateKey,
+    ) -> Result<Self, SshServerError> {
+        Self::start_inner(address, authorized_keys, &[], Some(repositories), host_key).await
     }
 
     pub(crate) async fn start_with_git_writes(
@@ -64,7 +75,15 @@ impl RunningSshServer {
         .await
         .map_err(|_| SshServerError::Join)?
         .map_err(|error| SshServerError::Recovery(error.to_string()))?;
-        Self::start_inner(address, authorized_keys, writable_keys, Some(repositories)).await
+        let host_key = PrivateKey::random(&mut rng(), Algorithm::Ed25519)?;
+        Self::start_inner(
+            address,
+            authorized_keys,
+            writable_keys,
+            Some(repositories),
+            host_key,
+        )
+        .await
     }
 
     async fn start_inner(
@@ -72,10 +91,10 @@ impl RunningSshServer {
         authorized_keys: &[SshPublicKey],
         writable_keys: &[SshPublicKey],
         repositories: Option<GitRepositories>,
+        host_key: PrivateKey,
     ) -> Result<Self, SshServerError> {
         let listener = TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
-        let host_key = PrivateKey::random(&mut rng(), Algorithm::Ed25519)?;
         let mut methods = MethodSet::empty();
         methods.push(MethodKind::PublicKey);
         let config = Arc::new(russh::server::Config {

@@ -15,6 +15,25 @@ Install the Rust toolchain that `rust-toolchain.toml` specifies. Then, run:
 cargo build --locked
 ```
 
+## Run
+
+Create the first administrator and import a bare repository before you start
+the server:
+
+```text
+tit --config /srv/tit/config.toml setup admin alice "SSH_PUBLIC_KEY"
+tit --config /srv/tit/config.toml admin repository import alice example /absolute/path/example.git
+tit --config /srv/tit/config.toml serve
+```
+
+The `serve` command starts the HTTP and SSH listeners in one process. It creates
+`ssh_host_ed25519_key` with mode 600 during the first start and uses the same
+host key during subsequent starts. Keep this file with the instance data.
+
+The server owns the instance lock until it receives SIGINT or SIGTERM. Stop the
+server before you run an offline administrator command. A subsequent milestone
+routes necessary online administrator commands through the control socket.
+
 ## Quality gate
 
 Install `cargo-deny` version 0.20.2. Then, run this command from the repository

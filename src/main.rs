@@ -9,16 +9,14 @@ mod cli;
 mod config;
 mod domain;
 mod feed;
-#[allow(dead_code, reason = "M1C proves Git reads before the CLI serves them")]
+#[allow(dead_code, reason = "the server uses only part of the shared Git API")]
 mod git;
-#[allow(
-    dead_code,
-    reason = "M2 establishes the Web interface before tit serve calls it"
-)]
+#[allow(dead_code, reason = "the server uses only part of the shared HTTP API")]
 mod http;
 mod instance;
 mod markdown;
-#[allow(dead_code, reason = "M1B proves the SSH server before M2 calls it")]
+mod serve;
+#[allow(dead_code, reason = "the server uses only part of the shared SSH API")]
 mod ssh;
 mod store;
 
@@ -29,7 +27,8 @@ use clap::Parser;
 
 use crate::cli::{AdminCommand, Cli, Command, ObjectFormat, RepositoryCommand, SetupCommand};
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -42,6 +41,13 @@ fn main() -> ExitCode {
     match config::load(&cli) {
         Ok(config) => match cli.command {
             None => ExitCode::SUCCESS,
+            Some(Command::Serve) => match serve::run(&config).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("tit: {error}");
+                    ExitCode::FAILURE
+                }
+            },
             Some(Command::Doctor) => match store::doctor(&config.instance_dir) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {

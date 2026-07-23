@@ -567,6 +567,44 @@ impl Store {
 
     #[allow(
         dead_code,
+        reason = "some integration tests import storage without the server"
+    )]
+    pub(crate) fn active_ssh_public_keys(&self) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT ssh_public_key.canonical_key
+             FROM ssh_public_key
+             JOIN account ON account.id = ssh_public_key.account_id
+             WHERE account.state = 'active'
+             ORDER BY ssh_public_key.id",
+        )?;
+        statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests import storage without the server"
+    )]
+    pub(crate) fn active_public_repositories(&self) -> Result<Vec<RepositoryRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT repository.id, account.username, repository.slug,
+                    repository.visibility, repository.state, repository.object_format,
+                    repository.created_at, repository.archived_at
+             FROM repository
+             JOIN account ON account.id = repository.owner_account_id
+             WHERE repository.visibility = 'public' AND repository.state = 'active'
+             ORDER BY account.username, repository.slug",
+        )?;
+        statement
+            .query_map([], repository_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    #[allow(
+        dead_code,
         reason = "some integration tests import storage without public event pages"
     )]
     pub(crate) fn public_repository_events(

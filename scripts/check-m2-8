@@ -4,3 +4,4 @@ set -eu
 ./scripts/check
 cargo test --locked --release --test git_reads measures_bounded_search_without_an_index -- --ignored --nocapture
 cargo test --locked --release --test public_routes browses_and_clones_public_repositories_for_both_hash_formats
+cargo test --locked --release --test serve serves_an_imported_repository_through_http_and_ssh

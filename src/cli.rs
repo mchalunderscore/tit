@@ -46,6 +46,8 @@ pub(crate) struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Start the HTTP and SSH servers
+    Serve,
     /// Check the instance database
     Doctor,
     /// Set up an uninitialized instance
