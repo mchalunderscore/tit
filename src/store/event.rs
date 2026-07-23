@@ -28,6 +28,7 @@ pub(super) enum EventKind {
     PullRequestLineCommented,
     PullRequestApproved,
     PullRequestChangesRequested,
+    PullRequestMerged,
 }
 
 impl EventKind {
@@ -57,7 +58,33 @@ impl EventKind {
             Self::PullRequestLineCommented => "pull-request-line-commented",
             Self::PullRequestApproved => "pull-request-approved",
             Self::PullRequestChangesRequested => "pull-request-changes-requested",
+            Self::PullRequestMerged => "pull-request-merged",
         }
+    }
+}
+
+pub(super) fn pull_request_merge(
+    pull_request_id: &str,
+    number: i64,
+    revision: i64,
+    method: &str,
+    base_ref: &str,
+    old_target: &str,
+    new_target: &str,
+) -> VersionedEvent {
+    VersionedEvent {
+        kind: EventKind::PullRequestMerged,
+        payload: json!({
+            "version": PAYLOAD_VERSION,
+            "pull_request_id": pull_request_id,
+            "number": number,
+            "revision": revision,
+            "method": method,
+            "base_ref": base_ref,
+            "old_target": old_target,
+            "new_target": new_target,
+        })
+        .to_string(),
     }
 }
 

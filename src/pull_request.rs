@@ -14,8 +14,9 @@ use crate::git::read::{
 };
 use crate::git::repository::{GitRepository, GitRepositoryError};
 use crate::store::{
-    NewPullRequestRefIntent, NewPullRequestReview, PullRequestDetail, PullRequestRecord,
-    PullRequestRefIntentRecord, PullRequestRevisionRecord, Store, StoreError,
+    GitOperationIntent, NewPullRequestMerge, NewPullRequestRefIntent, NewPullRequestReview,
+    PullRequestDetail, PullRequestRecord, PullRequestRefIntentRecord, PullRequestRevisionRecord,
+    Store, StoreError,
 };
 
 pub(crate) const MAX_TITLE_BYTES: usize = 200;
@@ -266,6 +267,9 @@ impl PullRequestService {
         self.recover_inner()?;
         let detail =
             Store::open(&self.database)?.pull_request(owner, repository, number, Some(actor))?;
+        if detail.pull_request.state != "open" {
+            return Err(StoreError::PullRequestState.into());
+        }
         let revision = detail
             .revisions
             .iter()
@@ -327,6 +331,128 @@ impl PullRequestService {
             .map_err(Into::into)
     }
 
+    pub(crate) fn merge(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        actor: &str,
+        method: &str,
+    ) -> Result<PullRequestRecord, PullRequestError> {
+        validate_context(owner, repository, actor)?;
+        if number < 1 || !matches!(method, "fast-forward" | "merge-commit") {
+            return Err(PullRequestError::MergeMethod);
+        }
+        let _operation = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.recover_inner()?;
+        let detail =
+            Store::open(&self.database)?.pull_request(owner, repository, number, Some(actor))?;
+        if detail.pull_request.state != "open" {
+            return Err(StoreError::PullRequestState.into());
+        }
+        if !detail.can_merge {
+            return Err(StoreError::PullRequestDenied.into());
+        }
+        let revision = detail.revisions.last().ok_or(PullRequestError::Revision)?;
+        let path = self.repository_path(&detail.repository.id)?;
+        let git = GitRepository::open(&path)?;
+        let base = git.resolve_branch(&detail.pull_request.base_ref)?;
+        let head = git.resolve_branch(&detail.pull_request.head_ref)?;
+        if base.to_string() != revision.base_object_id
+            || head.to_string() != revision.head_object_id
+        {
+            return Err(PullRequestError::StaleRevision);
+        }
+        let reader = RepositoryReadService::open(&path, ReadLimits::default())?;
+        let comparison = reader.comparison(base, head, &ReadCancellation::default())?;
+        let intent_id = random_id()?;
+        let created_at = timestamp()?;
+        let merge_message = format!(
+            "Merge pull request #{number} from {}\n\n{}",
+            detail.pull_request.head_ref, detail.pull_request.title
+        );
+        let new_target = match (method, comparison.mergeability) {
+            ("fast-forward", crate::git::read::Mergeability::FastForward) => head,
+            ("merge-commit", crate::git::read::Mergeability::Clean) => {
+                git.prepare_merge_commit(base, head, actor, created_at, &merge_message)?
+            }
+            _ => return Err(PullRequestError::Mergeability),
+        };
+        let repository_text = path.to_str().ok_or(PullRequestError::RepositoryPath)?;
+        let quarantine = path.join("objects").join("tit-quarantine").join(&intent_id);
+        let quarantine_text = quarantine
+            .to_str()
+            .ok_or(PullRequestError::RepositoryPath)?;
+        let initial = serialize_ref(base, &detail.pull_request.base_ref);
+        let proposed = serialize_ref(new_target, &detail.pull_request.base_ref);
+        let base_text = base.to_string();
+        let head_text = head.to_string();
+        let new_target_text = new_target.to_string();
+        let mut store = Store::open(&self.database)?;
+        store.begin_pull_request_merge(
+            &NewPullRequestMerge {
+                owner,
+                repository,
+                number,
+                revision: revision.number,
+                actor,
+                method,
+                base_ref: &detail.pull_request.base_ref,
+                old_target: &base_text,
+                head_target: &head_text,
+                new_target: &new_target_text,
+                created_at,
+            },
+            &GitOperationIntent {
+                id: &intent_id,
+                repository_path: repository_text,
+                actor,
+                initial_refs: &initial,
+                proposed_refs: &proposed,
+                event_payload: &proposed,
+                quarantine_path: quarantine_text,
+                created_at,
+            },
+        )?;
+        crash_point("merge-intent");
+        if method == "merge-commit" {
+            match git.write_merge_commit(base, head, actor, created_at, &merge_message) {
+                Ok(written) if written == new_target => {}
+                Ok(_) => {
+                    store.abandon_git_intent(&intent_id)?;
+                    return Err(PullRequestError::NonDeterministicMerge);
+                }
+                Err(error) => {
+                    store.abandon_git_intent(&intent_id)?;
+                    return Err(error.into());
+                }
+            }
+        }
+        store.mark_git_objects_promoted(&intent_id, None)?;
+        crash_point("merge-objects");
+        if let Err(error) = git.update_reference_with_log(
+            &detail.pull_request.base_ref,
+            Some(base),
+            new_target,
+            "merge pull request",
+        ) {
+            match git.reference_target(&detail.pull_request.base_ref)? {
+                Some(current) if current == new_target => store.complete_git_intent(&intent_id)?,
+                _ => store.abandon_git_intent(&intent_id)?,
+            }
+            return Err(error.into());
+        }
+        crash_point("merge-ref");
+        store.complete_git_intent(&intent_id)?;
+        crash_point("merge-completed");
+        Ok(store
+            .pull_request(owner, repository, number, Some(actor))?
+            .pull_request)
+    }
+
     #[allow(
         dead_code,
         reason = "some integration tests compile the service without the Web list route"
@@ -358,6 +484,7 @@ impl PullRequestService {
             .operations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::git::receive_pack::recover_incomplete_pushes(&self.database)?;
         self.recover_inner()
     }
 
@@ -498,6 +625,10 @@ fn pull_request_ref(number: i64) -> String {
     format!("refs/pull/{number}/head")
 }
 
+fn serialize_ref(id: ObjectId, name: &str) -> Vec<u8> {
+    format!("{id} {name}\n").into_bytes()
+}
+
 fn parse_id(value: &str) -> Result<ObjectId, PullRequestError> {
     ObjectId::from_hex(value.as_bytes()).map_err(|_| PullRequestError::StoredObjectId)
 }
@@ -564,6 +695,14 @@ pub(crate) enum PullRequestError {
     ReviewBody,
     #[error("pull-request review line anchor is not valid")]
     ReviewAnchor,
+    #[error("pull-request merge method is not valid")]
+    MergeMethod,
+    #[error("pull-request revision is not the current branch state")]
+    StaleRevision,
+    #[error("pull request cannot use the requested merge method")]
+    Mergeability,
+    #[error("pull-request merge did not produce a deterministic commit")]
+    NonDeterministicMerge,
     #[error("pull-request refs have not changed")]
     Unchanged,
     #[error("stored pull-request object ID is not valid")]
@@ -576,6 +715,8 @@ pub(crate) enum PullRequestError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Read(#[from] ReadError),
+    #[error(transparent)]
+    ReceivePack(#[from] crate::git::receive_pack::ReceivePackError),
     #[error("cannot create a random pull-request ID")]
     Random,
     #[error("the system clock is before the Unix epoch")]

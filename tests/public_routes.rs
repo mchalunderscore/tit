@@ -911,6 +911,29 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     assert_eq!(revised_again.status, 303);
     let outdated = request(server.address(), "GET", "/alice/example/pulls/1", &[], &[]);
     assert!(outdated.text().contains("<strong>Outdated</strong>"));
+    let merge_page = request(
+        server.address(),
+        "GET",
+        "/alice/example/pulls/1",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    );
+    assert!(merge_page.text().contains("Fast-forward refs/heads/main"));
+    let merge = request(
+        server.address(),
+        "POST",
+        "/alice/example/pulls/1/merge",
+        &headers,
+        form(&[("csrf", csrf.as_str()), ("method", "fast-forward")]).as_bytes(),
+    );
+    assert_eq!(merge.status, 303);
+    let merged = request(server.address(), "GET", "/alice/example/pulls/1", &[], &[]);
+    assert!(merged.text().contains("merged · opened by alice"));
+    assert!(merged.text().contains("pull-request-merged"));
+    assert_eq!(
+        rev_parse(&bare, "refs/heads/main"),
+        rev_parse(&bare, "refs/heads/feature")
+    );
     let search_page = request(server.address(), "GET", "/search", &[], &[]);
     assert_eq!(search_page.status, 200);
     assert!(

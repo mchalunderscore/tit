@@ -442,10 +442,17 @@ fn recover_intent(store: &mut Store, intent: &GitIntentRecord) -> Result<(), Rec
         ("pending", true, false) | ("pending", true, true) => {
             store.abandon_git_intent(&intent.id)?;
         }
+        ("pending", false, false) if initial.len() == 1 => {
+            store.abandon_git_intent(&intent.id)?;
+        }
         ("promoted", false, true) => {
             store.complete_git_intent(&intent.id)?;
         }
         ("promoted", true, false) | ("promoted", true, true) => {
+            remove_promoted_pack(repository_path, intent.pack_name.as_deref())?;
+            store.abandon_git_intent(&intent.id)?;
+        }
+        ("promoted", false, false) if initial.len() == 1 => {
             remove_promoted_pack(repository_path, intent.pack_name.as_deref())?;
             store.abandon_git_intent(&intent.id)?;
         }

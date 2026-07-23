@@ -36,6 +36,10 @@ pub(super) fn routes() -> Router<WebState> {
             "/{owner}/{repository}/pulls/{number}/reviews",
             post(create_review),
         )
+        .route(
+            "/{owner}/{repository}/pulls/{number}/merge",
+            post(merge_pull_request),
+        )
         .layer(DefaultBodyLimit::max(MAX_PULL_REQUEST_BYTES))
 }
 
@@ -162,10 +166,45 @@ async fn pull_request_detail(
                     can_review: detail.can_review
                         && !csrf.is_empty()
                         && result.revision.number == pull_request_revision(detail),
+                    can_merge: detail.can_merge
+                        && !csrf.is_empty()
+                        && result.revision.number == pull_request_revision(detail),
                 },
             )
         }
         Err(error) => read_error(error, &request_id.0),
+    }
+}
+
+async fn merge_pull_request(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(path): Path<PullRequestPath>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "method"]) {
+        Ok(fields) => fields,
+        Err(()) => return bad_request(&request_id.0),
+    };
+    let actor =
+        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
+            Ok(actor) => actor,
+            Err(response) => return response,
+        };
+    let Some(service) = state.pull_requests.clone() else {
+        return internal(&request_id.0);
+    };
+    let owner = path.owner.clone();
+    let repository = path.repository.clone();
+    let number = path.number;
+    let result = job(state, move || {
+        service.merge(&owner, &repository, number, &actor, &fields[1])
+    })
+    .await;
+    match result {
+        Ok(_) => redirect(&path.owner, &path.repository, number),
+        Err(error) => mutation_error(error, &request_id.0),
     }
 }
 
@@ -377,11 +416,18 @@ fn mutation_error(error: PullRequestError, request_id: &str) -> Response {
         | PullRequestError::ReviewKind
         | PullRequestError::ReviewBody
         | PullRequestError::ReviewAnchor
+        | PullRequestError::MergeMethod
         | PullRequestError::Store(StoreError::PullRequestRevisionNotFound)
         | PullRequestError::Store(StoreError::PullRequestReviewAnchor)
         | PullRequestError::Git(crate::git::repository::GitRepositoryError::MissingReference(_)) => {
             bad_request(request_id)
         }
+        PullRequestError::StaleRevision | PullRequestError::Mergeability => render_error(
+            StatusCode::CONFLICT,
+            request_id,
+            "Pull-request conflict",
+            "The pull request cannot be merged in its current state.",
+        ),
         _ => internal(request_id),
     }
 }
@@ -490,6 +536,7 @@ struct PullRequestTemplate<'a> {
     csrf: &'a str,
     can_revise: bool,
     can_review: bool,
+    can_merge: bool,
 }
 
 struct ReviewView<'a> {

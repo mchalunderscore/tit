@@ -26,6 +26,7 @@ mod store;
 
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -36,7 +37,7 @@ use git::repository::GitRepository;
 use gix::hash::ObjectId;
 use pull_request::{PullRequestError, PullRequestService};
 use rusqlite::params;
-use store::{NewPullRequestRefIntent, Store, StoreError};
+use store::{GitOperationIntent, NewPullRequestMerge, NewPullRequestRefIntent, Store, StoreError};
 use tempfile::TempDir;
 
 #[test]
@@ -247,6 +248,301 @@ fn creates_revises_and_recovers_numbered_pull_request_refs_for_both_hashes() {
             ]
         );
     }
+}
+
+#[test]
+fn fast_forwards_pull_requests_with_one_durable_merge_event_for_both_hashes() {
+    for (index, object_format) in ["sha1", "sha256"].into_iter().enumerate() {
+        let fixture = Fixture::new(object_format, index + 30);
+        let service = PullRequestService::new(&fixture.database, &fixture.repositories);
+        let opened = service
+            .open(
+                "alice",
+                "project",
+                "alice",
+                "Fast-forward the feature",
+                "Move the base ref to the reviewed head.",
+                "refs/heads/main",
+                "refs/heads/feature",
+            )
+            .expect("open a fast-forward pull request");
+        assert!(matches!(
+            service.merge("alice", "project", 1, "bob", "fast-forward"),
+            Err(PullRequestError::Store(StoreError::PullRequestDenied))
+        ));
+
+        let merged = service
+            .merge("alice", "project", 1, "alice", "fast-forward")
+            .expect("fast-forward the pull request");
+        assert_eq!(merged.state, "merged");
+        assert_eq!(
+            rev_parse(&fixture.bare, "refs/heads/main"),
+            opened.head_object_id
+        );
+        assert!(matches!(
+            service.merge("alice", "project", 1, "alice", "fast-forward"),
+            Err(PullRequestError::Store(StoreError::PullRequestState))
+        ));
+
+        let store = Store::open(&fixture.database).expect("open the merge store");
+        let intent_state: String = store
+            .connection()
+            .query_row(
+                "SELECT git_operation_intent.state
+                 FROM pull_request_merge_intent
+                 JOIN git_operation_intent
+                   ON git_operation_intent.id = pull_request_merge_intent.intent_id",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the merge intent");
+        assert_eq!(intent_state, "completed");
+        let events: Vec<String> = store
+            .connection()
+            .prepare(
+                "SELECT kind FROM repository_event
+                 WHERE sequence > 1 ORDER BY sequence",
+            )
+            .expect("prepare merge events")
+            .query_map([], |row| row.get(0))
+            .expect("query merge events")
+            .collect::<Result<_, _>>()
+            .expect("read merge events");
+        assert_eq!(events, ["push", "ref-updated", "pull-request-merged",]);
+    }
+}
+
+#[test]
+fn rejects_a_merge_when_the_base_moved_after_the_revision() {
+    let fixture = Fixture::new("sha1", 40);
+    let service = PullRequestService::new(&fixture.database, &fixture.repositories);
+    service
+        .open(
+            "alice",
+            "project",
+            "alice",
+            "Stale base",
+            "Do not merge a stale comparison.",
+            "refs/heads/main",
+            "refs/heads/feature",
+        )
+        .expect("open a pull request");
+    fixture.commit_on("main", "base.txt", "new base\n", "move the base");
+    assert!(matches!(
+        service.merge("alice", "project", 1, "alice", "fast-forward"),
+        Err(PullRequestError::StaleRevision)
+    ));
+    let count: i64 = Store::open(&fixture.database)
+        .expect("open the stale merge store")
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM pull_request_merge_intent",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count merge intents");
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn creates_worktree_free_merge_commits_with_deterministic_parents_for_both_hashes() {
+    for (index, object_format) in ["sha1", "sha256"].into_iter().enumerate() {
+        let fixture = Fixture::new(object_format, index + 50);
+        fixture.commit_on("main", "base.txt", "base side\n", "advance base");
+        run(
+            &fixture.worktree,
+            Command::new("git").args(["switch", "-q", "feature"]),
+        );
+        run(
+            &fixture.worktree,
+            Command::new("git").args(["mv", "feature.txt", "renamed-feature.txt"]),
+        );
+        let renamed = fixture.worktree.join("renamed-feature.txt");
+        fs::set_permissions(&renamed, fs::Permissions::from_mode(0o755))
+            .expect("set the executable mode");
+        git_commit(&fixture.worktree, "rename the feature");
+        run(
+            &fixture.worktree,
+            Command::new("git")
+                .args(["push", "-q"])
+                .arg(&fixture.bare)
+                .arg("feature"),
+        );
+
+        let git = GitRepository::open(&fixture.bare).expect("open the merge repository");
+        let base = git
+            .resolve_branch("refs/heads/main")
+            .expect("resolve the merge base");
+        let head = git
+            .resolve_branch("refs/heads/feature")
+            .expect("resolve the merge head");
+        let object_state = git_object_state(&fixture.bare);
+        let first = git
+            .prepare_merge_commit(base, head, "alice", 1234, "deterministic merge")
+            .expect("prepare a merge commit");
+        let second = git
+            .prepare_merge_commit(base, head, "alice", 1234, "deterministic merge")
+            .expect("prepare the same merge commit");
+        assert_eq!(first, second);
+        assert_eq!(git_object_state(&fixture.bare), object_state);
+        assert!(!fixture.bare.join("index").exists());
+
+        let service = PullRequestService::new(&fixture.database, &fixture.repositories);
+        service
+            .open(
+                "alice",
+                "project",
+                "alice",
+                "Merge the rename",
+                "Keep the rename and executable mode.",
+                "refs/heads/main",
+                "refs/heads/feature",
+            )
+            .expect("open a divergent pull request");
+        service
+            .merge("alice", "project", 1, "alice", "merge-commit")
+            .expect("create a merge commit");
+        let merged = rev_parse(&fixture.bare, "refs/heads/main");
+        assert_ne!(merged, base.to_string());
+        assert_ne!(merged, head.to_string());
+        let description = git_output(
+            &fixture.bare,
+            &["show", "-s", "--format=%an|%ae|%cn|%ce|%P|%s", &merged],
+        );
+        let expected = format!(
+            "alice|alice@users.tit|alice|alice@users.tit|{base} {head}|Merge pull request #1 from refs/heads/feature"
+        );
+        assert_eq!(description.trim(), expected);
+        let tree = git_output(&fixture.bare, &["ls-tree", "-r", &merged]);
+        assert!(tree.contains("100755 blob"));
+        assert!(tree.contains("\trenamed-feature.txt"));
+        assert!(tree.contains("\tbase.txt"));
+        assert!(!fixture.bare.join("index").exists());
+    }
+}
+
+#[test]
+fn rejects_a_conflicting_server_merge_without_moving_the_base() {
+    let fixture = Fixture::new("sha1", 60);
+    fixture.commit_on("main", "README.md", "main content\n", "change main");
+    fixture.commit_on(
+        "feature",
+        "README.md",
+        "feature content\n",
+        "change feature",
+    );
+    let base = rev_parse(&fixture.bare, "refs/heads/main");
+    let service = PullRequestService::new(&fixture.database, &fixture.repositories);
+    service
+        .open(
+            "alice",
+            "project",
+            "alice",
+            "Conflicting merge",
+            "Do not create a conflict commit.",
+            "refs/heads/main",
+            "refs/heads/feature",
+        )
+        .expect("open a conflicting pull request");
+    assert!(matches!(
+        service.merge("alice", "project", 1, "alice", "merge-commit"),
+        Err(PullRequestError::Mergeability)
+    ));
+    assert_eq!(rev_parse(&fixture.bare, "refs/heads/main"), base);
+    let count: i64 = Store::open(&fixture.database)
+        .expect("open the conflict store")
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM pull_request_merge_intent",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count conflict intents");
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn recovers_a_completed_merge_and_abandons_a_concurrent_base_change() {
+    let fixture = Fixture::new("sha1", 70);
+    let service = PullRequestService::new(&fixture.database, &fixture.repositories);
+    service
+        .open(
+            "alice",
+            "project",
+            "alice",
+            "Recover this merge",
+            "Complete metadata after the ref update.",
+            "refs/heads/main",
+            "refs/heads/feature",
+        )
+        .expect("open a recoverable pull request");
+    begin_test_merge_intent(&fixture, 1, "71000000000000000000000000000000");
+    let git = GitRepository::open(&fixture.bare).expect("open the recovery repository");
+    let base = git
+        .resolve_branch("refs/heads/main")
+        .expect("resolve the recovery base");
+    let head = git
+        .resolve_branch("refs/heads/feature")
+        .expect("resolve the recovery head");
+    git.update_reference_with_log("refs/heads/main", Some(base), head, "interrupted merge")
+        .expect("apply the interrupted merge ref");
+    service.recover().expect("recover merge metadata");
+    assert_eq!(
+        service
+            .get("alice", "project", 1, Some("alice"))
+            .expect("read the recovered merge")
+            .pull_request
+            .state,
+        "merged"
+    );
+
+    let concurrent = Fixture::new("sha1", 71);
+    let service = PullRequestService::new(&concurrent.database, &concurrent.repositories);
+    service
+        .open(
+            "alice",
+            "project",
+            "alice",
+            "Race the base",
+            "A concurrent base update wins before this ref moves.",
+            "refs/heads/main",
+            "refs/heads/feature",
+        )
+        .expect("open a concurrent pull request");
+    begin_test_merge_intent(&concurrent, 1, "72000000000000000000000000000000");
+    concurrent.commit_on("main", "raced.txt", "concurrent\n", "race the merge");
+    let raced_target = rev_parse(&concurrent.bare, "refs/heads/main");
+    service
+        .recover()
+        .expect("abandon the merge that did not update its ref");
+    assert_eq!(rev_parse(&concurrent.bare, "refs/heads/main"), raced_target);
+    assert_eq!(
+        service
+            .get("alice", "project", 1, Some("alice"))
+            .expect("read the unmerged pull request")
+            .pull_request
+            .state,
+        "open"
+    );
+    let store = Store::open(&concurrent.database).expect("open the raced merge store");
+    let state: String = store
+        .connection()
+        .query_row(
+            "SELECT state FROM git_operation_intent WHERE id = ?1",
+            ["72000000000000000000000000000000"],
+            |row| row.get(0),
+        )
+        .expect("read the raced intent state");
+    assert_eq!(state, "abandoned");
+    let merge_count: i64 = store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM pull_request_merge_intent",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count active merge metadata");
+    assert_eq!(merge_count, 0);
 }
 
 #[test]
@@ -745,6 +1041,60 @@ fn git_commit(worktree: &Path, message: &str) {
     run(worktree, &mut command);
 }
 
+fn begin_test_merge_intent(fixture: &Fixture, number: i64, intent_id: &str) {
+    let service = PullRequestService::new(&fixture.database, &fixture.repositories);
+    let detail = service
+        .get("alice", "project", number, Some("alice"))
+        .expect("read a merge intent pull request");
+    let revision = detail.revisions.last().expect("find the merge revision");
+    let git = GitRepository::open(&fixture.bare).expect("open the merge intent repository");
+    let base = git
+        .resolve_branch("refs/heads/main")
+        .expect("resolve the merge intent base");
+    let head = git
+        .resolve_branch("refs/heads/feature")
+        .expect("resolve the merge intent head");
+    let initial = format!("{base} refs/heads/main\n").into_bytes();
+    let proposed = format!("{head} refs/heads/main\n").into_bytes();
+    let created_at = revision.created_at + 1;
+    let quarantine = fixture
+        .bare
+        .join("objects")
+        .join("tit-quarantine")
+        .join(intent_id);
+    let mut store = Store::open(&fixture.database).expect("open the merge intent store");
+    store
+        .begin_pull_request_merge(
+            &NewPullRequestMerge {
+                owner: "alice",
+                repository: "project",
+                number,
+                revision: revision.number,
+                actor: "alice",
+                method: "fast-forward",
+                base_ref: "refs/heads/main",
+                old_target: &base.to_string(),
+                head_target: &head.to_string(),
+                new_target: &head.to_string(),
+                created_at,
+            },
+            &GitOperationIntent {
+                id: intent_id,
+                repository_path: fixture.bare.to_str().expect("a UTF-8 repository path"),
+                actor: "alice",
+                initial_refs: &initial,
+                proposed_refs: &proposed,
+                event_payload: &proposed,
+                quarantine_path: quarantine.to_str().expect("a UTF-8 quarantine path"),
+                created_at,
+            },
+        )
+        .expect("begin a test merge intent");
+    store
+        .mark_git_objects_promoted(intent_id, None)
+        .expect("mark test merge objects promoted");
+}
+
 fn rev_parse(repository: &Path, revision: &str) -> String {
     let output = Command::new("git")
         .args(["rev-parse", revision])
@@ -756,6 +1106,20 @@ fn rev_parse(repository: &Path, revision: &str) -> String {
         .expect("read a fixture object ID")
         .trim()
         .to_owned()
+}
+
+fn git_output(repository: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(repository)
+        .output()
+        .expect("run a Git inspection command");
+    assert!(
+        output.status.success(),
+        "Git inspection failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("read Git inspection output")
 }
 
 fn git_object_state(repository: &Path) -> String {

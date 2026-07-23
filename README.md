@@ -419,3 +419,19 @@ events, the chronological timeline, no-JavaScript Web forms, and historical
 schema migration. Read the
 [pull-request review architectural decision record](docs/adr/0024-pull-request-review.md)
 for the anchor, permission, event, and outdated-state contracts.
+
+## Milestone 5.4 gate
+
+Run the pull-request merge gate:
+
+```text
+./scripts/check-m5-4
+```
+
+This command tests fast-forward and server-created merge commits, SHA-1 and
+SHA-256 repositories, rename and mode preservation, deterministic parents,
+attribution, conflict and stale-ref rejection, intent recovery, concurrent base
+updates, atomic events, the no-JavaScript Web form, and historical schema
+migration. Read the
+[pull-request merge architectural decision record](docs/adr/0025-pull-request-merge.md)
+for the merge, permission, intent, and recovery contracts.

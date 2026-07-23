@@ -12,7 +12,7 @@ mod event;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
 const MAX_ACTIVE_FEED_TOKENS: i64 = 32;
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -22,7 +22,7 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 16] = [
+const MIGRATIONS: [&str; 17] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
@@ -39,6 +39,7 @@ const MIGRATIONS: [&str; 16] = [
     include_str!("migrations/014_feed_tokens.sql"),
     include_str!("migrations/015_pull_requests.sql"),
     include_str!("migrations/016_pull_request_reviews.sql"),
+    include_str!("migrations/017_pull_request_merges.sql"),
 ];
 
 #[allow(
@@ -355,6 +356,128 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn begin_pull_request_merge(
+        &mut self,
+        merge: &NewPullRequestMerge<'_>,
+        intent: &GitOperationIntent<'_>,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let access = repository_issue_access(
+            &transaction,
+            merge.owner,
+            merge.repository,
+            Some(merge.actor),
+        )?;
+        if !access.can_read() {
+            return Err(StoreError::PullRequestHidden);
+        }
+        if !access.can_maintain() {
+            return Err(StoreError::PullRequestDenied);
+        }
+        if managed_repository_id(intent.repository_path) != Some(access.repository.id.as_str()) {
+            return Err(StoreError::Integrity(
+                "pull-request merge repository path does not match its repository".to_owned(),
+            ));
+        }
+        let current = transaction
+            .query_row(
+                "SELECT pull_request.id, pull_request.state, pull_request.base_ref,
+                        pull_request.base_object_id, pull_request.head_object_id,
+                        pull_request_revision.id, pull_request_revision.number
+                 FROM pull_request
+                 JOIN pull_request_revision
+                   ON pull_request_revision.pull_request_id = pull_request.id
+                 WHERE pull_request.repository_id = ?1
+                   AND pull_request.number = ?2
+                   AND pull_request_revision.number =
+                       (SELECT MAX(number) FROM pull_request_revision AS latest
+                        WHERE latest.pull_request_id = pull_request.id)",
+                rusqlite::params![access.repository.id, merge.number],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::PullRequestNotFound(
+                    merge.owner.to_owned(),
+                    merge.repository.to_owned(),
+                    merge.number,
+                )
+            })?;
+        if current.1 != "open" {
+            return Err(StoreError::PullRequestState);
+        }
+        if current.2 != merge.base_ref
+            || current.3 != merge.old_target
+            || current.4 != merge.head_target
+            || current.6 != merge.revision
+        {
+            return Err(StoreError::PullRequestRevisionNotFound);
+        }
+        let initial = parse_event_refs(intent.initial_refs)?;
+        let proposed = parse_event_refs(intent.proposed_refs)?;
+        if initial
+            != [(
+                merge.old_target.to_owned(),
+                merge.base_ref.as_bytes().to_vec(),
+            )]
+            || proposed
+                != [(
+                    merge.new_target.to_owned(),
+                    merge.base_ref.as_bytes().to_vec(),
+                )]
+        {
+            return Err(StoreError::EventPayload);
+        }
+        transaction.execute(
+            "INSERT INTO git_operation_intent
+             (id, repository_path, actor, initial_refs, proposed_refs, event_payload,
+              quarantine_path, state, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
+            rusqlite::params![
+                intent.id,
+                intent.repository_path,
+                intent.actor,
+                intent.initial_refs,
+                intent.proposed_refs,
+                intent.event_payload,
+                intent.quarantine_path,
+                intent.created_at,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO pull_request_merge_intent
+             (intent_id, repository_id, pull_request_id, revision_id, revision_number,
+              method, base_ref, old_target, new_target, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                intent.id,
+                access.repository.id,
+                current.0,
+                current.5,
+                merge.revision,
+                merge.method,
+                merge.base_ref,
+                merge.old_target,
+                merge.new_target,
+                merge.created_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn mark_git_objects_promoted(
         &self,
         id: &str,
@@ -415,17 +538,27 @@ impl Store {
             &proposed_refs,
             created_at,
         )?;
+        complete_pull_request_merge(&transaction, id, &actor, created_at)?;
         transaction.commit()?;
         Ok(())
     }
 
-    pub(crate) fn abandon_git_intent(&self, id: &str) -> Result<(), StoreError> {
-        let changed = self.connection.execute(
+    pub(crate) fn abandon_git_intent(&mut self, id: &str) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM pull_request_merge_intent WHERE intent_id = ?1",
+            [id],
+        )?;
+        let changed = transaction.execute(
             "UPDATE git_operation_intent SET state = 'abandoned'
              WHERE id = ?1 AND state IN ('pending', 'promoted')",
             [id],
         )?;
-        require_one_intent(id, changed)
+        require_one_intent(id, changed)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     #[allow(
@@ -1844,15 +1977,18 @@ impl Store {
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let can_revise = access.can_write_repository();
+        let is_open = pull_request.state == "open";
+        let can_revise = is_open && access.can_write_repository();
+        let can_merge = access.can_maintain() && pull_request.state == "open";
         Ok(PullRequestDetail {
-            can_review: access.active_actor_id.is_some() && access.can_read(),
+            can_review: is_open && access.active_actor_id.is_some() && access.can_read(),
             repository: access.repository,
             pull_request,
             revisions,
             reviews,
             timeline,
             can_revise,
+            can_merge,
         })
     }
 
@@ -3238,6 +3374,7 @@ pub(crate) struct PullRequestDetail {
     pub(crate) timeline: Vec<PullRequestTimelineRecord>,
     pub(crate) can_revise: bool,
     pub(crate) can_review: bool,
+    pub(crate) can_merge: bool,
 }
 
 pub(crate) struct NewPullRequestReview<'a> {
@@ -3395,6 +3532,20 @@ pub(crate) struct GitOperationIntent<'a> {
     pub(crate) proposed_refs: &'a [u8],
     pub(crate) event_payload: &'a [u8],
     pub(crate) quarantine_path: &'a str,
+    pub(crate) created_at: i64,
+}
+
+pub(crate) struct NewPullRequestMerge<'a> {
+    pub(crate) owner: &'a str,
+    pub(crate) repository: &'a str,
+    pub(crate) number: i64,
+    pub(crate) revision: i64,
+    pub(crate) actor: &'a str,
+    pub(crate) method: &'a str,
+    pub(crate) base_ref: &'a str,
+    pub(crate) old_target: &'a str,
+    pub(crate) head_target: &'a str,
+    pub(crate) new_target: &'a str,
     pub(crate) created_at: i64,
 }
 
@@ -4065,6 +4216,90 @@ fn insert_domain_event(
         ],
     )?;
     Ok(())
+}
+
+fn complete_pull_request_merge(
+    transaction: &rusqlite::Transaction<'_>,
+    intent_id: &str,
+    actor: &str,
+    completed_at: i64,
+) -> Result<(), StoreError> {
+    let merge = transaction
+        .query_row(
+            "SELECT merge.repository_id, merge.pull_request_id, pull_request.number,
+                    merge.revision_id, merge.revision_number, merge.method,
+                    merge.base_ref, merge.old_target, merge.new_target,
+                    pull_request.state, pull_request.base_ref,
+                    pull_request.base_object_id, pull_request.head_object_id,
+                    revision.base_object_id, revision.head_object_id,
+                    (SELECT MAX(number) FROM pull_request_revision AS latest
+                     WHERE latest.pull_request_id = pull_request.id)
+             FROM pull_request_merge_intent AS merge
+             JOIN pull_request ON pull_request.id = merge.pull_request_id
+             JOIN pull_request_revision AS revision ON revision.id = merge.revision_id
+             WHERE merge.intent_id = ?1",
+            [intent_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, i64>(15)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(merge) = merge else {
+        return Ok(());
+    };
+    if merge.9 != "open"
+        || merge.10 != merge.6
+        || merge.11 != merge.7
+        || merge.12 != merge.14
+        || merge.13 != merge.7
+        || merge.15 != merge.4
+    {
+        return Err(StoreError::PullRequestState);
+    }
+    let changed = transaction.execute(
+        "UPDATE pull_request SET state = 'merged', updated_at = ?2
+         WHERE id = ?1 AND state = 'open'",
+        rusqlite::params![merge.1, completed_at],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::PullRequestState);
+    }
+    let event = event::pull_request_merge(
+        &merge.1, merge.2, merge.4, &merge.5, &merge.6, &merge.7, &merge.8,
+    );
+    insert_domain_event(
+        transaction,
+        &NewDomainEvent {
+            repository_id: &merge.0,
+            source_intent_id: Some(intent_id),
+            source_ordinal: Some(2),
+            issue_id: None,
+            pull_request_id: Some(&merge.1),
+            event: &event,
+            actor,
+            ref_name: None,
+            old_target: None,
+            new_target: None,
+            created_at: completed_at,
+        },
+    )
 }
 
 fn end_sessions(

@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gix::hash::{Kind, ObjectId};
-use gix::objs::{Data, Kind as ObjectKind, tree::EntryKind};
+use gix::objs::{Commit, Data, Kind as ObjectKind, tree::EntryKind};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 use gix_pack::data::Version;
@@ -169,6 +169,16 @@ impl GitRepository {
         expected: Option<ObjectId>,
         new: ObjectId,
     ) -> Result<(), GitRepositoryError> {
+        self.update_reference_with_log(name, expected, new, "pull request revision")
+    }
+
+    pub(crate) fn update_reference_with_log(
+        &self,
+        name: &str,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+        message: &str,
+    ) -> Result<(), GitRepositoryError> {
         if new.kind() != self.object_format() {
             return Err(GitRepositoryError::WrongObjectFormat);
         }
@@ -185,7 +195,7 @@ impl GitRepository {
                 log: LogChange {
                     mode: RefLog::AndReference,
                     force_create_reflog: false,
-                    message: "pull request revision".into(),
+                    message: message.into(),
                 },
             },
         };
@@ -193,6 +203,31 @@ impl GitRepository {
             .edit_references_as([edit], None)
             .map_err(|error| GitRepositoryError::RefTransaction(error.to_string()))?;
         Ok(())
+    }
+
+    pub(crate) fn prepare_merge_commit(
+        &self,
+        base: ObjectId,
+        head: ObjectId,
+        actor: &str,
+        created_at: i64,
+        message: &str,
+    ) -> Result<ObjectId, GitRepositoryError> {
+        let repository = gix::open(self.repository.path())
+            .map_err(|error| GitRepositoryError::Merge(error.to_string()))?
+            .with_object_memory();
+        write_merge_commit(&repository, base, head, actor, created_at, message)
+    }
+
+    pub(crate) fn write_merge_commit(
+        &self,
+        base: ObjectId,
+        head: ObjectId,
+        actor: &str,
+        created_at: i64,
+        message: &str,
+    ) -> Result<ObjectId, GitRepositoryError> {
+        write_merge_commit(&self.repository, base, head, actor, created_at, message)
     }
 
     pub(crate) fn make_pack(
@@ -354,6 +389,60 @@ impl GitRepository {
     }
 }
 
+fn write_merge_commit(
+    repository: &gix::Repository,
+    base: ObjectId,
+    head: ObjectId,
+    actor: &str,
+    created_at: i64,
+    message: &str,
+) -> Result<ObjectId, GitRepositoryError> {
+    if base.kind() != repository.object_hash() || head.kind() != repository.object_hash() {
+        return Err(GitRepositoryError::WrongObjectFormat);
+    }
+    let options = repository
+        .tree_merge_options()
+        .map_err(|error| GitRepositoryError::Merge(error.to_string()))?
+        .with_rewrites(Some(Default::default()))
+        .with_fail_on_conflict(Some(Default::default()));
+    let mut outcome = repository
+        .merge_commits(base, head, Default::default(), options.into())
+        .map_err(|error| GitRepositoryError::Merge(error.to_string()))?;
+    if outcome
+        .tree_merge
+        .has_unresolved_conflicts(Default::default())
+    {
+        return Err(GitRepositoryError::MergeConflict);
+    }
+    let tree = outcome
+        .tree_merge
+        .tree
+        .write()
+        .map_err(|error| GitRepositoryError::Merge(error.to_string()))?
+        .detach();
+    let signature = gix::actor::Signature {
+        name: actor.into(),
+        email: format!("{actor}@users.tit").into(),
+        time: gix::date::Time {
+            seconds: created_at,
+            offset: 0,
+        },
+    };
+    let commit = Commit {
+        message: message.into(),
+        tree,
+        author: signature.clone(),
+        committer: signature,
+        encoding: None,
+        parents: [base, head].into_iter().collect(),
+        extra_headers: Default::default(),
+    };
+    repository
+        .write_object(&commit)
+        .map(gix::Id::detach)
+        .map_err(|error| GitRepositoryError::Merge(error.to_string()))
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum GitRepositoryError {
     #[error("cannot create Git repository {path}: {reason}")]
@@ -374,6 +463,10 @@ pub(crate) enum GitRepositoryError {
     BranchNotCommit,
     #[error("cannot update Git references: {0}")]
     RefTransaction(String),
+    #[error("cannot create a Git merge commit: {0}")]
+    Merge(String),
+    #[error("Git merge has conflicts")]
+    MergeConflict,
     #[error("cannot read Git object {id}: {reason}")]
     Object { id: ObjectId, reason: String },
     #[error("Git object does not exist: {0}")]

@@ -138,6 +138,28 @@
 {% endfor %}
   </section>
 
+{% if can_merge %}
+{% if comparison.mergeability == "fast-forward" %}
+  <section aria-labelledby="merge-heading">
+    <h2 id="merge-heading">Merge this pull request</h2>
+    <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/merge">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="method" value="fast-forward">
+      <button type="submit">Fast-forward {{ pull_request.base_ref }}</button>
+    </form>
+  </section>
+{% else if comparison.mergeability == "clean merge" %}
+  <section aria-labelledby="merge-heading">
+    <h2 id="merge-heading">Merge this pull request</h2>
+    <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/merge">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="method" value="merge-commit">
+      <button type="submit">Create a merge commit on {{ pull_request.base_ref }}</button>
+    </form>
+  </section>
+{% endif %}
+{% endif %}
+
 {% if can_review %}
   <section aria-labelledby="review-heading">
     <h2 id="review-heading">Review this revision</h2>
