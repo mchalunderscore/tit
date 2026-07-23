@@ -66,6 +66,24 @@ account. The SSH username does not select the account. An owner, maintainer, or
 writer can push branches and tags. A reader cannot push. HTTP Git access stays
 read-only.
 
+The `[limits]` configuration sets the maximum HTTP request size and the maximum
+concurrent HTTP requests and SSH sessions. The default values are 1 MiB and
+1024. A route can use a smaller request limit. Each HTTP request has a
+30-second time limit. An HTTP request can wait for one second for a concurrency
+permit.
+
+The server permits 10 Web login attempts per client address in one minute. It
+permits 30 SSH authentication attempts per client address in one minute. It
+keeps attempt state for a maximum of 4096 client addresses. SSH also permits a
+maximum of three public-key authentication attempts on one connection and
+closes an inactive connection after 30 seconds.
+
+Git reads have byte, object-count, entry-count, and 30-second limits. Git
+receive-pack has byte, object-count, delta-depth, and processing-time limits.
+Markdown rendering accepts a maximum of 256 KiB of source and 1 MiB of rendered
+HTML. The Web UI shows a limit message instead of content that exceeds a
+Markdown limit.
+
 Stop the server and show the newest audit events with this command:
 
 ```text
@@ -602,3 +620,17 @@ quarantine debris, missing indexes, unsafe permissions, and changed backup
 data. Read the
 [read-only diagnostics architectural decision record](docs/adr/0030-read-only-diagnostics.md)
 for the check, repair, inspection, and dump contracts.
+
+## Milestone 6.4 gate
+
+Install stock OpenSSH. Then, run the limits gate:
+
+```text
+./scripts/check-m6-4
+```
+
+This command tests HTTP request and login-attempt limits, SSH authentication
+limits, Markdown limits, Git pack limits, and repository diff and archive
+limits. Read the
+[limits and abuse resistance architectural decision record](docs/adr/0031-limits-and-abuse-resistance.md)
+for the limit values and failure behavior.

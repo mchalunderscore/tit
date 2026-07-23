@@ -68,6 +68,10 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
             instance_dir: config.instance_dir.clone(),
             http_clone_base,
             ssh_clone_base,
+            max_request_bytes: usize::try_from(config.max_request_bytes)
+                .map_err(|_| ServeError::RequestLimit)?,
+            max_connections: usize::try_from(config.max_connections)
+                .map_err(|_| ServeError::ConnectionLimit)?,
         },
         reload_keys,
         readiness.clone(),
@@ -79,6 +83,7 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
         authorized_keys,
         git,
         host_key,
+        usize::try_from(config.max_connections).map_err(|_| ServeError::ConnectionLimit)?,
     )
     .await
     {
@@ -284,6 +289,10 @@ pub(crate) enum ServeError {
     HostKeyPermissions { path: PathBuf, mode: u32 },
     #[error(transparent)]
     HostKey(#[from] ssh_key::Error),
+    #[error("the HTTP request limit does not fit this platform")]
+    RequestLimit,
+    #[error("the connection limit does not fit this platform")]
+    ConnectionLimit,
 }
 
 #[cfg(test)]

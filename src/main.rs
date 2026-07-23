@@ -24,6 +24,7 @@ mod maintenance;
 mod markdown;
 mod policy;
 mod pull_request;
+mod rate_limit;
 mod repair;
 mod repository;
 mod search;

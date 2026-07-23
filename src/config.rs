@@ -12,6 +12,8 @@ use crate::cli::Cli;
 
 const CONFIG_VERSION: u32 = 1;
 const SYSTEM_CONFIG_PATH: &str = "/srv/tit/config.toml";
+const MAX_CONFIG_REQUEST_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_CONFIG_CONNECTIONS: u32 = 100_000;
 
 #[derive(Debug)]
 pub(crate) struct Config {
@@ -57,8 +59,14 @@ impl Config {
         if self.max_request_bytes == 0 {
             return Err(ConfigError::ZeroLimit("max_request_bytes"));
         }
+        if self.max_request_bytes > MAX_CONFIG_REQUEST_BYTES {
+            return Err(ConfigError::LimitTooLarge("max_request_bytes"));
+        }
         if self.max_connections == 0 {
             return Err(ConfigError::ZeroLimit("max_connections"));
+        }
+        if self.max_connections > MAX_CONFIG_CONNECTIONS {
+            return Err(ConfigError::LimitTooLarge("max_connections"));
         }
         if self.signup_policy != SignupPolicy::Invite {
             return Err(ConfigError::UnsupportedSignupPolicy);
@@ -242,6 +250,8 @@ pub(crate) enum ConfigError {
     ZeroListenerPort(&'static str),
     #[error("configuration limit {0} must not be zero")]
     ZeroLimit(&'static str),
+    #[error("configuration limit {0} is too large")]
+    LimitTooLarge(&'static str),
     #[error("signup policy is not supported")]
     UnsupportedSignupPolicy,
     #[error("trusted proxy address is not a unicast address: {0}")]
@@ -575,6 +585,39 @@ max_connections = 1
         assert!(matches!(
             load(&cli(&path)),
             Err(ConfigError::ZeroLimit("max_request_bytes"))
+        ));
+    }
+
+    #[test]
+    fn rejects_limits_that_are_too_large() {
+        let (_directory, path) = write_config(
+            r#"
+version = 1
+public_url = "https://tit.example/"
+
+[limits]
+max_request_bytes = 268435457
+max_connections = 1
+"#,
+        );
+        assert!(matches!(
+            load(&cli(&path)),
+            Err(ConfigError::LimitTooLarge("max_request_bytes"))
+        ));
+
+        let (_directory, path) = write_config(
+            r#"
+version = 1
+public_url = "https://tit.example/"
+
+[limits]
+max_request_bytes = 1
+max_connections = 100001
+"#,
+        );
+        assert!(matches!(
+            load(&cli(&path)),
+            Err(ConfigError::LimitTooLarge("max_connections"))
         ));
     }
 

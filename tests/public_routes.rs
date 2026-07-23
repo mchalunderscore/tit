@@ -51,6 +51,8 @@ mod policy;
 )]
 #[path = "../src/pull_request.rs"]
 mod pull_request;
+#[path = "../src/rate_limit.rs"]
+mod rate_limit;
 #[allow(
     dead_code,
     reason = "the public route test does not create repositories through forms"
@@ -95,6 +97,8 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
                 instance_dir: fixture.instance.path().to_owned(),
                 http_clone_base: "https://tit.example".to_owned(),
                 ssh_clone_base: "ssh://tit.example:2222".to_owned(),
+                max_request_bytes: 1024 * 1024,
+                max_connections: 1024,
             },
         )
         .await
@@ -616,6 +620,8 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
             instance_dir: fixture.instance.path().to_owned(),
             http_clone_base: "http://127.0.0.1".to_owned(),
             ssh_clone_base: "ssh://tit.example:2222".to_owned(),
+            max_request_bytes: 1024 * 1024,
+            max_connections: 1024,
         },
     )
     .await
@@ -1477,12 +1483,21 @@ fn request(
     head.push_str("\r\n");
     stream
         .write_all(head.as_bytes())
-        .and_then(|()| stream.write_all(body))
-        .expect("write an HTTP request");
+        .expect("write HTTP request headers");
+    if let Err(error) = stream.write_all(body)
+        && !matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+        )
+    {
+        panic!("write an HTTP request: {error}");
+    }
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .expect("read an HTTP response");
+    if let Err(error) = stream.read_to_end(&mut response)
+        && error.kind() != std::io::ErrorKind::ConnectionReset
+    {
+        panic!("read an HTTP response: {error}");
+    }
     HttpResponse::parse(&response)
 }
 

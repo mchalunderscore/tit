@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -12,7 +12,7 @@ use ssh_key::{Algorithm, EcdsaCurve, PrivateKey, PublicKey};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::auth::SshPublicKey;
@@ -22,6 +22,7 @@ use crate::git::transport::{GitRepositories, GitSshService};
 use crate::git::upload_pack::{ProtocolVersion, UploadPack, UploadPackError};
 use crate::issue::{IssueError, IssueService, MAX_BODY_BYTES, MAX_TITLE_BYTES};
 use crate::policy::RepositoryOperation;
+use crate::rate_limit::AttemptLimiter;
 use crate::repository::{RepositoryService, RepositoryServiceError};
 use crate::store::{Store, StoreError};
 
@@ -32,6 +33,8 @@ const MAX_REPOSITORY_COMMAND_BYTES: usize = 512;
 const MAX_ISSUE_COMMAND_BYTES: usize = 512;
 const MAX_PULL_REQUEST_COMMAND_BYTES: usize = 512;
 const MAX_ISSUE_INPUT_BYTES: usize = MAX_TITLE_BYTES + 1 + MAX_BODY_BYTES;
+const SSH_ATTEMPTS_PER_MINUTE: usize = 30;
+const MAX_SSH_CLIENTS: usize = 4096;
 const REPOSITORY_CREATE_USAGE: &str =
     "repo create NAME [--object-format sha1|sha256] [--output human|json]";
 const ISSUE_LIST_USAGE: &str = "issue list OWNER/REPOSITORY [--output human|json]";
@@ -146,10 +149,18 @@ impl RunningSshServer {
         authorized_keys: AuthorizedSshKeys,
         repositories: GitRepositories,
         host_key: PrivateKey,
+        max_connections: usize,
     ) -> Result<Self, SshServerError> {
         recover_pushes(&repositories).await?;
-        Self::start_inner_with_keys(address, authorized_keys, &[], Some(repositories), host_key)
-            .await
+        Self::start_inner_with_keys(
+            address,
+            authorized_keys,
+            &[],
+            Some(repositories),
+            host_key,
+            max_connections,
+        )
+        .await
     }
 
     pub(crate) async fn start_with_git_writes(
@@ -183,6 +194,7 @@ impl RunningSshServer {
             writable_keys,
             repositories,
             host_key,
+            1024,
         )
         .await
     }
@@ -193,6 +205,7 @@ impl RunningSshServer {
         writable_keys: &[SshPublicKey],
         repositories: Option<GitRepositories>,
         host_key: PrivateKey,
+        max_connections: usize,
     ) -> Result<Self, SshServerError> {
         let listener = TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
@@ -229,6 +242,12 @@ impl RunningSshServer {
             writable_keys,
             audit: Arc::clone(&audit),
             repositories: repositories.map(Arc::new),
+            connections: Arc::new(Semaphore::new(max_connections)),
+            attempts: AttemptLimiter::new(
+                SSH_ATTEMPTS_PER_MINUTE,
+                Duration::from_secs(60),
+                MAX_SSH_CLIENTS,
+            ),
         };
         let (handle_sender, handle_receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -312,12 +331,14 @@ struct SshServer {
     writable_keys: Arc<HashSet<PublicKey>>,
     audit: Arc<RequestAudit>,
     repositories: Option<Arc<GitRepositories>>,
+    connections: Arc<Semaphore>,
+    attempts: AttemptLimiter<IpAddr>,
 }
 
 impl Server for SshServer {
     type Handler = SshSession;
 
-    fn new_client(&mut self, _peer_address: Option<SocketAddr>) -> Self::Handler {
+    fn new_client(&mut self, peer_address: Option<SocketAddr>) -> Self::Handler {
         SshSession {
             authorized_keys: self.authorized_keys.clone(),
             writable_keys: Arc::clone(&self.writable_keys),
@@ -328,6 +349,11 @@ impl Server for SshServer {
             authenticated_identity: None,
             authenticated_key: None,
             authenticated_writer: false,
+            peer_address: peer_address
+                .map(|address| address.ip())
+                .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            attempts: self.attempts.clone(),
+            _connection_permit: self.connections.clone().try_acquire_owned().ok(),
         }
     }
 }
@@ -342,6 +368,9 @@ struct SshSession {
     authenticated_identity: Option<SshIdentity>,
     authenticated_key: Option<PublicKey>,
     authenticated_writer: bool,
+    peer_address: IpAddr,
+    attempts: AttemptLimiter<IpAddr>,
+    _connection_permit: Option<OwnedSemaphorePermit>,
 }
 
 enum ExecChannel {
@@ -393,6 +422,9 @@ impl Handler for SshSession {
         _user: &str,
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
+        if self._connection_permit.is_none() || !self.attempts.allow(self.peer_address) {
+            return Ok(Auth::reject());
+        }
         if let Some(identity) = self.authorized_keys.identity(public_key) {
             self.authenticated_identity = Some(identity);
             self.authenticated_key = Some(public_key.clone());

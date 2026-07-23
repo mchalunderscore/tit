@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+./scripts/check
+cargo test --locked --release --test web_shell enforces_request_and_login_attempt_limits
+cargo test --locked --release --test ssh limits_authentication_attempts_by_client_address
+cargo test --locked --release --bin tit markdown::tests::bounds_source_and_rendered_content
+cargo test --locked --release --bin tit rate_limit::tests::bounds_attempts_and_tracked_keys
+cargo test --locked --release --test git_reads enforces_each_read_boundary_and_rejects_unsafe_paths
+cargo test --locked --release --test git_reads produces_bounded_diffs_blame_and_streaming_archives
+cargo test --locked --release --test git_repository reads_sorted_refs_and_generates_complete_packs_for_both_hashes

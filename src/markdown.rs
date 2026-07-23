@@ -5,6 +5,10 @@ use ammonia::{Builder, UrlRelative};
 use pulldown_cmark::{Event, Parser, Tag, TagEnd, html};
 use url::Url;
 
+pub(crate) const MAX_MARKDOWN_BYTES: usize = 256 * 1024;
+const MAX_RENDERED_BYTES: usize = 1024 * 1024;
+const LIMIT_MESSAGE: &str = "<p>Markdown content exceeds the rendering limit.</p>\n";
+
 #[derive(Default)]
 pub struct RenderedMarkdown(String);
 
@@ -15,6 +19,9 @@ impl fmt::Display for RenderedMarkdown {
 }
 
 pub fn render(source: &str) -> RenderedMarkdown {
+    if source.len() > MAX_MARKDOWN_BYTES {
+        return RenderedMarkdown(LIMIT_MESSAGE.to_owned());
+    }
     let mut skipped_link = false;
     let events = Parser::new(source).filter_map(|event| match event {
         Event::Start(Tag::Link { ref dest_url, .. }) if !safe_link(dest_url) => {
@@ -67,7 +74,12 @@ pub fn render(source: &str) -> RenderedMarkdown {
         .url_relative(UrlRelative::PassThrough)
         .link_rel(Some("nofollow noopener noreferrer"));
 
-    RenderedMarkdown(sanitizer.clean(&rendered).to_string())
+    let rendered = sanitizer.clean(&rendered).to_string();
+    if rendered.len() > MAX_RENDERED_BYTES {
+        RenderedMarkdown(LIMIT_MESSAGE.to_owned())
+    } else {
+        RenderedMarkdown(rendered)
+    }
 }
 
 fn safe_link(destination: &str) -> bool {
@@ -135,5 +147,17 @@ mod tests {
 
         assert!(output.contains("Text &amp; markup."));
         assert!(!output.contains("href="));
+    }
+
+    #[test]
+    fn bounds_source_and_rendered_content() {
+        assert_eq!(
+            render(&"x".repeat(super::MAX_MARKDOWN_BYTES + 1)).to_string(),
+            super::LIMIT_MESSAGE
+        );
+        assert_eq!(
+            render(&"<".repeat(super::MAX_MARKDOWN_BYTES)).to_string(),
+            super::LIMIT_MESSAGE
+        );
     }
 }

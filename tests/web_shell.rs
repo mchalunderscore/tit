@@ -46,6 +46,8 @@ mod policy;
 #[allow(dead_code, reason = "the Web shell test does not use pull requests")]
 #[path = "../src/pull_request.rs"]
 mod pull_request;
+#[path = "../src/rate_limit.rs"]
+mod rate_limit;
 #[allow(dead_code, reason = "the Web shell test does not create repositories")]
 #[path = "../src/repository.rs"]
 mod repository;
@@ -243,6 +245,23 @@ async fn serves_useful_errors_and_owns_request_ids() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enforces_request_and_login_attempt_limits() {
+    let server = start().await;
+
+    for _ in 0..10 {
+        assert_eq!(request(server.address(), "POST", "/login", &[]).status, 400);
+    }
+    let limited = request(server.address(), "POST", "/login", &[]);
+    assert_eq!(limited.status, 429);
+    assert_eq!(limited.body, "Login attempt limit exceeded.\n");
+
+    let oversized = request_with_declared_length(server.address(), "/", 1024 * 1024 + 1);
+    assert_eq!(oversized.status, 413);
+
+    server.shutdown().await.expect("stop the Web server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancels_a_connection_after_the_shutdown_drain_limit() {
     let server = start().await;
     let mut stalled = tokio::net::TcpStream::connect(server.address())
@@ -284,6 +303,24 @@ fn request(
     stream
         .write_all(request.as_bytes())
         .expect("write an HTTP request");
+    let mut bytes = Vec::new();
+    stream
+        .read_to_end(&mut bytes)
+        .expect("read an HTTP response");
+    HttpResponse::parse(&bytes)
+}
+
+fn request_with_declared_length(
+    address: SocketAddr,
+    path: &str,
+    content_length: usize,
+) -> HttpResponse {
+    let mut stream = TcpStream::connect(address).expect("connect to the Web server");
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {content_length}\r\n\r\n"
+    )
+    .expect("write an HTTP request");
     let mut bytes = Vec::new();
     stream
         .read_to_end(&mut bytes)

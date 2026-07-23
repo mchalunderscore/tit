@@ -5,7 +5,7 @@ mod public;
 mod pull_requests;
 mod watches;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +14,9 @@ use std::time::Duration;
 use askama::Template;
 use axum::Router;
 use axum::body::{Body, Bytes, HttpBody};
-use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, RawQuery, Request, State};
+use axum::extract::{
+    ConnectInfo, DefaultBodyLimit, Extension, OriginalUri, RawQuery, Request, State,
+};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -23,6 +25,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
+use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::account::{AccountError, AccountService};
 use crate::auth::validate_username;
@@ -31,6 +34,7 @@ use crate::feed_token::FeedTokenService;
 use crate::issue::IssueService;
 use crate::maintenance::MaintenanceGate;
 use crate::pull_request::PullRequestService;
+use crate::rate_limit::AttemptLimiter;
 use crate::repository::{RepositoryService, RepositoryServiceError};
 use crate::search::MetadataSearchService;
 use crate::session::{SessionError, WebLoginService};
@@ -43,6 +47,10 @@ const STYLE: &str = include_str!("../../assets/style.css");
 const MAX_LOCATION_QUERY_BYTES: usize = 512;
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 const MAX_BLOCKING_WEB_JOBS: usize = 8;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CONCURRENCY_WAIT: Duration = Duration::from_secs(1);
+const LOGIN_ATTEMPTS_PER_MINUTE: usize = 10;
+const MAX_LOGIN_CLIENTS: usize = 4096;
 const SESSION_COOKIE: &str = "tit-session";
 const CSRF_COOKIE: &str = "tit-csrf";
 const LOGIN_CSRF_COOKIE: &str = "tit-login-csrf";
@@ -52,6 +60,9 @@ struct WebState {
     public: Option<PublicWeb>,
     accounts: Option<AccountService>,
     jobs: Arc<Semaphore>,
+    requests: Arc<Semaphore>,
+    login_attempts: AttemptLimiter<IpAddr>,
+    max_request_bytes: usize,
     key_reloader: Option<AccountKeyReloader>,
     login: Option<WebLoginService>,
     repositories: Option<RepositoryService>,
@@ -67,6 +78,9 @@ struct WebState {
 #[derive(Clone)]
 pub(super) struct RequestActor(pub(super) Option<String>);
 
+#[derive(Clone, Copy)]
+struct ClientAddress(IpAddr);
+
 type AccountKeyReloader = Arc<dyn Fn(&AccountService) -> Result<(), AccountError> + Send + Sync>;
 
 #[derive(Clone, Debug)]
@@ -74,6 +88,8 @@ pub(crate) struct PublicWebConfig {
     pub(crate) instance_dir: PathBuf,
     pub(crate) http_clone_base: String,
     pub(crate) ssh_clone_base: String,
+    pub(crate) max_request_bytes: usize,
+    pub(crate) max_connections: usize,
 }
 
 #[derive(Clone, Default)]
@@ -109,6 +125,9 @@ impl RunningWebServer {
                 public: None,
                 accounts: None,
                 jobs: Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS)),
+                requests: Arc::new(Semaphore::new(1024)),
+                login_attempts: login_attempt_limiter(),
+                max_request_bytes: 1024 * 1024,
                 key_reloader: None,
                 login: None,
                 repositories: None,
@@ -156,6 +175,8 @@ impl RunningWebServer {
         maintenance: Option<MaintenanceGate>,
     ) -> Result<Self, WebError> {
         let jobs = Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS));
+        let requests = Arc::new(Semaphore::new(config.max_connections));
+        let max_request_bytes = config.max_request_bytes;
         let database = config.instance_dir.join(crate::store::DATABASE_FILE);
         let accounts = AccountService::new(database.clone());
         let public_url = url::Url::parse(&format!("{}/", config.http_clone_base))
@@ -185,6 +206,9 @@ impl RunningWebServer {
                 public: Some(public),
                 accounts: Some(accounts),
                 jobs,
+                requests,
+                login_attempts: login_attempt_limiter(),
+                max_request_bytes,
                 key_reloader,
                 login: Some(login),
                 repositories: Some(repositories),
@@ -205,11 +229,14 @@ impl RunningWebServer {
         let address = listener.local_addr()?;
         let (shutdown, receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
-            axum::serve(listener, router_with_state(state))
-                .with_graceful_shutdown(async {
-                    let _ = receiver.await;
-                })
-                .await
+            axum::serve(
+                listener,
+                router_with_state(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = receiver.await;
+            })
+            .await
         });
         Ok(Self {
             address,
@@ -249,6 +276,9 @@ pub(crate) fn router() -> Router {
         public: None,
         accounts: None,
         jobs: Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS)),
+        requests: Arc::new(Semaphore::new(1024)),
+        login_attempts: login_attempt_limiter(),
+        max_request_bytes: 1024 * 1024,
         key_reloader: None,
         login: None,
         repositories: None,
@@ -263,6 +293,7 @@ pub(crate) fn router() -> Router {
 }
 
 fn router_with_state(state: WebState) -> Router {
+    let max_request_bytes = state.max_request_bytes;
     let repository_routes = metadata_search::routes()
         .merge(watches::routes())
         .merge(issues::routes())
@@ -316,8 +347,62 @@ fn router_with_state(state: WebState) -> Router {
         .merge(repository_routes)
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
-        .with_state(state)
+        .layer(RequestBodyLimitLayer::new(max_request_bytes))
+        .layer(middleware::from_fn_with_state(state.clone(), request_guard))
         .layer(middleware::from_fn(response_policy))
+        .with_state(state)
+}
+
+fn login_attempt_limiter() -> AttemptLimiter<IpAddr> {
+    AttemptLimiter::new(
+        LOGIN_ATTEMPTS_PER_MINUTE,
+        Duration::from_secs(60),
+        MAX_LOGIN_CLIENTS,
+    )
+}
+
+async fn request_guard(
+    State(state): State<WebState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let address = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|peer| peer.0.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    request.extensions_mut().insert(ClientAddress(address));
+    let permit = match tokio::time::timeout(
+        CONCURRENCY_WAIT,
+        state.requests.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => return limit_response(StatusCode::SERVICE_UNAVAILABLE, "Server is busy.\n"),
+    };
+    let response = tokio::time::timeout(REQUEST_TIMEOUT, next.run(request)).await;
+    drop(permit);
+    match response {
+        Ok(response) => response,
+        Err(_) => limit_response(
+            StatusCode::REQUEST_TIMEOUT,
+            "Request time limit exceeded.\n",
+        ),
+    }
+}
+
+fn limit_response(status: StatusCode, message: &'static str) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(message))
+        .expect("the limit response is valid")
+}
+
+fn allow_login_attempt(state: &WebState, peer: ClientAddress) -> bool {
+    state.login_attempts.allow(peer.0)
 }
 
 async fn repository_actor(
@@ -468,10 +553,17 @@ async fn login_form(Extension(request_id): Extension<RequestId>) -> Response {
 
 async fn login_challenge(
     State(state): State<WebState>,
+    Extension(peer): Extension<ClientAddress>,
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if !allow_login_attempt(&state, peer) {
+        return limit_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Login attempt limit exceeded.\n",
+        );
+    }
     let fields = match parse_named_form(&headers, &body, &["username", "public-key"]) {
         Ok(fields) => fields,
         Err(()) => return login_error(&request_id.0, "", "The login request is not valid."),
@@ -513,10 +605,17 @@ async fn login_challenge(
 
 async fn login_verify(
     State(state): State<WebState>,
+    Extension(peer): Extension<ClientAddress>,
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if !allow_login_attempt(&state, peer) {
+        return limit_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Login attempt limit exceeded.\n",
+        );
+    }
     let fields = match parse_named_form(
         &headers,
         &body,
@@ -562,10 +661,17 @@ async fn login_verify(
 
 async fn login_verify_file(
     State(state): State<WebState>,
+    Extension(peer): Extension<ClientAddress>,
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    if !allow_login_attempt(&state, peer) {
+        return limit_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Login attempt limit exceeded.\n",
+        );
+    }
     let Some(content_type) = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())

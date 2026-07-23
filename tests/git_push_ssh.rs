@@ -22,6 +22,8 @@ mod maintenance;
 #[allow(dead_code, reason = "the SSH push test does not use repository policy")]
 #[path = "../src/policy.rs"]
 mod policy;
+#[path = "../src/rate_limit.rs"]
+mod rate_limit;
 #[allow(dead_code, reason = "the SSH push test does not create repositories")]
 #[path = "../src/repository.rs"]
 mod repository;

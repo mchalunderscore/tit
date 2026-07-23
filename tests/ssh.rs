@@ -25,6 +25,8 @@ mod maintenance;
 )]
 #[path = "../src/policy.rs"]
 mod policy;
+#[path = "../src/rate_limit.rs"]
+mod rate_limit;
 #[allow(
     dead_code,
     reason = "the SSH identity test does not create repositories"
@@ -115,6 +117,28 @@ async fn rejects_unknown_keys_and_forced_rsa_sha1_authentication() {
         .shutdown()
         .await
         .expect("stop the RSA SSH server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn limits_authentication_attempts_by_client_address() {
+    let directory = TempDir::new().expect("create a key directory");
+    let private_key = directory.path().join("ed25519");
+    generate_key(&private_key, KeyFixture::Ed25519);
+    let server = start(&[parse_public_key(&private_key)]).await;
+
+    for attempt in 0..30 {
+        let output = ssh(&server, &private_key, "alice", &["tit --version"]);
+        assert!(
+            output.status.success(),
+            "authentication attempt {} failed: {}",
+            attempt + 1,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let limited = ssh(&server, &private_key, "alice", &["tit --version"]);
+    assert!(!limited.status.success());
+
+    server.shutdown().await.expect("stop the SSH server");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
