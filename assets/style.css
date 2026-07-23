@@ -45,6 +45,53 @@ form {
   max-width: 32rem;
 }
 
+.repository-header nav,
+.repository-header h1 {
+  margin-block: 0.5rem;
+}
+
+.repository-header nav a {
+  margin-right: 1rem;
+}
+
+dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.25rem 1rem;
+}
+
+dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  padding: 0.4rem;
+  border-bottom: 1px solid GrayText;
+  text-align: left;
+  vertical-align: top;
+}
+
+pre {
+  max-width: 100%;
+  padding: 1rem;
+  overflow: auto;
+  border: 1px solid GrayText;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.commit-list code,
+.blame-list code {
+  overflow-wrap: anywhere;
+}
+
 .field {
   margin-block: 1rem;
 }

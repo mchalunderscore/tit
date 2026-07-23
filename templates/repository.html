@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% block title %}{{ page_title }} · tit{% endblock %}
+{% block content %}
+  <header class="repository-header">
+    <h1><a href="/{{ owner }}/{{ repository }}">{{ owner }}/{{ repository }}</a></h1>
+    <nav aria-label="Repository">
+      <a href="/{{ owner }}/{{ repository }}">Summary</a>
+      <a href="/{{ owner }}/{{ repository }}/refs">Refs</a>
+{% if has_head %}
+      <a href="/{{ owner }}/{{ repository }}/tree/{{ commit_id }}">Tree</a>
+      <a href="/{{ owner }}/{{ repository }}/commit/{{ commit_id }}">Commit</a>
+      <a href="/{{ owner }}/{{ repository }}/archive/{{ commit_id }}.tar">Archive</a>
+{% endif %}
+    </nav>
+  </header>
+
+{% if page_kind == "summary" %}
+  <section aria-labelledby="clone-heading">
+    <h2 id="clone-heading">Clone</h2>
+    <dl>
+      <dt>HTTP</dt><dd><code>{{ http_clone_url }}</code></dd>
+      <dt>SSH</dt><dd><code>{{ ssh_clone_url }}</code></dd>
+      <dt>Object format</dt><dd>{{ object_format }}</dd>
+      <dt>Created</dt><dd><time>{{ created_at }}</time></dd>
+    </dl>
+  </section>
+{% if has_head %}
+  <section aria-labelledby="history-heading">
+    <h2 id="history-heading">Recent commits</h2>
+    <ol class="commit-list">
+{% for item in history %}
+      <li><a href="/{{ owner }}/{{ repository }}/commit/{{ item.id }}"><code>{{ item.id }}</code></a> {{ item.summary }} — {{ item.author_name }}</li>
+{% endfor %}
+    </ol>
+  </section>
+{% if has_readme %}
+  <section aria-labelledby="readme-heading">
+    <h2 id="readme-heading">{{ readme_path }}</h2>
+{% if readme_binary %}
+    <p>Binary README content cannot be shown.</p>
+{% else %}
+    <pre>{{ readme_content }}</pre>
+{% endif %}
+  </section>
+{% endif %}
+{% else %}
+  <p>This repository has no commits.</p>
+{% endif %}
+{% endif %}
+
+{% if page_kind == "refs" %}
+  <h2>Refs</h2>
+  <table>
+    <thead><tr><th scope="col">Name</th><th scope="col">Target</th><th scope="col">Details</th></tr></thead>
+    <tbody>
+{% for item in refs %}
+      <tr>
+        <th scope="row">{{ item.name }}</th>
+        <td><a href="/{{ owner }}/{{ repository }}/commit/{{ item.href }}"><code>{{ item.target }}</code></a></td>
+        <td>{% if item.symbolic != "" %}→ {{ item.symbolic }}{% endif %}{% if item.peeled != "" %}peeled <code>{{ item.peeled }}</code>{% endif %}</td>
+      </tr>
+{% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+{% if page_kind == "tree" %}
+  <h2>Tree{% if path != "" %}: {{ path }}{% endif %}</h2>
+  <table>
+    <thead><tr><th scope="col">Mode</th><th scope="col">Type</th><th scope="col">Name</th><th scope="col">Object</th></tr></thead>
+    <tbody>
+{% for item in entries %}
+      <tr>
+        <td><code>{{ item.mode }}</code></td><td>{{ item.kind }}</td>
+        <th scope="row"><a href="/{{ owner }}/{{ repository }}/{{ item.href }}">{{ item.name }}</a></th>
+        <td><code>{{ item.id }}</code></td>
+      </tr>
+{% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+{% if page_kind == "blob" %}
+  <h2>Blob: {{ path }}</h2>
+  <p><a href="/{{ owner }}/{{ repository }}/raw/{{ commit_id }}/{{ encoded_path }}">Raw</a> · <a href="/{{ owner }}/{{ repository }}/blame/{{ commit_id }}/{{ encoded_path }}">Blame</a></p>
+{% if blob_binary %}
+  <p>Binary content cannot be shown. Use the raw link to download it.</p>
+{% else %}
+  <pre>{{ blob_content }}</pre>
+{% endif %}
+{% endif %}
+
+{% if page_kind == "commit" %}
+  <article>
+    <h2>Commit <code>{{ commit.id }}</code></h2>
+    <dl>
+      <dt>Author</dt><dd>{{ commit.author_name }} &lt;{{ commit.author_email }}&gt;</dd>
+      <dt>Committed</dt><dd><time>{{ commit.committed_at }}</time></dd>
+      <dt>Tree</dt><dd><a href="/{{ owner }}/{{ repository }}/tree/{{ commit.id }}"><code>{{ commit.tree }}</code></a></dd>
+{% for parent in commit.parents %}
+      <dt>Parent</dt><dd><a href="/{{ owner }}/{{ repository }}/commit/{{ parent }}"><code>{{ parent }}</code></a> · <a href="/{{ owner }}/{{ repository }}/diff/{{ parent }}/{{ commit.id }}">Diff</a></dd>
+{% endfor %}
+    </dl>
+    <pre>{{ commit.message }}</pre>
+  </article>
+{% endif %}
+
+{% if page_kind == "diff" %}
+  <h2>Diff</h2>
+  <p><code>{{ secondary_id }}</code> → <code>{{ commit_id }}</code></p>
+{% for file in diffs %}
+  <section>
+    <h3>{{ file.path }}</h3>
+    <p>Mode <code>{{ file.old_mode }}</code> → <code>{{ file.new_mode }}</code>; object <code>{{ file.old_id }}</code> → <code>{{ file.new_id }}</code></p>
+{% if file.binary %}
+    <p>Binary content changed.</p>
+{% else %}
+    <pre>{{ file.hunks }}</pre>
+{% endif %}
+  </section>
+{% endfor %}
+{% endif %}
+
+{% if page_kind == "blame" %}
+  <h2>Blame: {{ path }}</h2>
+  <p><a href="/{{ owner }}/{{ repository }}/blob/{{ commit_id }}/{{ encoded_path }}">Blob</a> · <a href="/{{ owner }}/{{ repository }}/raw/{{ commit_id }}/{{ encoded_path }}">Raw</a></p>
+{% if blob_binary %}
+  <p>Binary content cannot be blamed.</p>
+{% else %}
+  <ol class="blame-list">
+{% for item in blame %}
+    <li value="{{ item.start_line }}"><a href="/{{ owner }}/{{ repository }}/commit/{{ item.commit_id }}"><code>{{ item.commit_id }}</code></a> lines {{ item.source_start_line }}–{{ item.end_line }}{% if item.source_path != "" %} from {{ item.source_path }}{% endif %}<pre>{{ item.content }}</pre></li>
+{% endfor %}
+  </ol>
+{% endif %}
+{% endif %}
+{% endblock %}

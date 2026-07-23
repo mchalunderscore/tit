@@ -12,7 +12,7 @@ mod domain;
 mod git;
 #[allow(
     dead_code,
-    reason = "M2.4 establishes the HTTP shell before tit serve calls it"
+    reason = "M2 establishes the Web interface before tit serve calls it"
 )]
 mod http;
 mod instance;

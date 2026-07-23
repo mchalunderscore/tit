@@ -2,7 +2,7 @@ pub(crate) mod http;
 pub(crate) mod packetline;
 #[allow(
     dead_code,
-    reason = "M2.3 establishes repository reads before the HTTP handlers call them"
+    reason = "some protocol tests import Git without the public HTTP routes"
 )]
 pub(crate) mod read;
 pub(crate) mod receive_pack;

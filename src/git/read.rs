@@ -478,8 +478,9 @@ impl RepositoryReadService {
         budget.check()?;
         let object = self
             .repository
-            .find_object(id)
-            .map_err(|error| ReadError::Git(error.to_string()))?;
+            .try_find_object(id)
+            .map_err(|error| ReadError::Git(error.to_string()))?
+            .ok_or(ReadError::ObjectNotFound(id))?;
         if object.kind != ObjectKind::Commit {
             return Err(ReadError::WrongObjectKind {
                 expected: "commit",
@@ -547,8 +548,9 @@ impl RepositoryReadService {
         budget.check()?;
         let object = self
             .repository
-            .find_object(id)
-            .map_err(|error| ReadError::Git(error.to_string()))?;
+            .try_find_object(id)
+            .map_err(|error| ReadError::Git(error.to_string()))?
+            .ok_or(ReadError::ObjectNotFound(id))?;
         if object.kind != ObjectKind::Tree {
             return Err(ReadError::WrongObjectKind {
                 expected: "tree",
@@ -627,8 +629,9 @@ impl RepositoryReadService {
         budget.check()?;
         let object = self
             .repository
-            .find_object(id)
-            .map_err(|error| ReadError::Git(error.to_string()))?;
+            .try_find_object(id)
+            .map_err(|error| ReadError::Git(error.to_string()))?
+            .ok_or(ReadError::ObjectNotFound(id))?;
         if object.kind != ObjectKind::Blob {
             return Err(ReadError::WrongObjectKind {
                 expected: "blob",
@@ -1009,6 +1012,8 @@ pub(crate) enum ReadError {
     NotBare(PathBuf),
     #[error("Git read failed: {0}")]
     Git(String),
+    #[error("Git object does not exist: {0}")]
+    ObjectNotFound(ObjectId),
     #[error("expected a {expected} object, found {actual}")]
     WrongObjectKind {
         expected: &'static str,

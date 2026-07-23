@@ -1,4 +1,8 @@
+mod public;
+
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use askama::Template;
 use axum::Router;
@@ -10,15 +14,30 @@ use axum::response::Response;
 use axum::routing::get;
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::auth::validate_username;
 use crate::domain::repository::validate_slug;
 
+use self::public::PublicWeb;
+
 const STYLE: &str = include_str!("../../assets/style.css");
 const MAX_LOCATION_QUERY_BYTES: usize = 512;
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+const MAX_BLOCKING_WEB_JOBS: usize = 8;
+
+#[derive(Clone)]
+struct WebState {
+    public: Option<PublicWeb>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PublicWebConfig {
+    pub(crate) instance_dir: PathBuf,
+    pub(crate) http_clone_base: String,
+    pub(crate) ssh_clone_base: String,
+}
 
 pub(crate) struct RunningWebServer {
     address: SocketAddr,
@@ -28,11 +47,29 @@ pub(crate) struct RunningWebServer {
 
 impl RunningWebServer {
     pub(crate) async fn start(address: SocketAddr) -> Result<Self, WebError> {
+        Self::start_with_state(address, WebState { public: None }).await
+    }
+
+    pub(crate) async fn start_public(
+        address: SocketAddr,
+        config: PublicWebConfig,
+    ) -> Result<Self, WebError> {
+        let public = PublicWeb::open(config, Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS)))?;
+        Self::start_with_state(
+            address,
+            WebState {
+                public: Some(public),
+            },
+        )
+        .await
+    }
+
+    async fn start_with_state(address: SocketAddr, state: WebState) -> Result<Self, WebError> {
         let listener = TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
         let (shutdown, receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
-            axum::serve(listener, router())
+            axum::serve(listener, router_with_state(state))
                 .with_graceful_shutdown(async {
                     let _ = receiver.await;
                 })
@@ -57,12 +94,18 @@ impl RunningWebServer {
 }
 
 pub(crate) fn router() -> Router {
+    router_with_state(WebState { public: None })
+}
+
+fn router_with_state(state: WebState) -> Router {
     Router::new()
         .route("/", get(home))
         .route("/go", get(go_to_repository))
         .route("/assets/style.css", get(style))
+        .merge(public::routes())
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
+        .with_state(state)
         .layer(middleware::from_fn(response_policy))
 }
 
@@ -294,6 +337,8 @@ struct ErrorTemplate<'a> {
 pub(crate) enum WebError {
     #[error("HTTP listener error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("public Web configuration error: {0}")]
+    Public(#[from] public::PublicWebError),
     #[error("HTTP server task failed")]
     Join,
 }

@@ -7,8 +7,24 @@ mod auth;
 )]
 #[path = "../src/domain/mod.rs"]
 mod domain;
+#[allow(dead_code, reason = "the shell test does not use each shared Git API")]
+#[path = "../src/git/mod.rs"]
+mod git;
+#[allow(
+    dead_code,
+    reason = "the shell test does not use public repository routes"
+)]
 #[path = "../src/http/mod.rs"]
 mod http;
+#[allow(
+    dead_code,
+    reason = "the shell test does not use instance administration"
+)]
+#[path = "../src/instance.rs"]
+mod instance;
+#[allow(dead_code, reason = "the shell test does not use repository storage")]
+#[path = "../src/store/mod.rs"]
+mod store;
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};

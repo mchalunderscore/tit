@@ -464,6 +464,36 @@ impl Store {
             Err(error) => Err(error.into()),
         }
     }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests import the store without public HTTP routes"
+    )]
+    pub(crate) fn public_repository(
+        &self,
+        owner: &str,
+        slug: &str,
+    ) -> Result<RepositoryRecord, StoreError> {
+        let result = self.connection.query_row(
+            "SELECT repository.id, account.username, repository.slug,
+                    repository.visibility, repository.state, repository.object_format,
+                    repository.created_at, repository.archived_at
+             FROM repository
+             JOIN account ON account.id = repository.owner_account_id
+             WHERE account.username = ?1 AND repository.slug = ?2
+               AND repository.visibility = 'public' AND repository.state = 'active'",
+            rusqlite::params![owner, slug],
+            repository_from_row,
+        );
+        match result {
+            Ok(repository) => Ok(repository),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(StoreError::RepositoryNotFound(
+                owner.to_owned(),
+                slug.to_owned(),
+            )),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 pub(crate) struct InitialAdministrator<'a> {
