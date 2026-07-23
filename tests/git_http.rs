@@ -1,5 +1,8 @@
 #[path = "../src/git/http.rs"]
 mod http;
+#[allow(dead_code, reason = "the HTTP test does not run maintenance")]
+#[path = "../src/maintenance.rs"]
+mod maintenance;
 #[allow(
     dead_code,
     reason = "the HTTP test does not use each shared protocol API"

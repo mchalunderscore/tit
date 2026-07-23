@@ -12,6 +12,9 @@ mod domain;
 )]
 #[path = "../src/git/mod.rs"]
 mod git;
+#[allow(dead_code, reason = "the pull-request test does not run maintenance")]
+#[path = "../src/maintenance.rs"]
+mod maintenance;
 #[allow(
     dead_code,
     reason = "the pull-request test uses repository policy through Git"

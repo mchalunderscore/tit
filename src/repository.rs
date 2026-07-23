@@ -9,6 +9,7 @@ use thiserror::Error;
 use crate::auth::{AuthError, validate_username};
 use crate::domain::repository::{RepositoryNameError, validate_slug};
 use crate::git::repository::{GitRepository, GitRepositoryError};
+use crate::maintenance::MaintenanceGate;
 use crate::store::{
     NewAuditEvent, NewRepository, RepositoryOrigin, RepositoryRecord, Store, StoreError,
 };
@@ -17,13 +18,23 @@ use crate::store::{
 pub(crate) struct RepositoryService {
     database: PathBuf,
     root: PathBuf,
+    maintenance: MaintenanceGate,
 }
 
 impl RepositoryService {
     pub(crate) fn new(database: &Path, root: &Path) -> Self {
+        Self::new_with_gate(database, root, MaintenanceGate::default())
+    }
+
+    pub(crate) fn new_with_gate(
+        database: &Path,
+        root: &Path,
+        maintenance: MaintenanceGate,
+    ) -> Self {
         Self {
             database: database.to_owned(),
             root: root.to_owned(),
+            maintenance,
         }
     }
 
@@ -57,6 +68,7 @@ impl RepositoryService {
     ) -> Result<RepositoryRecord, RepositoryServiceError> {
         validate_username(owner)?;
         validate_slug(slug)?;
+        let _maintenance = self.maintenance.mutation();
         let object_format_name = object_format_name(object_format)?;
         let created_at = timestamp()?;
         let mut store = Store::open(&self.database)?;

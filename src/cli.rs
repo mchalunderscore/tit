@@ -52,6 +52,18 @@ pub(crate) enum Command {
     InviteCode,
     /// Check the instance database
     Doctor,
+    /// Create a backup archive
+    Backup {
+        /// Write the backup archive to FILE
+        output: PathBuf,
+    },
+    /// Restore a backup archive to an empty instance directory
+    Restore {
+        /// Read the backup archive from FILE
+        archive: PathBuf,
+        /// Restore the instance into DIRECTORY
+        target: PathBuf,
+    },
     /// Set up an uninitialized instance
     Setup {
         #[command(subcommand)]

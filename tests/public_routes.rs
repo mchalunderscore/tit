@@ -37,6 +37,9 @@ mod instance;
 #[allow(dead_code, reason = "the public-route test does not mutate issues")]
 #[path = "../src/issue.rs"]
 mod issue;
+#[allow(dead_code, reason = "the public-route test does not run maintenance")]
+#[path = "../src/maintenance.rs"]
+mod maintenance;
 #[path = "../src/markdown.rs"]
 mod markdown;
 #[allow(dead_code, reason = "the public-route test uses anonymous policy only")]

@@ -77,6 +77,73 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     assert!(health.starts_with("HTTP/1.1 200"));
     assert!(health.ends_with("\r\n\r\nready\n"));
 
+    let backup_directory = TempDir::new().expect("create a backup directory");
+    let backup = backup_directory.path().join("instance.tar");
+    let backup_output = Command::new(env!("CARGO_BIN_EXE_tit"))
+        .args([
+            "--config",
+            config.to_str().expect("a UTF-8 configuration path"),
+            "backup",
+            backup.to_str().expect("a UTF-8 backup path"),
+        ])
+        .output()
+        .expect("request an online backup");
+    assert!(
+        backup_output.status.success(),
+        "online backup failed: {}",
+        String::from_utf8_lossy(&backup_output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&backup_output.stdout).contains("contains credentials"));
+    assert_eq!(
+        fs::metadata(&backup)
+            .expect("inspect the backup")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    let restored = TempDir::new().expect("create a restore target");
+    fs::set_permissions(restored.path(), fs::Permissions::from_mode(0o700))
+        .expect("make the restore target private");
+    let restore_output = Command::new(env!("CARGO_BIN_EXE_tit"))
+        .args([
+            "restore",
+            backup.to_str().expect("a UTF-8 backup path"),
+            restored.path().to_str().expect("a UTF-8 restore path"),
+        ])
+        .output()
+        .expect("restore the online backup");
+    assert!(
+        restore_output.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore_output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&restore_output.stdout).contains("is not active"));
+    let restored_database = rusqlite::Connection::open(restored.path().join("tit.sqlite3"))
+        .expect("open the restored database");
+    let restored_repository: String = restored_database
+        .query_row(
+            "SELECT id FROM repository WHERE slug = 'example'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the restored repository");
+    drop(restored_database);
+    let restored_readme = Command::new("git")
+        .args(["--git-dir"])
+        .arg(
+            restored
+                .path()
+                .join("repositories")
+                .join(format!("{restored_repository}.git")),
+        )
+        .args(["show", "main:README.md"])
+        .output()
+        .expect("read the restored Git repository");
+    assert!(restored_readme.status.success());
+    assert_eq!(restored_readme.stdout, b"serve fixture\n");
+
     let second = Command::new(env!("CARGO_BIN_EXE_tit"))
         .args([
             "--config",

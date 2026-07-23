@@ -297,6 +297,17 @@ impl GitRepository {
         Ok(pack)
     }
 
+    pub(crate) fn integrity_check(&self) -> Result<(), GitRepositoryError> {
+        let roots: Vec<_> = self
+            .references()?
+            .into_iter()
+            .flat_map(|reference| [Some(reference.target), reference.peeled])
+            .flatten()
+            .collect();
+        self.walk_reachable(&roots, false)?;
+        Ok(())
+    }
+
     fn walk_reachable(
         &self,
         roots: &[ObjectId],

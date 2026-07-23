@@ -15,6 +15,7 @@ const SYSTEM_CONFIG_PATH: &str = "/srv/tit/config.toml";
 
 #[derive(Debug)]
 pub(crate) struct Config {
+    pub(crate) config_path: PathBuf,
     pub(crate) public_url: Url,
     pub(crate) instance_dir: PathBuf,
     pub(crate) http_listen: SocketAddr,
@@ -291,6 +292,7 @@ pub(crate) fn load(cli: &Cli) -> Result<Config, ConfigError> {
     let ssh_public_port = cli.ssh_public_port.unwrap_or(file.ssh.public_port);
 
     let config = Config {
+        config_path: path.clone(),
         public_url,
         instance_dir,
         http_listen,

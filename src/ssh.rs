@@ -374,6 +374,7 @@ struct ReceiveChannel {
     commands_complete: bool,
     pack: tokio::fs::File,
     pack_bytes: u64,
+    maintenance: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
 impl Handler for SshSession {
@@ -623,6 +624,7 @@ impl Handler for SshSession {
                             repository,
                             identity,
                             public_key,
+                            maintenance,
                         } = *receive;
                         session.data(channel, advertisement)?;
                         let pack = tokio::fs::File::create(service.incoming_pack()).await;
@@ -641,6 +643,7 @@ impl Handler for SshSession {
                                         commands_complete: false,
                                         pack,
                                         pack_bytes: 0,
+                                        maintenance,
                                     })),
                                 );
                             }
@@ -1603,6 +1606,7 @@ impl SshSession {
                 let actor = identity.username.clone();
                 let public_key = self.authenticated_key.clone()?;
                 let uses_policy = repositories.uses_policy();
+                let maintenance = repositories.mutation_permit().await;
                 let permit = repositories.blocking_permit().await.ok()?;
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
@@ -1626,6 +1630,7 @@ impl SshSession {
                             repository,
                             identity,
                             public_key,
+                            maintenance,
                         },
                     )))
                 })
@@ -1659,6 +1664,7 @@ struct InitialReceiveService {
     repository: String,
     identity: SshIdentity,
     public_key: PublicKey,
+    maintenance: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
 async fn receive_data(git: &mut ReceiveChannel, data: &[u8]) -> Result<(), ()> {
@@ -1700,6 +1706,7 @@ async fn finish_receive(
         authorized_keys,
         commands,
         mut pack,
+        maintenance,
         ..
     } = *git;
     pack.flush().await.ok()?;
@@ -1711,6 +1718,7 @@ async fn finish_receive(
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _push_permit = push_permit;
+        let _maintenance = maintenance;
         if authorized_keys.identity(&public_key).as_ref() != Some(&identity)
             || !repositories.authorize(
                 &identity.username,

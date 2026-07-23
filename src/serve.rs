@@ -10,11 +10,13 @@ use thiserror::Error;
 
 use crate::account::AccountService;
 use crate::auth::{AuthError, SshPublicKey};
+use crate::backup::OnlineBackupService;
 use crate::config::{Config, ConfigError};
 use crate::control::{ControlError, RunningControlServer};
 use crate::git::transport::{GitRepositories, RepositoryPathError};
 use crate::http::{ListenerReadiness, PublicWebConfig, RunningWebServer, WebError};
 use crate::instance::{InstanceError, InstanceLock, prepare_database, prepare_repository_root};
+use crate::maintenance::MaintenanceGate;
 use crate::policy::PolicyError;
 use crate::pull_request::{PullRequestError, PullRequestService};
 use crate::ssh::{AuthorizedSshKeys, RunningSshServer, SshServerError};
@@ -26,14 +28,26 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
     let _lock = InstanceLock::acquire(&config.instance_dir)?;
     let database = prepare_database(&config.instance_dir)?;
     let repository_root = prepare_repository_root(&config.instance_dir)?;
-    PullRequestService::new(&database, &repository_root).recover()?;
+    let maintenance = MaintenanceGate::default();
+    PullRequestService::new_with_gate(&database, &repository_root, maintenance.clone())
+        .recover()?;
     let store = Store::open(&database)?;
     let keys = active_ssh_identities(&store)?;
-    let git = GitRepositories::new_managed_authorized(&repository_root, &database)?;
+    let git = GitRepositories::new_managed_authorized_with_gate(
+        &repository_root,
+        &database,
+        maintenance.clone(),
+    )?;
     drop(store);
 
     let accounts = AccountService::new(database);
-    let control = RunningControlServer::start(&config.instance_dir, accounts.clone())?;
+    let backup = OnlineBackupService::new(
+        config.instance_dir.clone(),
+        config.config_path.clone(),
+        maintenance.clone(),
+    );
+    let control =
+        RunningControlServer::start_with_backup(&config.instance_dir, accounts.clone(), backup)?;
     let authorized_keys = AuthorizedSshKeys::for_accounts(keys);
     let readiness = ListenerReadiness::default();
 
@@ -57,6 +71,7 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
         },
         reload_keys,
         readiness.clone(),
+        maintenance,
     )
     .await?;
     let ssh = match RunningSshServer::start_with_dynamic_keys(

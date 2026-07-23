@@ -6,6 +6,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
+use crate::maintenance::MaintenanceGate;
 use crate::policy::{RepositoryOperation, RepositoryPolicy};
 
 const MAX_BLOCKING_GIT_JOBS: usize = 4;
@@ -18,6 +19,7 @@ pub(crate) struct GitRepositories {
     push_database: Option<PathBuf>,
     push_jobs: std::sync::Arc<Semaphore>,
     blocking_jobs: std::sync::Arc<Semaphore>,
+    maintenance: MaintenanceGate,
 }
 
 impl GitRepositories {
@@ -33,6 +35,7 @@ impl GitRepositories {
             push_database: None,
             push_jobs: std::sync::Arc::new(Semaphore::new(1)),
             blocking_jobs: std::sync::Arc::new(Semaphore::new(MAX_BLOCKING_GIT_JOBS)),
+            maintenance: MaintenanceGate::default(),
         })
     }
 
@@ -68,9 +71,18 @@ impl GitRepositories {
         root: &Path,
         database: &Path,
     ) -> Result<Self, RepositoryPathError> {
+        Self::new_managed_authorized_with_gate(root, database, MaintenanceGate::default())
+    }
+
+    pub(crate) fn new_managed_authorized_with_gate(
+        root: &Path,
+        database: &Path,
+        maintenance: MaintenanceGate,
+    ) -> Result<Self, RepositoryPathError> {
         let mut service = Self::new(root)?;
         service.push_database = Some(database.to_owned());
         service.policy = Some(RepositoryPolicy::new(database));
+        service.maintenance = maintenance;
         Ok(service)
     }
 
@@ -214,6 +226,10 @@ impl GitRepositories {
 
     pub(crate) async fn push_permit(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
         self.push_jobs.clone().acquire_owned().await
+    }
+
+    pub(crate) async fn mutation_permit(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.maintenance.mutation_async().await
     }
 
     pub(crate) async fn blocking_permit(&self) -> Result<OwnedSemaphorePermit, AcquireError> {

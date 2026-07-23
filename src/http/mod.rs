@@ -29,6 +29,7 @@ use crate::auth::validate_username;
 use crate::domain::repository::validate_slug;
 use crate::feed_token::FeedTokenService;
 use crate::issue::IssueService;
+use crate::maintenance::MaintenanceGate;
 use crate::pull_request::PullRequestService;
 use crate::repository::{RepositoryService, RepositoryServiceError};
 use crate::search::MetadataSearchService;
@@ -127,7 +128,7 @@ impl RunningWebServer {
         address: SocketAddr,
         config: PublicWebConfig,
     ) -> Result<Self, WebError> {
-        Self::start_public_inner(address, config, None, None).await
+        Self::start_public_inner(address, config, None, None, None).await
     }
 
     pub(crate) async fn start_public_with_key_reload(
@@ -135,8 +136,16 @@ impl RunningWebServer {
         config: PublicWebConfig,
         key_reloader: AccountKeyReloader,
         readiness: ListenerReadiness,
+        maintenance: MaintenanceGate,
     ) -> Result<Self, WebError> {
-        Self::start_public_inner(address, config, Some(key_reloader), Some(readiness)).await
+        Self::start_public_inner(
+            address,
+            config,
+            Some(key_reloader),
+            Some(readiness),
+            Some(maintenance),
+        )
+        .await
     }
 
     async fn start_public_inner(
@@ -144,6 +153,7 @@ impl RunningWebServer {
         config: PublicWebConfig,
         key_reloader: Option<AccountKeyReloader>,
         readiness: Option<ListenerReadiness>,
+        maintenance: Option<MaintenanceGate>,
     ) -> Result<Self, WebError> {
         let jobs = Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS));
         let database = config.instance_dir.join(crate::store::DATABASE_FILE);
@@ -153,9 +163,19 @@ impl RunningWebServer {
         let secure_cookies = public_url.scheme() == "https";
         let login = WebLoginService::new(database, &public_url)?;
         let public = PublicWeb::open(config, Arc::clone(&jobs))?;
-        let repositories = RepositoryService::new(public.database(), public.repository_root());
+        let repositories = match maintenance.clone() {
+            Some(gate) => {
+                RepositoryService::new_with_gate(public.database(), public.repository_root(), gate)
+            }
+            None => RepositoryService::new(public.database(), public.repository_root()),
+        };
         let issues = IssueService::new(public.database());
-        let pull_requests = PullRequestService::new(public.database(), public.repository_root());
+        let pull_requests = match maintenance {
+            Some(gate) => {
+                PullRequestService::new_with_gate(public.database(), public.repository_root(), gate)
+            }
+            None => PullRequestService::new(public.database(), public.repository_root()),
+        };
         let feeds = FeedTokenService::new(public.database());
         let search = MetadataSearchService::new(public.database());
         let watches = WatchService::new(public.database());

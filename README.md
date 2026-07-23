@@ -76,6 +76,35 @@ Each event shows its action, actor, target, outcome, time, and correlation ID.
 The history does not store recovery credentials, login challenges, signatures,
 session tokens, or SSH private keys.
 
+## Backup and restore
+
+For an offline backup, stop the server and run:
+
+```text
+tit --config /srv/tit/config.toml backup /var/backups/tit-2026-07-23.tar
+```
+
+For an online backup, leave the server active and run the same command. The CLI
+sends the request through the private control socket. The server pauses Git
+ref mutations while it makes the SQLite backup and copies the repositories,
+configuration, and SSH host key.
+
+The output file must be an absolute path outside `/srv/tit`. The command creates
+a new mode-0600 file and does not replace an existing file. The backup contains
+credentials. Store it as a secret.
+
+Restore always uses a different, empty instance directory:
+
+```text
+install -d -m 700 /srv/tit-restored
+tit restore /var/backups/tit-2026-07-23.tar /srv/tit-restored
+tit --config /srv/tit-restored/config.toml doctor
+```
+
+Restore checks the manifest, all checksums, the database, and all repositories.
+It does not activate the restored instance. To activate it, stop the old server
+and explicitly start `tit --config /srv/tit-restored/config.toml serve`.
+
 An authenticated account can create a repository with SSH:
 
 ```text
@@ -497,3 +526,17 @@ drain, the empty advisory lock file, and rejection of a second server process.
 Read the
 [process lifecycle architectural decision record](docs/adr/0028-process-lifecycle.md)
 for the readiness, shutdown, and instance-lock contracts.
+
+## Milestone 6.2 gate
+
+Install stock Git. Then, run the backup and restore gate:
+
+```text
+./scripts/check-m6-2
+```
+
+This command tests offline and online backup, owner-only archive permissions,
+the global maintenance gate, manifest checksum failures, empty restore targets,
+database validation, and restored Git object access. Read the
+[backup and restore architectural decision record](docs/adr/0029-backup-and-restore.md)
+for the archive, gate, credential, and activation contracts.

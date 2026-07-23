@@ -2918,6 +2918,21 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub(crate) fn all_repositories(&self) -> Result<Vec<RepositoryRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT repository.id, account.username, repository.slug,
+                    repository.visibility, repository.state, repository.object_format,
+                    repository.created_at, repository.archived_at
+             FROM repository
+             JOIN account ON account.id = repository.owner_account_id
+             ORDER BY account.username, repository.slug",
+        )?;
+        statement
+            .query_map([], repository_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     #[allow(
         dead_code,
         reason = "some integration tests import the store without public HTTP routes"

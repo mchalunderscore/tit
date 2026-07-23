@@ -35,6 +35,9 @@ mod instance;
 #[allow(dead_code, reason = "the Web shell test does not use issue workflows")]
 #[path = "../src/issue.rs"]
 mod issue;
+#[allow(dead_code, reason = "the Web shell test does not run maintenance")]
+#[path = "../src/maintenance.rs"]
+mod maintenance;
 #[path = "../src/markdown.rs"]
 mod markdown;
 #[allow(dead_code, reason = "the Web shell test has no repository catalog")]

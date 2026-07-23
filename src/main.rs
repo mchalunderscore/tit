@@ -5,6 +5,7 @@ mod admin;
     reason = "the bootstrap command uses only part of the authentication API"
 )]
 mod auth;
+mod backup;
 mod bootstrap;
 mod cli;
 mod config;
@@ -18,6 +19,7 @@ mod git;
 mod http;
 mod instance;
 mod issue;
+mod maintenance;
 mod markdown;
 mod policy;
 mod pull_request;
@@ -51,6 +53,10 @@ async fn main() -> ExitCode {
         }
     };
 
+    if let Some(Command::Restore { archive, target }) = &cli.command {
+        return run_restore(archive, target);
+    }
+
     match config::load(&cli) {
         Ok(config) => match cli.command {
             None => ExitCode::SUCCESS,
@@ -83,6 +89,10 @@ async fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+            Some(Command::Backup { output }) => run_backup(&config, &output).await,
+            Some(Command::Restore { .. }) => {
+                unreachable!("the restore command runs before configuration is loaded")
+            }
             Some(Command::Setup {
                 command:
                     SetupCommand::Admin {
@@ -118,6 +128,55 @@ async fn main() -> ExitCode {
             Some(Command::Admin {
                 command: AdminCommand::Audit { limit },
             }) => run_audit_command(&config.instance_dir, limit),
+        },
+        Err(error) => {
+            eprintln!("tit: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_backup(config: &config::Config, output: &std::path::Path) -> ExitCode {
+    let result = match backup::create_offline(&config.instance_dir, &config.config_path, output) {
+        Ok(()) => Ok(()),
+        Err(backup::BackupError::Instance(instance::InstanceError::Locked)) => {
+            control::request_backup(&config.instance_dir, output)
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+        }
+        Err(error) => Err(Box::new(error) as Box<dyn std::error::Error>),
+    };
+    match result {
+        Ok(()) => match writeln!(
+            io::stdout().lock(),
+            "Backup: {}\nWarning: This backup contains credentials.",
+            output.display()
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("tit: cannot write backup information: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("tit: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_restore(archive: &std::path::Path, target: &std::path::Path) -> ExitCode {
+    match backup::restore(archive, target) {
+        Ok(()) => match writeln!(
+            io::stdout().lock(),
+            "Restore: {}\nThe restored instance is not active.",
+            target.display()
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("tit: cannot write restore information: {error}");
+                ExitCode::FAILURE
+            }
         },
         Err(error) => {
             eprintln!("tit: {error}");

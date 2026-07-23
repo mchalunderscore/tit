@@ -13,6 +13,7 @@ use crate::git::read::{
     Comparison, ReadCancellation, ReadError, ReadLimits, RepositoryReadService,
 };
 use crate::git::repository::{GitRepository, GitRepositoryError};
+use crate::maintenance::MaintenanceGate;
 use crate::policy::{PolicyError, RepositoryPolicy};
 use crate::store::{
     GitOperationIntent, NewPullRequestMerge, NewPullRequestRefIntent, NewPullRequestReview,
@@ -29,6 +30,7 @@ pub(crate) struct PullRequestService {
     database: PathBuf,
     repositories: PathBuf,
     operations: Arc<Mutex<()>>,
+    maintenance: MaintenanceGate,
 }
 
 pub(crate) struct PullRequestComparison {
@@ -39,10 +41,19 @@ pub(crate) struct PullRequestComparison {
 
 impl PullRequestService {
     pub(crate) fn new(database: &Path, repositories: &Path) -> Self {
+        Self::new_with_gate(database, repositories, MaintenanceGate::default())
+    }
+
+    pub(crate) fn new_with_gate(
+        database: &Path,
+        repositories: &Path,
+        maintenance: MaintenanceGate,
+    ) -> Self {
         Self {
             database: database.to_owned(),
             repositories: repositories.to_owned(),
             operations: Arc::new(Mutex::new(())),
+            maintenance,
         }
     }
 
@@ -64,6 +75,7 @@ impl PullRequestService {
         validate_content(title, body)?;
         validate_branch(base_ref)?;
         validate_branch(head_ref)?;
+        let _maintenance = self.maintenance.mutation();
         let _operation = self
             .operations
             .lock()
@@ -116,6 +128,7 @@ impl PullRequestService {
         if number < 1 {
             return Err(PullRequestError::Number);
         }
+        let _maintenance = self.maintenance.mutation();
         let _operation = self
             .operations
             .lock()
@@ -184,6 +197,7 @@ impl PullRequestService {
         if number < 1 {
             return Err(PullRequestError::Number);
         }
+        let _maintenance = self.maintenance.mutation();
         let _operation = self
             .operations
             .lock()
@@ -210,6 +224,7 @@ impl PullRequestService {
         if number < 1 || revision.is_some_and(|number| number < 1) {
             return Err(PullRequestError::Number);
         }
+        let _maintenance = self.maintenance.mutation();
         let _operation = self
             .operations
             .lock()
@@ -261,6 +276,7 @@ impl PullRequestService {
             return Err(PullRequestError::Number);
         }
         validate_review(kind, body, path, side, line)?;
+        let _maintenance = self.maintenance.mutation();
         let _operation = self
             .operations
             .lock()
@@ -344,6 +360,7 @@ impl PullRequestService {
         if number < 1 || !matches!(method, "fast-forward" | "merge-commit") {
             return Err(PullRequestError::MergeMethod);
         }
+        let _maintenance = self.maintenance.mutation();
         let _operation = self
             .operations
             .lock()
@@ -473,6 +490,7 @@ impl PullRequestService {
         if let Some(actor) = actor {
             validate_username(actor)?;
         }
+        let _maintenance = self.maintenance.mutation();
         let _operation = self
             .operations
             .lock()
@@ -484,6 +502,7 @@ impl PullRequestService {
     }
 
     pub(crate) fn recover(&self) -> Result<(), PullRequestError> {
+        let _maintenance = self.maintenance.mutation();
         let _operation = self
             .operations
             .lock()
