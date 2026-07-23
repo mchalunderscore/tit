@@ -12,7 +12,7 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 pub(crate) const REPOSITORY_DIRECTORY: &str = "repositories";
 
 pub(crate) struct InstanceLock {
-    _file: File,
+    file: File,
 }
 
 impl InstanceLock {
@@ -40,10 +40,16 @@ impl InstanceLock {
             })?;
         validate_private_file(&path, &file)?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => Ok(Self { file }),
             Err(TryLockError::WouldBlock) => Err(InstanceError::Locked),
             Err(TryLockError::Error(source)) => Err(InstanceError::Open { path, source }),
         }
+    }
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
