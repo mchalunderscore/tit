@@ -1,3 +1,9 @@
+#[allow(
+    dead_code,
+    reason = "the Web shell test does not use account mutations"
+)]
+#[path = "../src/account.rs"]
+mod account;
 #[allow(dead_code, reason = "the Web shell test uses only username validation")]
 #[path = "../src/auth.rs"]
 mod auth;
@@ -79,6 +85,27 @@ async fn serves_the_semantic_shell_without_javascript() {
         css_head.header("content-length"),
         css.body.len().to_string()
     );
+
+    let signup = request(server.address(), "GET", "/signup", &[]);
+    assert_eq!(signup.status, 200);
+    assert!(
+        signup
+            .body
+            .contains("<form action=\"/signup\" method=\"post\">")
+    );
+    assert!(signup.body.contains("name=\"invitation\""));
+    let recovery = request(server.address(), "GET", "/recover", &[]);
+    assert_eq!(recovery.status, 200);
+    assert!(
+        recovery
+            .body
+            .contains("<form action=\"/recover\" method=\"post\">")
+    );
+    assert!(recovery.body.contains("name=\"recovery\""));
+
+    let wrong_signup_method = request(server.address(), "PUT", "/signup", &[]);
+    assert_eq!(wrong_signup_method.status, 405);
+    assert_eq!(wrong_signup_method.header("allow"), "GET, HEAD, POST");
 
     server.shutdown().await.expect("stop the Web server");
 }

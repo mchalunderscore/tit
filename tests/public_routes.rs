@@ -1,5 +1,11 @@
 #[allow(
     dead_code,
+    reason = "the public-route test does not use account mutations"
+)]
+#[path = "../src/account.rs"]
+mod account;
+#[allow(
+    dead_code,
     reason = "the public-route test uses only username validation"
 )]
 #[path = "../src/auth.rs"]

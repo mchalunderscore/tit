@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rand::rng;
@@ -32,6 +32,39 @@ pub(crate) struct RunningSshServer {
     audit: Arc<RequestAudit>,
 }
 
+#[derive(Clone)]
+pub(crate) struct AuthorizedSshKeys {
+    keys: Arc<RwLock<HashMap<PublicKey, String>>>,
+}
+
+impl AuthorizedSshKeys {
+    pub(crate) fn new(keys: &[SshPublicKey]) -> Self {
+        Self {
+            keys: Arc::new(RwLock::new(key_map(keys))),
+        }
+    }
+
+    pub(crate) fn replace(&self, keys: &[SshPublicKey]) {
+        if let Ok(mut current) = self.keys.write() {
+            *current = key_map(keys);
+        }
+    }
+
+    fn actor(&self, key: &PublicKey) -> Option<String> {
+        self.keys.read().ok()?.get(key).cloned()
+    }
+
+    fn contains(&self, key: &PublicKey) -> bool {
+        self.keys.read().is_ok_and(|keys| keys.contains_key(key))
+    }
+}
+
+fn key_map(keys: &[SshPublicKey]) -> HashMap<PublicKey, String> {
+    keys.iter()
+        .map(|key| (key.public_key().clone(), key.fingerprint().to_owned()))
+        .collect()
+}
+
 impl RunningSshServer {
     pub(crate) async fn start(
         address: SocketAddr,
@@ -57,6 +90,16 @@ impl RunningSshServer {
         host_key: PrivateKey,
     ) -> Result<Self, SshServerError> {
         Self::start_inner(address, authorized_keys, &[], Some(repositories), host_key).await
+    }
+
+    pub(crate) async fn start_with_dynamic_keys(
+        address: SocketAddr,
+        authorized_keys: AuthorizedSshKeys,
+        repositories: GitRepositories,
+        host_key: PrivateKey,
+    ) -> Result<Self, SshServerError> {
+        Self::start_inner_with_keys(address, authorized_keys, &[], Some(repositories), host_key)
+            .await
     }
 
     pub(crate) async fn start_with_git_writes(
@@ -93,6 +136,23 @@ impl RunningSshServer {
         repositories: Option<GitRepositories>,
         host_key: PrivateKey,
     ) -> Result<Self, SshServerError> {
+        Self::start_inner_with_keys(
+            address,
+            AuthorizedSshKeys::new(authorized_keys),
+            writable_keys,
+            repositories,
+            host_key,
+        )
+        .await
+    }
+
+    async fn start_inner_with_keys(
+        address: SocketAddr,
+        authorized_keys: AuthorizedSshKeys,
+        writable_keys: &[SshPublicKey],
+        repositories: Option<GitRepositories>,
+        host_key: PrivateKey,
+    ) -> Result<Self, SshServerError> {
         let listener = TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
         let mut methods = MethodSet::empty();
@@ -116,12 +176,6 @@ impl RunningSshServer {
             nodelay: true,
             ..Default::default()
         });
-        let authorized_keys: Arc<HashMap<PublicKey, String>> = Arc::new(
-            authorized_keys
-                .iter()
-                .map(|key| (key.public_key().clone(), key.fingerprint().to_owned()))
-                .collect(),
-        );
         let writable_keys = Arc::new(
             writable_keys
                 .iter()
@@ -182,7 +236,7 @@ pub(crate) enum SshServerError {
 
 #[derive(Clone)]
 struct SshServer {
-    authorized_keys: Arc<HashMap<PublicKey, String>>,
+    authorized_keys: AuthorizedSshKeys,
     writable_keys: Arc<HashSet<PublicKey>>,
     audit: Arc<RequestAudit>,
     repositories: Option<Arc<GitRepositories>>,
@@ -193,7 +247,7 @@ impl Server for SshServer {
 
     fn new_client(&mut self, _peer_address: Option<SocketAddr>) -> Self::Handler {
         SshSession {
-            authorized_keys: Arc::clone(&self.authorized_keys),
+            authorized_keys: self.authorized_keys.clone(),
             writable_keys: Arc::clone(&self.writable_keys),
             audit: Arc::clone(&self.audit),
             repositories: self.repositories.clone(),
@@ -206,7 +260,7 @@ impl Server for SshServer {
 }
 
 struct SshSession {
-    authorized_keys: Arc<HashMap<PublicKey, String>>,
+    authorized_keys: AuthorizedSshKeys,
     writable_keys: Arc<HashSet<PublicKey>>,
     audit: Arc<RequestAudit>,
     repositories: Option<Arc<GitRepositories>>,
@@ -250,8 +304,8 @@ impl Handler for SshSession {
         _user: &str,
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        if let Some(actor) = self.authorized_keys.get(public_key) {
-            self.authenticated_actor = Some(actor.clone());
+        if let Some(actor) = self.authorized_keys.actor(public_key) {
+            self.authenticated_actor = Some(actor);
             self.authenticated_writer = self.writable_keys.contains(public_key);
             Ok(Auth::Accept)
         } else {
@@ -603,7 +657,7 @@ impl Handler for SshSession {
 
 impl SshSession {
     fn authorize(&self, public_key: &PublicKey) -> Auth {
-        if self.authorized_keys.contains_key(public_key) {
+        if self.authorized_keys.contains(public_key) {
             Auth::Accept
         } else {
             Auth::reject()

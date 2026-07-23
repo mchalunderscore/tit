@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+./scripts/check
+cargo test --locked --release --test account_lifecycle
+cargo test --locked --release --test serve serves_an_imported_repository_through_http_and_ssh

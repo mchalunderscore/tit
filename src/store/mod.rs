@@ -9,7 +9,7 @@ use thiserror::Error;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -19,15 +19,20 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 6] = [
+const MIGRATIONS: [&str; 7] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
     include_str!("migrations/004_identity.sql"),
     include_str!("migrations/005_repository.sql"),
     include_str!("migrations/006_repository_events.sql"),
+    include_str!("migrations/007_account_lifecycle.sql"),
 ];
 
+#[allow(
+    dead_code,
+    reason = "integration tests compile storage without every account operation"
+)]
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
     #[error("SQLite error: {0}")]
@@ -58,6 +63,18 @@ pub(crate) enum StoreError {
     AlreadyInitialized,
     #[error("account does not exist or is not active: {0}")]
     AccountNotFound(String),
+    #[error("username is not available: {0}")]
+    UsernameUnavailable(String),
+    #[error("signup invitation is invalid, expired, or already used")]
+    InvalidInvitation,
+    #[error("recovery credential is invalid")]
+    InvalidRecovery,
+    #[error("SSH public key already exists")]
+    KeyExists,
+    #[error("active SSH public key does not exist")]
+    KeyNotFound,
+    #[error("an account must have at least one active SSH public key")]
+    LastKey,
     #[error("repository does not exist: {0}/{1}")]
     RepositoryNotFound(String, String),
     #[error("repository already exists: {0}/{1}")]
@@ -373,6 +390,199 @@ impl Store {
         Ok(())
     }
 
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without accounts"
+    )]
+    pub(crate) fn create_signup_invitation(
+        &self,
+        code_hash: &[u8; 32],
+        created_at: i64,
+        expires_at: i64,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO signup_invitation (code_hash, created_at, expires_at, consumed_at)
+             VALUES (?1, ?2, ?3, NULL)",
+            rusqlite::params![code_hash, created_at, expires_at],
+        )?;
+        Ok(())
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without accounts"
+    )]
+    pub(crate) fn create_account_with_invitation(
+        &mut self,
+        account: &InvitedAccount<'_>,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let consumed = transaction.execute(
+            "UPDATE signup_invitation SET consumed_at = ?2
+             WHERE code_hash = ?1 AND consumed_at IS NULL AND expires_at >= ?2",
+            rusqlite::params![account.invitation_hash, account.created_at],
+        )?;
+        if consumed != 1 {
+            return Err(StoreError::InvalidInvitation);
+        }
+        let inserted = transaction.execute(
+            "INSERT INTO account (username, is_administrator, state, created_at)
+             VALUES (?1, 0, 'active', ?2)",
+            rusqlite::params![account.username, account.created_at],
+        );
+        let account_id = match inserted {
+            Ok(1) => transaction.last_insert_rowid(),
+            Err(error) if is_unique_constraint(&error) => {
+                return Err(StoreError::UsernameUnavailable(account.username.to_owned()));
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => unreachable!("an INSERT changes one row"),
+        };
+        insert_ssh_key(&transaction, account_id, &account.key, account.created_at)?;
+        transaction.execute(
+            "INSERT INTO recovery_credential (account_id, credential_hash, created_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![account_id, account.recovery_hash, account.created_at],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without accounts"
+    )]
+    pub(crate) fn recover_account(
+        &mut self,
+        recovery: &AccountRecovery<'_>,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let account_id = transaction
+            .query_row(
+                "SELECT account.id FROM account
+                 JOIN recovery_credential ON recovery_credential.account_id = account.id
+                 WHERE account.username = ?1 AND account.state = 'active'
+                   AND recovery_credential.credential_hash = ?2",
+                rusqlite::params![recovery.username, recovery.old_recovery_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::InvalidRecovery)?;
+        transaction.execute(
+            "UPDATE ssh_public_key SET revoked_at = ?2
+             WHERE account_id = ?1 AND revoked_at IS NULL",
+            rusqlite::params![account_id, recovery.created_at],
+        )?;
+        let existing = transaction
+            .query_row(
+                "SELECT account_id FROM ssh_public_key WHERE fingerprint = ?1",
+                [recovery.key.fingerprint],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        match existing {
+            Some(owner) if owner == account_id => {
+                transaction.execute(
+                    "UPDATE ssh_public_key
+                     SET canonical_key = ?2, label = ?3, revoked_at = NULL
+                     WHERE account_id = ?1 AND fingerprint = ?4",
+                    rusqlite::params![
+                        account_id,
+                        recovery.key.canonical_key,
+                        recovery.key.label,
+                        recovery.key.fingerprint,
+                    ],
+                )?;
+            }
+            Some(_) => return Err(StoreError::KeyExists),
+            None => insert_ssh_key(&transaction, account_id, &recovery.key, recovery.created_at)?,
+        }
+        transaction.execute(
+            "UPDATE recovery_credential
+             SET credential_hash = ?2, created_at = ?3 WHERE account_id = ?1",
+            rusqlite::params![account_id, recovery.new_recovery_hash, recovery.created_at],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without accounts"
+    )]
+    pub(crate) fn add_account_key(
+        &mut self,
+        username: &str,
+        key: &NewSshKey<'_>,
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let account_id = active_account_id(&transaction, username)?;
+        insert_ssh_key(&transaction, account_id, key, created_at)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without accounts"
+    )]
+    pub(crate) fn revoke_account_key(
+        &mut self,
+        username: &str,
+        fingerprint: &str,
+        revoked_at: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let account_id = active_account_id(&transaction, username)?;
+        let active: i64 = transaction.query_row(
+            "SELECT count(*) FROM ssh_public_key WHERE account_id = ?1 AND revoked_at IS NULL",
+            [account_id],
+            |row| row.get(0),
+        )?;
+        if active <= 1 {
+            return Err(StoreError::LastKey);
+        }
+        let changed = transaction.execute(
+            "UPDATE ssh_public_key SET revoked_at = ?3
+             WHERE account_id = ?1 AND fingerprint = ?2 AND revoked_at IS NULL",
+            rusqlite::params![account_id, fingerprint, revoked_at],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::KeyNotFound);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without accounts"
+    )]
+    pub(crate) fn suspend_account(
+        &self,
+        username: &str,
+        suspended: bool,
+    ) -> Result<(), StoreError> {
+        let state = if suspended { "suspended" } else { "active" };
+        let changed = self.connection.execute(
+            "UPDATE account SET state = ?2 WHERE username = ?1",
+            rusqlite::params![username, state],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::AccountNotFound(username.to_owned()));
+        }
+        Ok(())
+    }
+
     pub(crate) fn create_repository(
         &mut self,
         repository: &NewRepository<'_>,
@@ -574,7 +784,7 @@ impl Store {
             "SELECT ssh_public_key.canonical_key
              FROM ssh_public_key
              JOIN account ON account.id = ssh_public_key.account_id
-             WHERE account.state = 'active'
+             WHERE account.state = 'active' AND ssh_public_key.revoked_at IS NULL
              ORDER BY ssh_public_key.id",
         )?;
         statement
@@ -645,6 +855,40 @@ pub(crate) struct InitialAdministrator<'a> {
     pub(crate) canonical_key: &'a str,
     pub(crate) fingerprint: &'a str,
     pub(crate) recovery_hash: &'a [u8; 32],
+    pub(crate) created_at: i64,
+}
+
+#[allow(
+    dead_code,
+    reason = "some integration tests compile storage without accounts"
+)]
+pub(crate) struct NewSshKey<'a> {
+    pub(crate) canonical_key: &'a str,
+    pub(crate) fingerprint: &'a str,
+    pub(crate) label: &'a str,
+}
+
+#[allow(
+    dead_code,
+    reason = "some integration tests compile storage without accounts"
+)]
+pub(crate) struct InvitedAccount<'a> {
+    pub(crate) invitation_hash: &'a [u8; 32],
+    pub(crate) username: &'a str,
+    pub(crate) key: NewSshKey<'a>,
+    pub(crate) recovery_hash: &'a [u8; 32],
+    pub(crate) created_at: i64,
+}
+
+#[allow(
+    dead_code,
+    reason = "some integration tests compile storage without accounts"
+)]
+pub(crate) struct AccountRecovery<'a> {
+    pub(crate) username: &'a str,
+    pub(crate) old_recovery_hash: &'a [u8; 32],
+    pub(crate) key: NewSshKey<'a>,
+    pub(crate) new_recovery_hash: &'a [u8; 32],
     pub(crate) created_at: i64,
 }
 
@@ -727,6 +971,35 @@ pub(crate) struct GitIntentRecord {
     pub(crate) quarantine_path: String,
     pub(crate) state: String,
     pub(crate) pack_name: Option<String>,
+}
+
+#[allow(
+    dead_code,
+    reason = "some integration tests compile storage without accounts"
+)]
+fn insert_ssh_key(
+    transaction: &rusqlite::Transaction<'_>,
+    account_id: i64,
+    key: &NewSshKey<'_>,
+    created_at: i64,
+) -> Result<(), StoreError> {
+    match transaction.execute(
+        "INSERT INTO ssh_public_key
+         (account_id, canonical_key, fingerprint, created_at, label, last_used_at, revoked_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+        rusqlite::params![
+            account_id,
+            key.canonical_key,
+            key.fingerprint,
+            created_at,
+            key.label,
+        ],
+    ) {
+        Ok(1) => Ok(()),
+        Err(error) if is_unique_constraint(&error) => Err(StoreError::KeyExists),
+        Err(error) => Err(error.into()),
+        Ok(_) => unreachable!("an INSERT changes one row"),
+    }
 }
 
 fn insert_push_events(

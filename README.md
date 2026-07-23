@@ -31,8 +31,16 @@ The `serve` command starts the HTTP and SSH listeners in one process. It creates
 host key during subsequent starts. Keep this file with the instance data.
 
 The server owns the instance lock until it receives SIGINT or SIGTERM. Stop the
-server before you run an offline administrator command. A subsequent milestone
-routes necessary online administrator commands through the control socket.
+server before you run an offline administrator command. Create a signup code
+through the control socket while the server runs:
+
+```text
+tit --config /srv/tit/config.toml invite-code
+```
+
+The code is valid for one signup during the next 24 hours. Open `/signup` to
+create the account. Store the recovery credential offline when the Web UI shows
+it. Open `/recover` to replace all account keys with a new key.
 
 ## Quality gate
 
@@ -138,3 +146,16 @@ This command runs the quality gate, measures source search without an index,
 and tests the public routes with SHA-1 and SHA-256 repositories. Read the
 [source search architectural decision record](docs/adr/0008-bounded-source-search.md)
 for the search limits and current measurement.
+
+## Milestone 3.1 gate
+
+Install stock Git and OpenSSH. Then, run the account lifecycle gate:
+
+```text
+./scripts/check-m3-1
+```
+
+This command tests invitation, signup, recovery, key revocation, account
+suspension, and the owner-only control socket. Read the
+[account lifecycle architectural decision record](docs/adr/0010-account-lifecycle.md)
+for the credential and failure behavior.

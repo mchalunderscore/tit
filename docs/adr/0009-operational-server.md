@@ -18,7 +18,8 @@ Stop both listeners after SIGINT or SIGTERM. If one listener cannot start, stop
 the listener that already started and return an error.
 
 At startup, read the active SSH public keys and the active public repositories
-from SQLite. Give the SSH transport a fixed map from each owner and repository
+from SQLite. Reload the key map after a successful account signup or recovery.
+Give the SSH transport a fixed map from each owner and repository
 slug to its immutable repository ID. Resolve the final path below the canonical
 repository directory. The instance lock prevents an offline command from
 changing this map during the server run.

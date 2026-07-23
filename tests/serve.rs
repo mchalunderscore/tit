@@ -64,6 +64,47 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     let mut server = spawn_server(&config);
     wait_for_listener(http, &mut server);
     wait_for_listener(ssh, &mut server);
+    let control_socket = instance.path().join("control.sock");
+    assert_eq!(
+        fs::symlink_metadata(&control_socket)
+            .expect("inspect the control socket")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    let invitation_output = Command::new(env!("CARGO_BIN_EXE_tit"))
+        .args([
+            "--config",
+            config.to_str().expect("a UTF-8 configuration path"),
+            "invite-code",
+        ])
+        .output()
+        .expect("request an invitation");
+    assert!(invitation_output.status.success());
+    let invitation = String::from_utf8(invitation_output.stdout)
+        .expect("read the invitation output")
+        .trim()
+        .strip_prefix("Signup code: ")
+        .expect("read the invitation code")
+        .to_owned();
+    let member_key = instance.path().join("member");
+    create_ssh_key_fixture(&member_key);
+    let member_public =
+        fs::read_to_string(member_key.with_extension("pub")).expect("read the member public key");
+    let signup = http_form(
+        http,
+        "/signup",
+        &[
+            ("invitation", invitation.as_str()),
+            ("username", "bob"),
+            ("public-key", member_public.trim()),
+        ],
+    );
+    assert!(signup.starts_with("HTTP/1.1 200"), "{signup}");
+    let recovery = between(&signup, "<pre><code>", "</code></pre>");
+    assert!(recovery.starts_with("tit-recovery-v1:"));
 
     let summary = http_get(http, "/alice/example");
     assert!(summary.starts_with("HTTP/1.1 200"));
@@ -83,6 +124,37 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         fs::read(http_clone.join("README.md")).expect("read the HTTP clone"),
         b"serve fixture\n"
     );
+
+    assert!(ssh_clone_succeeds(
+        ssh,
+        &member_key,
+        &instance.path().join("member-clone")
+    ));
+
+    let replacement_key = instance.path().join("replacement");
+    create_ssh_key_fixture(&replacement_key);
+    let replacement_public = fs::read_to_string(replacement_key.with_extension("pub"))
+        .expect("read the replacement public key");
+    let recovered = http_form(
+        http,
+        "/recover",
+        &[
+            ("recovery", recovery),
+            ("username", "bob"),
+            ("public-key", replacement_public.trim()),
+        ],
+    );
+    assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");
+    assert!(!ssh_clone_succeeds(
+        ssh,
+        &member_key,
+        &instance.path().join("revoked-clone")
+    ));
+    assert!(ssh_clone_succeeds(
+        ssh,
+        &replacement_key,
+        &instance.path().join("replacement-clone")
+    ));
 
     let ssh_clone = instance.path().join("ssh-clone");
     let ssh_command = format!(
@@ -125,6 +197,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     assert!(String::from_utf8_lossy(&locked.stderr).contains("owns the instance lock"));
 
     server.terminate();
+    assert!(!control_socket.exists());
     let host_key = fs::read(instance.path().join("ssh_host_ed25519_key"))
         .expect("read the generated SSH host key");
     assert_eq!(
@@ -254,6 +327,54 @@ fn http_get(address: SocketAddr, path: &str) -> String {
         .read_to_string(&mut response)
         .expect("read an HTTP response");
     response
+}
+
+fn http_form(address: SocketAddr, path: &str, fields: &[(&str, &str)]) -> String {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(fields.iter().copied())
+        .finish();
+    let mut stream = TcpStream::connect(address).expect("connect to the HTTP server");
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("write an HTTP form");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read an HTTP response");
+    response
+}
+
+fn between<'a>(value: &'a str, start: &str, end: &str) -> &'a str {
+    value
+        .split_once(start)
+        .and_then(|(_, tail)| tail.split_once(end))
+        .map(|(value, _)| value)
+        .expect("find the response value")
+}
+
+fn ssh_clone_succeeds(address: SocketAddr, private_key: &Path, target: &Path) -> bool {
+    let ssh_command = format!(
+        "ssh -F /dev/null -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+        private_key.display()
+    );
+    Command::new("git")
+        .args([
+            "clone",
+            "-q",
+            &format!(
+                "ssh://ignored@127.0.0.1:{}/alice/example.git",
+                address.port()
+            ),
+        ])
+        .arg(target)
+        .env("GIT_SSH_COMMAND", ssh_command)
+        .output()
+        .expect("clone through the tit SSH server")
+        .status
+        .success()
 }
 
 struct ChildGuard(Option<Child>);

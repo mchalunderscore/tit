@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use askama::Template;
 use axum::Router;
-use axum::body::{Body, HttpBody};
-use axum::extract::{Extension, RawQuery, Request};
-use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
+use axum::body::{Body, Bytes, HttpBody};
+use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, RawQuery, Request, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
@@ -17,8 +17,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::account::{AccountError, AccountService};
 use crate::auth::validate_username;
 use crate::domain::repository::validate_slug;
+use crate::store::StoreError;
 
 use self::public::PublicWeb;
 
@@ -30,7 +32,12 @@ const MAX_BLOCKING_WEB_JOBS: usize = 8;
 #[derive(Clone)]
 struct WebState {
     public: Option<PublicWeb>,
+    accounts: Option<AccountService>,
+    jobs: Arc<Semaphore>,
+    key_reloader: Option<AccountKeyReloader>,
 }
+
+type AccountKeyReloader = Arc<dyn Fn(&AccountService) -> Result<(), AccountError> + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PublicWebConfig {
@@ -47,18 +54,48 @@ pub(crate) struct RunningWebServer {
 
 impl RunningWebServer {
     pub(crate) async fn start(address: SocketAddr) -> Result<Self, WebError> {
-        Self::start_with_state(address, WebState { public: None }).await
+        Self::start_with_state(
+            address,
+            WebState {
+                public: None,
+                accounts: None,
+                jobs: Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS)),
+                key_reloader: None,
+            },
+        )
+        .await
     }
 
     pub(crate) async fn start_public(
         address: SocketAddr,
         config: PublicWebConfig,
     ) -> Result<Self, WebError> {
-        let public = PublicWeb::open(config, Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS)))?;
+        Self::start_public_inner(address, config, None).await
+    }
+
+    pub(crate) async fn start_public_with_key_reload(
+        address: SocketAddr,
+        config: PublicWebConfig,
+        key_reloader: AccountKeyReloader,
+    ) -> Result<Self, WebError> {
+        Self::start_public_inner(address, config, Some(key_reloader)).await
+    }
+
+    async fn start_public_inner(
+        address: SocketAddr,
+        config: PublicWebConfig,
+        key_reloader: Option<AccountKeyReloader>,
+    ) -> Result<Self, WebError> {
+        let jobs = Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS));
+        let accounts = AccountService::new(config.instance_dir.join(crate::store::DATABASE_FILE));
+        let public = PublicWeb::open(config, Arc::clone(&jobs))?;
         Self::start_with_state(
             address,
             WebState {
                 public: Some(public),
+                accounts: Some(accounts),
+                jobs,
+                key_reloader,
             },
         )
         .await
@@ -94,13 +131,30 @@ impl RunningWebServer {
 }
 
 pub(crate) fn router() -> Router {
-    router_with_state(WebState { public: None })
+    router_with_state(WebState {
+        public: None,
+        accounts: None,
+        jobs: Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS)),
+        key_reloader: None,
+    })
 }
 
 fn router_with_state(state: WebState) -> Router {
     Router::new()
         .route("/", get(home))
         .route("/go", get(go_to_repository))
+        .route(
+            "/signup",
+            get(signup_form)
+                .post(signup)
+                .layer(DefaultBodyLimit::max(20 * 1024)),
+        )
+        .route(
+            "/recover",
+            get(recovery_form)
+                .post(recover)
+                .layer(DefaultBodyLimit::max(20 * 1024)),
+        )
         .route("/assets/style.css", get(style))
         .merge(public::routes())
         .fallback(not_found)
@@ -137,6 +191,210 @@ async fn go_to_repository(
     }
 }
 
+async fn signup_form(Extension(request_id): Extension<RequestId>) -> Response {
+    render_account_form(&request_id.0, AccountFormKind::Signup, "", "")
+}
+
+async fn recovery_form(Extension(request_id): Extension<RequestId>) -> Response {
+    render_account_form(&request_id.0, AccountFormKind::Recovery, "", "")
+}
+
+async fn signup(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_account_form(&headers, &body, "invitation") {
+        Ok(fields) => fields,
+        Err(()) => {
+            return render_account_error(
+                &request_id.0,
+                AccountFormKind::Signup,
+                "",
+                "The signup request is not valid.",
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+    let username = fields.username.clone();
+    let result = account_job(state, move |accounts| {
+        accounts.signup(&fields.credential, &fields.username, &fields.public_key)
+    })
+    .await;
+    account_result(result, &request_id.0, AccountFormKind::Signup, &username)
+}
+
+async fn recover(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_account_form(&headers, &body, "recovery") {
+        Ok(fields) => fields,
+        Err(()) => {
+            return render_account_error(
+                &request_id.0,
+                AccountFormKind::Recovery,
+                "",
+                "The recovery request is not valid.",
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+    let username = fields.username.clone();
+    let result = account_job(state, move |accounts| {
+        accounts.recover(&fields.username, &fields.credential, &fields.public_key)
+    })
+    .await;
+    account_result(result, &request_id.0, AccountFormKind::Recovery, &username)
+}
+
+async fn account_job<T: Send + 'static>(
+    state: WebState,
+    operation: impl FnOnce(AccountService) -> Result<T, AccountError> + Send + 'static,
+) -> Result<T, AccountError> {
+    let accounts = state.accounts.ok_or_else(|| {
+        AccountError::Store(StoreError::Integrity(
+            "account service is unavailable".to_owned(),
+        ))
+    })?;
+    let permit = state.jobs.acquire_owned().await.map_err(|_| {
+        AccountError::Store(StoreError::Integrity(
+            "account worker pool is unavailable".to_owned(),
+        ))
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let result = operation(accounts.clone());
+        if result.is_ok()
+            && let Some(reload) = state.key_reloader
+        {
+            reload(&accounts)?;
+        }
+        result
+    })
+    .await
+    .map_err(|_| AccountError::Store(StoreError::Integrity("account worker failed".to_owned())))?
+}
+
+fn account_result(
+    result: Result<String, AccountError>,
+    request_id: &str,
+    kind: AccountFormKind,
+    username: &str,
+) -> Response {
+    match result {
+        Ok(recovery) => render(
+            StatusCode::OK,
+            &RecoveryCodeTemplate {
+                request_id,
+                recovery: &recovery,
+            },
+        ),
+        Err(AccountError::Store(StoreError::UsernameUnavailable(_))) => render_account_error(
+            request_id,
+            kind,
+            username,
+            "That username is not available.",
+            StatusCode::CONFLICT,
+        ),
+        Err(
+            AccountError::Auth(_)
+            | AccountError::InvalidSecret
+            | AccountError::Store(StoreError::InvalidInvitation)
+            | AccountError::Store(StoreError::InvalidRecovery),
+        ) => render_account_error(
+            request_id,
+            kind,
+            username,
+            "The credential, username, or SSH public key is not valid.",
+            StatusCode::BAD_REQUEST,
+        ),
+        Err(_) => render_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            request_id,
+            "Internal server error",
+            "The account request could not be completed.",
+        ),
+    }
+}
+
+fn parse_account_form(
+    headers: &HeaderMap,
+    body: &[u8],
+    credential_name: &str,
+) -> Result<AccountForm, ()> {
+    if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        != Some("application/x-www-form-urlencoded")
+        || !valid_percent_encoding(body)
+    {
+        return Err(());
+    }
+    let mut username = None;
+    let mut credential = None;
+    let mut public_key = None;
+    for (name, value) in url::form_urlencoded::parse(body) {
+        match name.as_ref() {
+            "username" if username.is_none() => username = Some(value.into_owned()),
+            name if name == credential_name && credential.is_none() => {
+                credential = Some(value.into_owned());
+            }
+            "public-key" if public_key.is_none() => public_key = Some(value.into_owned()),
+            _ => return Err(()),
+        }
+    }
+    Ok(AccountForm {
+        username: username.ok_or(())?,
+        credential: credential.ok_or(())?,
+        public_key: public_key.ok_or(())?,
+    })
+}
+
+fn render_account_form(
+    request_id: &str,
+    kind: AccountFormKind,
+    username: &str,
+    error: &str,
+) -> Response {
+    render_account_error(request_id, kind, username, error, StatusCode::OK)
+}
+
+fn render_account_error(
+    request_id: &str,
+    kind: AccountFormKind,
+    username: &str,
+    error: &str,
+    status: StatusCode,
+) -> Response {
+    render(
+        status,
+        &AccountFormTemplate {
+            request_id,
+            username,
+            error,
+            has_error: !error.is_empty(),
+            recovery: matches!(kind, AccountFormKind::Recovery),
+        },
+    )
+}
+
+struct AccountForm {
+    username: String,
+    credential: String,
+    public_key: String,
+}
+
+#[derive(Clone, Copy)]
+enum AccountFormKind {
+    Signup,
+    Recovery,
+}
+
 async fn style() -> Response {
     Response::builder()
         .status(StatusCode::OK)
@@ -155,16 +413,25 @@ async fn not_found(Extension(request_id): Extension<RequestId>) -> Response {
     )
 }
 
-async fn method_not_allowed(Extension(request_id): Extension<RequestId>) -> Response {
+async fn method_not_allowed(
+    Extension(request_id): Extension<RequestId>,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
     let mut response = render_error(
         StatusCode::METHOD_NOT_ALLOWED,
         &request_id.0,
         "Method not allowed",
         "This page does not accept the request method.",
     );
-    response
-        .headers_mut()
-        .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+    let allow = match uri.path() {
+        "/signup" | "/recover" => "GET, HEAD, POST",
+        path if path.ends_with("/git-upload-pack") => "POST",
+        _ => "GET, HEAD",
+    };
+    response.headers_mut().insert(
+        header::ALLOW,
+        HeaderValue::from_str(allow).expect("the method list is a header value"),
+    );
     response
 }
 
@@ -331,6 +598,23 @@ struct ErrorTemplate<'a> {
     request_id: &'a str,
     status: &'a str,
     message: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "account.html")]
+struct AccountFormTemplate<'a> {
+    request_id: &'a str,
+    username: &'a str,
+    error: &'a str,
+    has_error: bool,
+    recovery: bool,
+}
+
+#[derive(Template)]
+#[template(path = "recovery-code.html")]
+struct RecoveryCodeTemplate<'a> {
+    request_id: &'a str,
+    recovery: &'a str,
 }
 
 #[derive(Debug, Error)]

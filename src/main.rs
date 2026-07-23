@@ -1,3 +1,4 @@
+mod account;
 mod admin;
 #[allow(
     dead_code,
@@ -7,6 +8,7 @@ mod auth;
 mod bootstrap;
 mod cli;
 mod config;
+mod control;
 mod domain;
 mod feed;
 #[allow(dead_code, reason = "the server uses only part of the shared Git API")]
@@ -25,7 +27,9 @@ use std::{io, io::Write};
 
 use clap::Parser;
 
-use crate::cli::{AdminCommand, Cli, Command, ObjectFormat, RepositoryCommand, SetupCommand};
+use crate::cli::{
+    AccountCommand, AdminCommand, Cli, Command, ObjectFormat, RepositoryCommand, SetupCommand,
+};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -48,6 +52,21 @@ async fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+            Some(Command::InviteCode) => {
+                match control::request_invitation(&config.instance_dir).await {
+                    Ok(code) => match writeln!(io::stdout().lock(), "Signup code: {code}") {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(error) => {
+                            eprintln!("tit: cannot write the signup code: {error}");
+                            ExitCode::FAILURE
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("tit: {error}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
             Some(Command::Doctor) => match store::doctor(&config.instance_dir) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
@@ -84,7 +103,57 @@ async fn main() -> ExitCode {
             Some(Command::Admin {
                 command: AdminCommand::Repository { command },
             }) => run_repository_command(&config.instance_dir, command),
+            Some(Command::Admin {
+                command: AdminCommand::Account { command },
+            }) => run_account_command(&config.instance_dir, command),
         },
+        Err(error) => {
+            eprintln!("tit: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_account_command(instance_dir: &std::path::Path, command: AccountCommand) -> ExitCode {
+    let result = (|| -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let _lock = instance::InstanceLock::acquire(instance_dir)?;
+        let database = instance::prepare_database(instance_dir)?;
+        let accounts = account::AccountService::new(database);
+        match command {
+            AccountCommand::KeyAdd {
+                username,
+                label,
+                ssh_public_key,
+            } => {
+                let fingerprint = accounts.add_key(&username, &label, &ssh_public_key)?;
+                Ok(Some(fingerprint))
+            }
+            AccountCommand::KeyRevoke {
+                username,
+                fingerprint,
+            } => {
+                accounts.revoke_key(&username, &fingerprint)?;
+                Ok(None)
+            }
+            AccountCommand::Suspend { username } => {
+                accounts.suspend(&username, true)?;
+                Ok(None)
+            }
+            AccountCommand::Resume { username } => {
+                accounts.suspend(&username, false)?;
+                Ok(None)
+            }
+        }
+    })();
+    match result {
+        Ok(Some(fingerprint)) => match writeln!(io::stdout().lock(), "fingerprint={fingerprint}") {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("tit: cannot write account information: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(None) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("tit: {error}");
             ExitCode::FAILURE

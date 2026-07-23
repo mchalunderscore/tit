@@ -7,12 +7,14 @@ use rand::rng;
 use ssh_key::{Algorithm, LineEnding, PrivateKey};
 use thiserror::Error;
 
+use crate::account::AccountService;
 use crate::auth::{AuthError, SshPublicKey};
 use crate::config::{Config, ConfigError};
+use crate::control::{ControlError, RunningControlServer};
 use crate::git::transport::{GitRepositories, RepositoryPathError};
 use crate::http::{PublicWebConfig, RunningWebServer, WebError};
 use crate::instance::{InstanceError, InstanceLock, prepare_database, prepare_repository_root};
-use crate::ssh::{RunningSshServer, SshServerError};
+use crate::ssh::{AuthorizedSshKeys, RunningSshServer, SshServerError};
 use crate::store::{Store, StoreError};
 
 pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
@@ -32,20 +34,37 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
     let git = GitRepositories::new_managed_public(&repository_root, repositories)?;
     drop(store);
 
+    let accounts = AccountService::new(database);
+    let control = RunningControlServer::start(&config.instance_dir, accounts.clone())?;
+    let authorized_keys = AuthorizedSshKeys::new(&keys);
+
     let (http_clone_base, ssh_clone_base) = clone_bases(config)?;
     let host_key = load_or_create_host_key(&config.instance_dir)?;
-    let web = RunningWebServer::start_public(
+    let reload_keys = {
+        let authorized_keys = authorized_keys.clone();
+        std::sync::Arc::new(move |accounts: &AccountService| {
+            let active = Store::open(accounts.database())?
+                .active_ssh_public_keys()?
+                .into_iter()
+                .map(|key| SshPublicKey::parse(&key))
+                .collect::<Result<Vec<_>, _>>()?;
+            authorized_keys.replace(&active);
+            Ok(())
+        })
+    };
+    let web = RunningWebServer::start_public_with_key_reload(
         config.http_listen,
         PublicWebConfig {
             instance_dir: config.instance_dir.clone(),
             http_clone_base,
             ssh_clone_base,
         },
+        reload_keys,
     )
     .await?;
-    let ssh = match RunningSshServer::start_with_git_and_host_key(
+    let ssh = match RunningSshServer::start_with_dynamic_keys(
         config.ssh_listen,
-        &keys,
+        authorized_keys,
         git,
         host_key,
     )
@@ -53,15 +72,18 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
     {
         Ok(ssh) => ssh,
         Err(error) => {
+            control.shutdown().await?;
             web.shutdown().await?;
             return Err(error.into());
         }
     };
 
     let signal = shutdown_signal().await;
-    let (ssh_result, web_result) = tokio::join!(ssh.shutdown(), web.shutdown());
+    let (ssh_result, web_result, control_result) =
+        tokio::join!(ssh.shutdown(), web.shutdown(), control.shutdown());
     ssh_result?;
     web_result?;
+    control_result?;
     signal.map_err(ServeError::Signal)
 }
 
@@ -191,6 +213,8 @@ pub(crate) enum ServeError {
     Web(#[from] WebError),
     #[error(transparent)]
     Ssh(#[from] SshServerError),
+    #[error(transparent)]
+    Control(#[from] ControlError),
     #[error("cannot wait for a shutdown signal: {0}")]
     Signal(std::io::Error),
     #[error("cannot read or write SSH host key {path}: {source}")]

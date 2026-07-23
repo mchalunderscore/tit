@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}{% if recovery %}Recover account{% else %}Create account{% endif %} · tit{% endblock %}
+{% block content %}
+  <h1>{% if recovery %}Recover account{% else %}Create account{% endif %}</h1>
+{% if recovery %}
+  <p>Use your recovery code to replace all SSH keys. You will get a new recovery code.</p>
+{% else %}
+  <p>You must have a valid signup code and an SSH public key.</p>
+{% endif %}
+{% if has_error %}
+  <p class="error" role="alert">{{ error }}</p>
+{% endif %}
+  <form action="{% if recovery %}/recover{% else %}/signup{% endif %}" method="post">
+    <div class="field">
+      <label for="username">Username</label>
+      <input id="username" name="username" value="{{ username }}" required autocomplete="username" autocapitalize="none" spellcheck="false">
+    </div>
+    <div class="field">
+{% if recovery %}
+      <label for="credential">Recovery code</label>
+      <input id="credential" name="recovery" type="password" required autocomplete="off">
+{% else %}
+      <label for="credential">Signup code</label>
+      <input id="credential" name="invitation" type="password" required autocomplete="off">
+{% endif %}
+    </div>
+    <div class="field">
+      <label for="public-key">New SSH public key</label>
+      <textarea id="public-key" name="public-key" required rows="5" autocomplete="off" autocapitalize="none" spellcheck="false"></textarea>
+    </div>
+    <button type="submit">{% if recovery %}Recover account{% else %}Create account{% endif %}</button>
+  </form>
+{% endblock %}

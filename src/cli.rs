@@ -48,6 +48,8 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Start the HTTP and SSH servers
     Serve,
+    /// Create a single-use signup invitation
+    InviteCode,
     /// Check the instance database
     Doctor,
     /// Set up an uninitialized instance
@@ -69,6 +71,30 @@ pub(crate) enum AdminCommand {
         #[command(subcommand)]
         command: RepositoryCommand,
     },
+    /// Administer accounts
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum AccountCommand {
+    /// Add an SSH public key
+    KeyAdd {
+        username: String,
+        label: String,
+        ssh_public_key: String,
+    },
+    /// Revoke an SSH public key
+    KeyRevoke {
+        username: String,
+        fingerprint: String,
+    },
+    /// Suspend an account
+    Suspend { username: String },
+    /// Restore a suspended account
+    Resume { username: String },
 }
 
 #[derive(Clone, Debug, Subcommand)]
