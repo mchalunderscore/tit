@@ -37,6 +37,39 @@
     </ol>
   </section>
 
+  <section aria-labelledby="reviews-heading">
+    <h2 id="reviews-heading">Reviews</h2>
+{% if reviews.is_empty() %}
+    <p>This pull request has no review activity.</p>
+{% else %}
+{% for review in reviews %}
+    <article id="review-{{ review.id }}">
+      <h3>{{ review.author }}: {{ review.kind }} at <time>{{ review.created_at }}</time></h3>
+      <p>Revision {{ review.revision }}
+{% if review.kind == "line-comment" %}
+        · <code>{{ review.commit_object_id }}</code> · <code>{{ review.path }}</code> · {{ review.side }} line {{ review.line }}
+{% if review.outdated %}
+        · <strong>Outdated</strong>
+{% endif %}
+{% endif %}
+      </p>
+{% if review.has_body %}
+      <div class="markdown">{{ review.body_html|safe }}</div>
+{% endif %}
+    </article>
+{% endfor %}
+{% endif %}
+  </section>
+
+  <section aria-labelledby="timeline-heading">
+    <h2 id="timeline-heading">Timeline</h2>
+    <ol>
+{% for event in timeline %}
+      <li value="{{ event.sequence }}">{{ event.actor }}: {{ event.kind }} at <time>{{ event.created_at }}</time></li>
+{% endfor %}
+    </ol>
+  </section>
+
   <section aria-labelledby="comparison-heading">
     <h2 id="comparison-heading">Comparison for revision {{ selected_revision }}</h2>
     <p>Merge base: <code>{{ comparison.merge_base }}</code></p>
@@ -72,10 +105,58 @@
       <p>This file has binary content.</p>
 {% else %}
       <pre>{{ file.hunks }}</pre>
+{% if can_review %}
+      <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/reviews">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="revision" value="{{ selected_revision }}">
+        <input type="hidden" name="kind" value="line-comment">
+        <input type="hidden" name="path-hex" value="{{ file.path_hex }}">
+        <div class="field">
+          <label for="review-side-{{ file.path_hex }}">Side</label>
+          <select id="review-side-{{ file.path_hex }}" name="side">
+{% if file.has_base %}
+            <option value="base">Base</option>
+{% endif %}
+{% if file.has_head %}
+            <option value="head">Head</option>
+{% endif %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="review-line-{{ file.path_hex }}">Line</label>
+          <input id="review-line-{{ file.path_hex }}" name="line" type="number" min="1" required>
+        </div>
+        <div class="field">
+          <label for="review-body-{{ file.path_hex }}">Line comment (Markdown)</label>
+          <textarea id="review-body-{{ file.path_hex }}" name="body" maxlength="262144" rows="4" required></textarea>
+        </div>
+        <button type="submit">Add line comment</button>
+      </form>
+{% endif %}
 {% endif %}
     </article>
 {% endfor %}
   </section>
+
+{% if can_review %}
+  <section aria-labelledby="review-heading">
+    <h2 id="review-heading">Review this revision</h2>
+    <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/reviews">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="revision" value="{{ selected_revision }}">
+      <input type="hidden" name="path-hex" value="">
+      <input type="hidden" name="side" value="">
+      <input type="hidden" name="line" value="">
+      <div class="field">
+        <label for="review-body">Review comment (Markdown)</label>
+        <textarea id="review-body" name="body" maxlength="262144" rows="8"></textarea>
+      </div>
+      <button name="kind" value="comment" type="submit">Add comment</button>
+      <button name="kind" value="approved" type="submit">Approve</button>
+      <button name="kind" value="changes-requested" type="submit">Request changes</button>
+    </form>
+  </section>
+{% endif %}
 
 {% if can_revise %}
   <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/revisions">

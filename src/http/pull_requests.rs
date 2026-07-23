@@ -32,6 +32,10 @@ pub(super) fn routes() -> Router<WebState> {
             "/{owner}/{repository}/pulls/{number}/revisions",
             post(revise_pull_request),
         )
+        .route(
+            "/{owner}/{repository}/pulls/{number}/reviews",
+            post(create_review),
+        )
         .layer(DefaultBodyLimit::max(MAX_PULL_REQUEST_BYTES))
 }
 
@@ -116,14 +120,122 @@ async fn pull_request_detail(
                     pull_request,
                     body_html: markdown::render(&pull_request.body),
                     revisions: &detail.revisions,
+                    reviews: detail
+                        .reviews
+                        .iter()
+                        .map(|review| ReviewView {
+                            id: &review.id,
+                            revision: review.revision,
+                            author: &review.author,
+                            kind: &review.kind,
+                            body_html: markdown::render(&review.body),
+                            has_body: !review.body.is_empty(),
+                            commit_object_id: review.commit_object_id.as_deref().unwrap_or(""),
+                            path: review
+                                .path
+                                .as_deref()
+                                .map(|path| String::from_utf8_lossy(path).into_owned())
+                                .unwrap_or_default(),
+                            side: review.side.as_deref().unwrap_or(""),
+                            line: review
+                                .line
+                                .map_or_else(String::new, |line| line.to_string()),
+                            outdated: review.kind == "line-comment"
+                                && review.revision != pull_request_revision(detail),
+                            created_at: review.created_at,
+                        })
+                        .collect(),
+                    timeline: detail
+                        .timeline
+                        .iter()
+                        .map(|event| TimelineView {
+                            sequence: event.sequence,
+                            kind: &event.kind,
+                            actor: &event.actor,
+                            created_at: event.created_at,
+                        })
+                        .collect(),
                     selected_revision: result.revision.number,
                     comparison: ComparisonView::from(&result.comparison),
                     csrf: &csrf,
                     can_revise: detail.can_revise && !csrf.is_empty(),
+                    can_review: detail.can_review
+                        && !csrf.is_empty()
+                        && result.revision.number == pull_request_revision(detail),
                 },
             )
         }
         Err(error) => read_error(error, &request_id.0),
+    }
+}
+
+async fn create_review(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(path): Path<PullRequestPath>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(
+        &headers,
+        &body,
+        &[
+            "csrf", "revision", "kind", "body", "path-hex", "side", "line",
+        ],
+    ) {
+        Ok(fields) => fields,
+        Err(()) => return bad_request(&request_id.0),
+    };
+    let actor =
+        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
+            Ok(actor) => actor,
+            Err(response) => return response,
+        };
+    let revision = match fields[1].parse::<i64>() {
+        Ok(revision) => revision,
+        Err(_) => return bad_request(&request_id.0),
+    };
+    let path_bytes = if fields[4].is_empty() {
+        None
+    } else {
+        match decode_hex(&fields[4]) {
+            Some(path) => Some(path),
+            None => return bad_request(&request_id.0),
+        }
+    };
+    let side = (!fields[5].is_empty()).then(|| fields[5].clone());
+    let line = if fields[6].is_empty() {
+        None
+    } else {
+        match fields[6].parse::<i64>() {
+            Ok(line) => Some(line),
+            Err(_) => return bad_request(&request_id.0),
+        }
+    };
+    let Some(service) = state.pull_requests.clone() else {
+        return internal(&request_id.0);
+    };
+    let owner = path.owner.clone();
+    let repository = path.repository.clone();
+    let number = path.number;
+    let result = job(state, move || {
+        service.review(
+            &owner,
+            &repository,
+            number,
+            revision,
+            &actor,
+            &fields[2],
+            &fields[3],
+            path_bytes.as_deref(),
+            side.as_deref(),
+            line,
+        )
+    })
+    .await;
+    match result {
+        Ok(_) => redirect(&path.owner, &path.repository, number),
+        Err(error) => mutation_error(error, &request_id.0),
     }
 }
 
@@ -245,6 +357,12 @@ fn mutation_error(error: PullRequestError, request_id: &str) -> Response {
             "Pull-request error",
             "You cannot change pull requests in this repository.",
         ),
+        PullRequestError::Store(StoreError::PullRequestState) => render_error(
+            StatusCode::CONFLICT,
+            request_id,
+            "Pull-request conflict",
+            "The pull request is not open.",
+        ),
         PullRequestError::Store(
             StoreError::RepositoryNotFound(_, _)
             | StoreError::PullRequestNotFound(_, _, _)
@@ -255,11 +373,38 @@ fn mutation_error(error: PullRequestError, request_id: &str) -> Response {
         | PullRequestError::Branch
         | PullRequestError::Number
         | PullRequestError::Unchanged
+        | PullRequestError::Revision
+        | PullRequestError::ReviewKind
+        | PullRequestError::ReviewBody
+        | PullRequestError::ReviewAnchor
+        | PullRequestError::Store(StoreError::PullRequestRevisionNotFound)
+        | PullRequestError::Store(StoreError::PullRequestReviewAnchor)
         | PullRequestError::Git(crate::git::repository::GitRepositoryError::MissingReference(_)) => {
             bad_request(request_id)
         }
         _ => internal(request_id),
     }
+}
+
+fn pull_request_revision(detail: &crate::store::PullRequestDetail) -> i64 {
+    detail
+        .revisions
+        .last()
+        .map_or(0, |revision| revision.number)
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(pair, 16).ok()
+        })
+        .collect()
 }
 
 fn bad_request(request_id: &str) -> Response {
@@ -338,10 +483,35 @@ struct PullRequestTemplate<'a> {
     pull_request: &'a crate::store::PullRequestRecord,
     body_html: RenderedMarkdown,
     revisions: &'a [crate::store::PullRequestRevisionRecord],
+    reviews: Vec<ReviewView<'a>>,
+    timeline: Vec<TimelineView<'a>>,
     selected_revision: i64,
     comparison: ComparisonView,
     csrf: &'a str,
     can_revise: bool,
+    can_review: bool,
+}
+
+struct ReviewView<'a> {
+    id: &'a str,
+    revision: i64,
+    author: &'a str,
+    kind: &'a str,
+    body_html: RenderedMarkdown,
+    has_body: bool,
+    commit_object_id: &'a str,
+    path: String,
+    side: &'a str,
+    line: String,
+    outdated: bool,
+    created_at: i64,
+}
+
+struct TimelineView<'a> {
+    sequence: i64,
+    kind: &'a str,
+    actor: &'a str,
+    created_at: i64,
 }
 
 struct ComparisonView {
@@ -359,7 +529,10 @@ struct CommitView {
 
 struct DiffView {
     path: String,
+    path_hex: String,
     binary: bool,
+    has_base: bool,
+    has_head: bool,
     hunks: String,
 }
 
@@ -396,10 +569,22 @@ impl From<&crate::git::read::Comparison> for ComparisonView {
                 .iter()
                 .map(|file| DiffView {
                     path: String::from_utf8_lossy(&file.path).into_owned(),
+                    path_hex: encode_hex(&file.path),
                     binary: file.binary,
+                    has_base: file.old_id.is_some(),
+                    has_head: file.new_id.is_some(),
                     hunks: String::from_utf8_lossy(&file.hunks).into_owned(),
                 })
                 .collect(),
         }
     }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        use std::fmt::Write;
+        write!(encoded, "{byte:02x}").expect("a string write cannot fail");
+    }
+    encoded
 }

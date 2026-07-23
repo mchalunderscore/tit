@@ -14,12 +14,13 @@ use crate::git::read::{
 };
 use crate::git::repository::{GitRepository, GitRepositoryError};
 use crate::store::{
-    NewPullRequestRefIntent, PullRequestDetail, PullRequestRecord, PullRequestRefIntentRecord,
-    PullRequestRevisionRecord, Store, StoreError,
+    NewPullRequestRefIntent, NewPullRequestReview, PullRequestDetail, PullRequestRecord,
+    PullRequestRefIntentRecord, PullRequestRevisionRecord, Store, StoreError,
 };
 
 pub(crate) const MAX_TITLE_BYTES: usize = 200;
 pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_REVIEW_BODY_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct PullRequestService {
@@ -237,6 +238,96 @@ impl PullRequestService {
     }
 
     #[allow(
+        clippy::too_many_arguments,
+        reason = "a review action includes its repository, revision, content, and optional line anchor"
+    )]
+    pub(crate) fn review(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        revision_number: i64,
+        actor: &str,
+        kind: &str,
+        body: &str,
+        path: Option<&[u8]>,
+        side: Option<&str>,
+        line: Option<i64>,
+    ) -> Result<String, PullRequestError> {
+        validate_context(owner, repository, actor)?;
+        if number < 1 || revision_number < 1 {
+            return Err(PullRequestError::Number);
+        }
+        validate_review(kind, body, path, side, line)?;
+        let _operation = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.recover_inner()?;
+        let detail =
+            Store::open(&self.database)?.pull_request(owner, repository, number, Some(actor))?;
+        let revision = detail
+            .revisions
+            .iter()
+            .find(|revision| revision.number == revision_number)
+            .ok_or(PullRequestError::Revision)?;
+        let commit_object_id = if kind == "line-comment" {
+            let path = path.ok_or(PullRequestError::ReviewAnchor)?;
+            let side = side.ok_or(PullRequestError::ReviewAnchor)?;
+            let line = line.ok_or(PullRequestError::ReviewAnchor)?;
+            let path_to_repository = self.repository_path(&detail.repository.id)?;
+            let reader = RepositoryReadService::open(&path_to_repository, ReadLimits::default())?;
+            let base = parse_id(&revision.base_object_id)?;
+            let head = parse_id(&revision.head_object_id)?;
+            let comparison = reader.comparison(base, head, &ReadCancellation::default())?;
+            let file = comparison
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .filter(|file| !file.binary)
+                .ok_or(PullRequestError::ReviewAnchor)?;
+            let (commit, exists) = match side {
+                "base" => (base, file.old_id.is_some()),
+                "head" => (head, file.new_id.is_some()),
+                _ => return Err(PullRequestError::ReviewAnchor),
+            };
+            if !exists {
+                return Err(PullRequestError::ReviewAnchor);
+            }
+            let blob = reader.blob(commit, path, &ReadCancellation::default())?;
+            let line_count = if blob.data.is_empty() {
+                0
+            } else {
+                blob.data.split(|byte| *byte == b'\n').count()
+                    - usize::from(blob.data.ends_with(b"\n"))
+            };
+            let line = usize::try_from(line).map_err(|_| PullRequestError::ReviewAnchor)?;
+            if line == 0 || line > line_count {
+                return Err(PullRequestError::ReviewAnchor);
+            }
+            Some(commit.to_string())
+        } else {
+            None
+        };
+        Store::open(&self.database)?
+            .create_pull_request_review(&NewPullRequestReview {
+                owner,
+                repository,
+                number,
+                revision: revision_number,
+                actor,
+                kind,
+                body,
+                commit_object_id: commit_object_id.as_deref(),
+                path,
+                side,
+                line,
+                created_at: timestamp()?,
+            })
+            .map_err(Into::into)
+    }
+
+    #[allow(
         dead_code,
         reason = "some integration tests compile the service without the Web list route"
     )]
@@ -361,6 +452,48 @@ fn validate_branch(name: &str) -> Result<(), PullRequestError> {
     Ok(())
 }
 
+fn validate_review(
+    kind: &str,
+    body: &str,
+    path: Option<&[u8]>,
+    side: Option<&str>,
+    line: Option<i64>,
+) -> Result<(), PullRequestError> {
+    if body.len() > MAX_REVIEW_BODY_BYTES
+        || body
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(PullRequestError::ReviewBody);
+    }
+    match kind {
+        "comment" | "changes-requested" if !body.trim().is_empty() => {
+            if path.is_none() && side.is_none() && line.is_none() {
+                Ok(())
+            } else {
+                Err(PullRequestError::ReviewAnchor)
+            }
+        }
+        "approved" if path.is_none() && side.is_none() && line.is_none() => Ok(()),
+        "line-comment" if !body.trim().is_empty() => {
+            let path = path.ok_or(PullRequestError::ReviewAnchor)?;
+            if path.is_empty()
+                || path.len() > ReadLimits::default().max_path_bytes
+                || path.contains(&0)
+                || !matches!(side, Some("base" | "head"))
+                || line.is_none_or(|line| line < 1)
+            {
+                return Err(PullRequestError::ReviewAnchor);
+            }
+            Ok(())
+        }
+        "comment" | "line-comment" | "approved" | "changes-requested" => {
+            Err(PullRequestError::ReviewBody)
+        }
+        _ => Err(PullRequestError::ReviewKind),
+    }
+}
+
 fn pull_request_ref(number: i64) -> String {
     format!("refs/pull/{number}/head")
 }
@@ -425,6 +558,12 @@ pub(crate) enum PullRequestError {
     Number,
     #[error("pull-request revision does not exist")]
     Revision,
+    #[error("pull-request review kind is not valid")]
+    ReviewKind,
+    #[error("pull-request review body is not valid")]
+    ReviewBody,
+    #[error("pull-request review line anchor is not valid")]
+    ReviewAnchor,
     #[error("pull-request refs have not changed")]
     Unchanged,
     #[error("stored pull-request object ID is not valid")]

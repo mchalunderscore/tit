@@ -12,7 +12,7 @@ mod event;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
 const MAX_ACTIVE_FEED_TOKENS: i64 = 32;
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -22,7 +22,7 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 15] = [
+const MIGRATIONS: [&str; 16] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
@@ -38,6 +38,7 @@ const MIGRATIONS: [&str; 15] = [
     include_str!("migrations/013_watches.sql"),
     include_str!("migrations/014_feed_tokens.sql"),
     include_str!("migrations/015_pull_requests.sql"),
+    include_str!("migrations/016_pull_request_reviews.sql"),
 ];
 
 #[allow(
@@ -142,6 +143,10 @@ pub(crate) enum StoreError {
     PullRequestHidden,
     #[error("pull request is not open")]
     PullRequestState,
+    #[error("pull-request revision does not exist")]
+    PullRequestRevisionNotFound,
+    #[error("pull-request review anchor does not match its revision")]
+    PullRequestReviewAnchor,
     #[error("pull-request ref intent {0} is not in the required state")]
     PullRequestIntentState(String),
     #[error("repository watch access is not authorized")]
@@ -1802,13 +1807,172 @@ impl Store {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        let reviews = {
+            let mut statement = self.connection.prepare(
+                "SELECT pull_request_review.id, pull_request_revision.number,
+                        author.username, pull_request_review.kind,
+                        pull_request_review.body, pull_request_review.commit_object_id,
+                        pull_request_review.path, pull_request_review.side,
+                        pull_request_review.line, pull_request_review.created_at
+                 FROM pull_request_review
+                 JOIN pull_request_revision
+                   ON pull_request_revision.id = pull_request_review.revision_id
+                 JOIN account AS author
+                   ON author.id = pull_request_review.author_account_id
+                 WHERE pull_request_review.pull_request_id = ?1
+                 ORDER BY pull_request_review.created_at, pull_request_review.id",
+            )?;
+            statement
+                .query_map([&pull_request.id], pull_request_review_from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let timeline = {
+            let mut statement = self.connection.prepare(
+                "SELECT sequence, kind, actor, payload, created_at
+                 FROM repository_event
+                 WHERE pull_request_id = ?1 ORDER BY sequence",
+            )?;
+            statement
+                .query_map([&pull_request.id], |row| {
+                    Ok(PullRequestTimelineRecord {
+                        sequence: row.get(0)?,
+                        kind: row.get(1)?,
+                        actor: row.get(2)?,
+                        payload: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let can_revise = access.can_write_repository();
         Ok(PullRequestDetail {
+            can_review: access.active_actor_id.is_some() && access.can_read(),
             repository: access.repository,
             pull_request,
             revisions,
+            reviews,
+            timeline,
             can_revise,
         })
+    }
+
+    pub(crate) fn create_pull_request_review(
+        &mut self,
+        review: &NewPullRequestReview<'_>,
+    ) -> Result<String, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let access = repository_issue_access(
+            &transaction,
+            review.owner,
+            review.repository,
+            Some(review.actor),
+        )?;
+        if !access.can_read() {
+            return Err(StoreError::PullRequestHidden);
+        }
+        let actor_id = access
+            .active_actor_id
+            .ok_or(StoreError::PullRequestDenied)?;
+        let pull_request = transaction
+            .query_row(
+                "SELECT id, state FROM pull_request
+                 WHERE repository_id = ?1 AND number = ?2",
+                rusqlite::params![access.repository.id, review.number],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::PullRequestNotFound(
+                    review.owner.to_owned(),
+                    review.repository.to_owned(),
+                    review.number,
+                )
+            })?;
+        if pull_request.1 != "open" {
+            return Err(StoreError::PullRequestState);
+        }
+        let revision = transaction
+            .query_row(
+                "SELECT id, base_object_id, head_object_id
+                 FROM pull_request_revision
+                 WHERE pull_request_id = ?1 AND number = ?2",
+                rusqlite::params![pull_request.0, review.revision],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::PullRequestRevisionNotFound)?;
+        if review.kind == "line-comment" {
+            let expected = match review.side {
+                Some("base") => revision.1.as_str(),
+                Some("head") => revision.2.as_str(),
+                _ => return Err(StoreError::PullRequestReviewAnchor),
+            };
+            if review.commit_object_id != Some(expected) {
+                return Err(StoreError::PullRequestReviewAnchor);
+            }
+        }
+        let id: String =
+            transaction.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+        transaction.execute(
+            "INSERT INTO pull_request_review
+             (id, pull_request_id, revision_id, author_account_id, kind, body,
+              commit_object_id, path, side, line, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                id,
+                pull_request.0,
+                revision.0,
+                actor_id,
+                review.kind,
+                review.body,
+                review.commit_object_id,
+                review.path,
+                review.side,
+                review.line,
+                review.created_at,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE pull_request SET updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![pull_request.0, review.created_at],
+        )?;
+        let kind = match review.kind {
+            "comment" => event::EventKind::PullRequestCommented,
+            "line-comment" => event::EventKind::PullRequestLineCommented,
+            "approved" => event::EventKind::PullRequestApproved,
+            "changes-requested" => event::EventKind::PullRequestChangesRequested,
+            _ => return Err(StoreError::PullRequestReviewAnchor),
+        };
+        let event = event::pull_request_review(
+            kind,
+            &pull_request.0,
+            review.number,
+            &id,
+            review.revision,
+            review.body,
+            review.commit_object_id,
+            review.path,
+            review.side,
+            review.line,
+        );
+        insert_pull_request_event(
+            &transaction,
+            &access.repository.id,
+            &pull_request.0,
+            review.actor,
+            review.created_at,
+            &event,
+        )?;
+        transaction.commit()?;
+        Ok(id)
     }
 
     pub(crate) fn pull_requests(
@@ -3043,11 +3207,52 @@ pub(crate) struct PullRequestRevisionRecord {
     pub(crate) created_at: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PullRequestReviewRecord {
+    pub(crate) id: String,
+    pub(crate) revision: i64,
+    pub(crate) author: String,
+    pub(crate) kind: String,
+    pub(crate) body: String,
+    pub(crate) commit_object_id: Option<String>,
+    pub(crate) path: Option<Vec<u8>>,
+    pub(crate) side: Option<String>,
+    pub(crate) line: Option<i64>,
+    pub(crate) created_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PullRequestTimelineRecord {
+    pub(crate) sequence: i64,
+    pub(crate) kind: String,
+    pub(crate) actor: String,
+    pub(crate) payload: String,
+    pub(crate) created_at: i64,
+}
+
 pub(crate) struct PullRequestDetail {
     pub(crate) repository: RepositoryRecord,
     pub(crate) pull_request: PullRequestRecord,
     pub(crate) revisions: Vec<PullRequestRevisionRecord>,
+    pub(crate) reviews: Vec<PullRequestReviewRecord>,
+    pub(crate) timeline: Vec<PullRequestTimelineRecord>,
     pub(crate) can_revise: bool,
+    pub(crate) can_review: bool,
+}
+
+pub(crate) struct NewPullRequestReview<'a> {
+    pub(crate) owner: &'a str,
+    pub(crate) repository: &'a str,
+    pub(crate) number: i64,
+    pub(crate) revision: i64,
+    pub(crate) actor: &'a str,
+    pub(crate) kind: &'a str,
+    pub(crate) body: &'a str,
+    pub(crate) commit_object_id: Option<&'a str>,
+    pub(crate) path: Option<&'a [u8]>,
+    pub(crate) side: Option<&'a str>,
+    pub(crate) line: Option<i64>,
+    pub(crate) created_at: i64,
 }
 
 pub(crate) struct NewPullRequestRefIntent<'a> {
@@ -3461,6 +3666,23 @@ fn pull_request_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PullReques
     })
 }
 
+fn pull_request_review_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PullRequestReviewRecord> {
+    Ok(PullRequestReviewRecord {
+        id: row.get(0)?,
+        revision: row.get(1)?,
+        author: row.get(2)?,
+        kind: row.get(3)?,
+        body: row.get(4)?,
+        commit_object_id: row.get(5)?,
+        path: row.get(6)?,
+        side: row.get(7)?,
+        line: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
+
 fn validate_feed_scope(scope: &str, repository: Option<(&str, &str)>) -> Result<(), StoreError> {
     match (scope, repository) {
         ("repository", Some(_)) | ("watched" | "assignments" | "mentions", None) => Ok(()),
@@ -3759,6 +3981,32 @@ fn insert_issue_event(
             source_ordinal: None,
             issue_id: Some(issue_id),
             pull_request_id: None,
+            event,
+            actor,
+            ref_name: None,
+            old_target: None,
+            new_target: None,
+            created_at,
+        },
+    )
+}
+
+fn insert_pull_request_event(
+    transaction: &rusqlite::Transaction<'_>,
+    repository_id: &str,
+    pull_request_id: &str,
+    actor: &str,
+    created_at: i64,
+    event: &event::VersionedEvent,
+) -> Result<(), StoreError> {
+    insert_domain_event(
+        transaction,
+        &NewDomainEvent {
+            repository_id,
+            source_intent_id: None,
+            source_ordinal: None,
+            issue_id: None,
+            pull_request_id: Some(pull_request_id),
             event,
             actor,
             ref_name: None,

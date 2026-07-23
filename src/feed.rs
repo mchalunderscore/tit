@@ -296,6 +296,10 @@ fn event_title(event: &RepositoryEventRecord) -> String {
         "issue-unassigned" => issue_value_title(event, "unassigned", "assignee"),
         "pull-request-created" => pull_request_title(event, "opened"),
         "pull-request-revised" => pull_request_title(event, "revised"),
+        "pull-request-commented" => pull_request_title(event, "commented on"),
+        "pull-request-line-commented" => pull_request_title(event, "commented on a line in"),
+        "pull-request-approved" => pull_request_title(event, "approved"),
+        "pull-request-changes-requested" => pull_request_title(event, "requested changes on"),
         _ => "Repository event".to_owned(),
     }
 }

@@ -404,3 +404,18 @@ diffs, immutable revision selection, mergeability states, unrelated histories,
 work limits, and Web output. Read the
 [pull-request comparison architectural decision record](docs/adr/0023-pull-request-comparison.md)
 for the computation, limit, and cache contracts.
+
+## Milestone 5.3 gate
+
+Run the pull-request review gate:
+
+```text
+./scripts/check-m5-3
+```
+
+This command tests general comments, line comments, approvals, change requests,
+immutable byte-path anchors, outdated display, repository permission, atomic
+events, the chronological timeline, no-JavaScript Web forms, and historical
+schema migration. Read the
+[pull-request review architectural decision record](docs/adr/0024-pull-request-review.md)
+for the anchor, permission, event, and outdated-state contracts.

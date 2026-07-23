@@ -848,6 +848,69 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     assert_eq!(first_revision.status, 200);
     assert!(first_revision.text().contains("Comparison for revision 1"));
     assert!(!first_revision.text().contains("pull-request.txt"));
+    for fields in [
+        vec![
+            ("csrf", csrf.as_str()),
+            ("revision", "2"),
+            ("kind", "comment"),
+            ("body", "A **general review**."),
+            ("path-hex", ""),
+            ("side", ""),
+            ("line", ""),
+        ],
+        vec![
+            ("csrf", csrf.as_str()),
+            ("revision", "2"),
+            ("kind", "approved"),
+            ("body", ""),
+            ("path-hex", ""),
+            ("side", ""),
+            ("line", ""),
+        ],
+        vec![
+            ("csrf", csrf.as_str()),
+            ("revision", "2"),
+            ("kind", "line-comment"),
+            ("body", "Review this line."),
+            ("path-hex", "70756c6c2d726571756573742e747874"),
+            ("side", "head"),
+            ("line", "1"),
+        ],
+    ] {
+        let response = request(
+            server.address(),
+            "POST",
+            "/alice/example/pulls/1/reviews",
+            &headers,
+            form(&fields).as_bytes(),
+        );
+        assert_eq!(response.status, 303);
+    }
+    let reviewed = request(server.address(), "GET", "/alice/example/pulls/1", &[], &[]);
+    assert!(reviewed.text().contains("<strong>general review</strong>"));
+    assert!(reviewed.text().contains("pull-request-approved"));
+    assert!(reviewed.text().contains("head line 1"));
+    assert!(!reviewed.text().contains("<strong>Outdated</strong>"));
+
+    fs::write(worktree.join("pull-request.txt"), b"later revision\n")
+        .expect("write a later pull-request revision");
+    commit_all(&worktree, "later pull-request revision");
+    run(Command::new("git")
+        .arg("-C")
+        .arg(&worktree)
+        .args(["push", "-q"])
+        .arg(&bare)
+        .arg("feature"));
+    let revised_again = request(
+        server.address(),
+        "POST",
+        "/alice/example/pulls/1/revisions",
+        &headers,
+        revision.as_bytes(),
+    );
+    assert_eq!(revised_again.status, 303);
+    let outdated = request(server.address(), "GET", "/alice/example/pulls/1", &[], &[]);
+    assert!(outdated.text().contains("<strong>Outdated</strong>"));
     let search_page = request(server.address(), "GET", "/search", &[], &[]);
     assert_eq!(search_page.status, 200);
     assert!(

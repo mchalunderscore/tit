@@ -24,6 +24,10 @@ pub(super) enum EventKind {
     IssueUnassigned,
     PullRequestCreated,
     PullRequestRevised,
+    PullRequestCommented,
+    PullRequestLineCommented,
+    PullRequestApproved,
+    PullRequestChangesRequested,
 }
 
 impl EventKind {
@@ -49,7 +53,52 @@ impl EventKind {
             Self::IssueUnassigned => "issue-unassigned",
             Self::PullRequestCreated => "pull-request-created",
             Self::PullRequestRevised => "pull-request-revised",
+            Self::PullRequestCommented => "pull-request-commented",
+            Self::PullRequestLineCommented => "pull-request-line-commented",
+            Self::PullRequestApproved => "pull-request-approved",
+            Self::PullRequestChangesRequested => "pull-request-changes-requested",
         }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the event payload stores the complete immutable review anchor"
+)]
+pub(super) fn pull_request_review(
+    kind: EventKind,
+    pull_request_id: &str,
+    number: i64,
+    review_id: &str,
+    revision: i64,
+    body: &str,
+    commit_object_id: Option<&str>,
+    path: Option<&[u8]>,
+    side: Option<&str>,
+    line: Option<i64>,
+) -> VersionedEvent {
+    debug_assert!(matches!(
+        kind,
+        EventKind::PullRequestCommented
+            | EventKind::PullRequestLineCommented
+            | EventKind::PullRequestApproved
+            | EventKind::PullRequestChangesRequested
+    ));
+    VersionedEvent {
+        kind,
+        payload: json!({
+            "version": PAYLOAD_VERSION,
+            "pull_request_id": pull_request_id,
+            "number": number,
+            "review_id": review_id,
+            "revision": revision,
+            "body": body,
+            "commit_object_id": commit_object_id,
+            "path_hex": path.map(encode_hex),
+            "side": side,
+            "line": line,
+        })
+        .to_string(),
     }
 }
 

@@ -25,6 +25,7 @@ mod pull_request;
 mod store;
 
 use std::fs;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -386,6 +387,158 @@ fn classifies_clean_conflicting_and_already_merged_revisions_for_both_hashes() {
     }
 }
 
+#[test]
+fn records_review_actions_and_immutable_line_anchors_for_both_hashes() {
+    for (index, object_format) in ["sha1", "sha256"].into_iter().enumerate() {
+        let fixture = Fixture::new(object_format, index + 20);
+        let byte_path = "review-å.txt".as_bytes();
+        fixture.commit_bytes_on("feature", byte_path, b"byte path\n", "add a byte path");
+        let service = PullRequestService::new(&fixture.database, &fixture.repositories);
+        service
+            .open(
+                "alice",
+                "project",
+                "alice",
+                "Review anchors",
+                "Keep each review action.",
+                "refs/heads/main",
+                "refs/heads/feature",
+            )
+            .expect("open a reviewed pull request");
+        service
+            .review(
+                "alice",
+                "project",
+                1,
+                1,
+                "bob",
+                "comment",
+                "A **general** comment.",
+                None,
+                None,
+                None,
+            )
+            .expect("add a reader comment");
+        service
+            .review(
+                "alice", "project", 1, 1, "bob", "approved", "", None, None, None,
+            )
+            .expect("approve the revision");
+        service
+            .review(
+                "alice",
+                "project",
+                1,
+                1,
+                "alice",
+                "changes-requested",
+                "Change this line.",
+                None,
+                None,
+                None,
+            )
+            .expect("request changes");
+        let line_id = service
+            .review(
+                "alice",
+                "project",
+                1,
+                1,
+                "bob",
+                "line-comment",
+                "Use a clearer value.",
+                Some(byte_path),
+                Some("head"),
+                Some(1),
+            )
+            .expect("add a line comment");
+        assert!(matches!(
+            service.review(
+                "alice",
+                "project",
+                1,
+                1,
+                "bob",
+                "line-comment",
+                "This line does not exist.",
+                Some(byte_path),
+                Some("head"),
+                Some(2),
+            ),
+            Err(PullRequestError::ReviewAnchor)
+        ));
+
+        fixture.commit_feature("make the line comment outdated");
+        service
+            .revise("alice", "project", 1, "alice")
+            .expect("record a new revision");
+        let detail = service
+            .get("alice", "project", 1, Some("bob"))
+            .expect("read review activity");
+        assert_eq!(detail.revisions.len(), 2);
+        assert_eq!(detail.reviews.len(), 4);
+        let line = detail
+            .reviews
+            .iter()
+            .find(|review| review.id == line_id)
+            .expect("find the line review");
+        assert_eq!(line.revision, 1);
+        assert_eq!(line.path.as_deref(), Some(byte_path));
+        assert_eq!(line.side.as_deref(), Some("head"));
+        assert_eq!(line.line, Some(1));
+        assert_eq!(
+            line.commit_object_id.as_deref(),
+            Some(detail.revisions[0].head_object_id.as_str())
+        );
+        assert_eq!(
+            detail
+                .timeline
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "pull-request-created",
+                "pull-request-commented",
+                "pull-request-approved",
+                "pull-request-changes-requested",
+                "pull-request-line-commented",
+                "pull-request-revised",
+            ]
+        );
+
+        let store = Store::open(&fixture.database).expect("open the review policy store");
+        store
+            .connection()
+            .execute(
+                "UPDATE repository SET visibility = 'private' WHERE slug = 'project'",
+                [],
+            )
+            .expect("make the reviewed repository private");
+        store
+            .connection()
+            .execute(
+                "DELETE FROM repository_collaborator WHERE account_id = 2",
+                [],
+            )
+            .expect("remove the reader");
+        assert!(matches!(
+            service.review(
+                "alice",
+                "project",
+                1,
+                2,
+                "bob",
+                "comment",
+                "This must stay hidden.",
+                None,
+                None,
+                None,
+            ),
+            Err(PullRequestError::Store(StoreError::PullRequestHidden))
+        ));
+    }
+}
+
 struct Fixture {
     _directory: TempDir,
     database: PathBuf,
@@ -500,6 +653,27 @@ impl Fixture {
             Command::new("git").args(["switch", "-q", branch]),
         );
         fs::write(self.worktree.join(path), content).expect("write branch content");
+        git_commit(&self.worktree, message);
+        run(
+            &self.worktree,
+            Command::new("git")
+                .args(["push", "-q"])
+                .arg(&self.bare)
+                .arg(branch),
+        );
+    }
+
+    fn commit_bytes_on(&self, branch: &str, path: &[u8], content: &[u8], message: &str) {
+        run(
+            &self.worktree,
+            Command::new("git").args(["switch", "-q", branch]),
+        );
+        fs::write(
+            self.worktree
+                .join(std::ffi::OsString::from_vec(path.to_vec())),
+            content,
+        )
+        .expect("write byte-path content");
         git_commit(&self.worktree, message);
         run(
             &self.worktree,
