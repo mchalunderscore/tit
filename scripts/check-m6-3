@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+./scripts/check
+cargo test --locked --release --test cli doctor_

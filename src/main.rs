@@ -10,6 +10,7 @@ mod bootstrap;
 mod cli;
 mod config;
 mod control;
+mod diagnostics;
 mod domain;
 mod feed;
 mod feed_token;
@@ -23,6 +24,7 @@ mod maintenance;
 mod markdown;
 mod policy;
 mod pull_request;
+mod repair;
 mod repository;
 mod search;
 mod serve;
@@ -38,8 +40,8 @@ use std::{io, io::Write};
 use clap::Parser;
 
 use crate::cli::{
-    AccountCommand, AdminCommand, Cli, CollaboratorRole, Command, ObjectFormat, RepositoryCommand,
-    RepositoryVisibility, SetupCommand,
+    AccountCommand, AdminCommand, Cli, CollaboratorRole, Command, InspectCommand, ObjectFormat,
+    RepairCommand, RepositoryCommand, RepositoryVisibility, SetupCommand,
 };
 
 #[tokio::main]
@@ -82,13 +84,28 @@ async fn main() -> ExitCode {
                     }
                 }
             }
-            Some(Command::Doctor) => match store::doctor(&config.instance_dir) {
+            Some(Command::Doctor { backups }) => match diagnostics::doctor(&config, &backups) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("tit: {error}");
                     ExitCode::FAILURE
                 }
             },
+            Some(Command::Inspect { command }) => run_inspect_command(&config, command),
+            Some(Command::Dump) => run_dump_command(&config),
+            Some(Command::Repair { command }) => {
+                let result = match command {
+                    RepairCommand::Intents => repair::intents(&config.instance_dir),
+                    RepairCommand::Quarantine => repair::quarantine(&config.instance_dir),
+                };
+                match result {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("tit: {error}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
             Some(Command::Backup { output }) => run_backup(&config, &output).await,
             Some(Command::Restore { .. }) => {
                 unreachable!("the restore command runs before configuration is loaded")
@@ -129,6 +146,71 @@ async fn main() -> ExitCode {
                 command: AdminCommand::Audit { limit },
             }) => run_audit_command(&config.instance_dir, limit),
         },
+        Err(error) => {
+            eprintln!("tit: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_inspect_command(config: &config::Config, command: InspectCommand) -> ExitCode {
+    let result = match command {
+        InspectCommand::Account { username } => {
+            serialize_inspection(diagnostics::inspect_account(config, &username))
+        }
+        InspectCommand::Repository { owner, slug } => {
+            serialize_inspection(diagnostics::inspect_repository(config, &owner, &slug))
+        }
+        InspectCommand::Intent { id } => {
+            serialize_inspection(diagnostics::inspect_intent(config, &id))
+        }
+    };
+    match result {
+        Ok(line) => match writeln!(io::stdout().lock(), "{line}") {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("tit: cannot write inspect information: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("tit: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn serialize_inspection(
+    result: Result<impl serde::Serialize, diagnostics::DiagnosticError>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(serde_json::to_string(&result?)?)
+}
+
+fn run_dump_command(config: &config::Config) -> ExitCode {
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut output = io::stdout().lock();
+        let mut output_error = None;
+        diagnostics::dump(config, |row| {
+            let result = serde_json::to_writer(&mut output, &row)
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+                .and_then(|()| {
+                    writeln!(output).map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+                });
+            match result {
+                Ok(()) => true,
+                Err(error) => {
+                    output_error = Some(error);
+                    false
+                }
+            }
+        })?;
+        if let Some(error) = output_error {
+            return Err(error);
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("tit: {error}");
             ExitCode::FAILURE

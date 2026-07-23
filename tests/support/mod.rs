@@ -1,5 +1,6 @@
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -19,6 +20,10 @@ impl TestInstance {
             "version = 1\npublic_url = \"https://tit.example/\"\n",
         )
         .expect("write the configuration");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("make the instance directory private");
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600))
+            .expect("make the configuration private");
         Self { directory, config }
     }
 

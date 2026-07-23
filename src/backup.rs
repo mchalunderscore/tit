@@ -86,6 +86,13 @@ pub(crate) fn restore(archive_path: &Path, target: &Path) -> Result<(), BackupEr
     Ok(())
 }
 
+pub(crate) fn check_archive(archive_path: &Path) -> Result<(), BackupError> {
+    validate_absolute_clean(archive_path)?;
+    let manifest = read_manifest(archive_path)?;
+    let expected = expected_files(&manifest)?;
+    verify_archive(archive_path, &expected)
+}
+
 fn create_archive(
     instance_dir: &Path,
     config_path: &Path,

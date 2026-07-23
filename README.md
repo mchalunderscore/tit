@@ -105,6 +105,53 @@ Restore checks the manifest, all checksums, the database, and all repositories.
 It does not activate the restored instance. To activate it, stop the old server
 and explicitly start `tit --config /srv/tit-restored/config.toml serve`.
 
+## Diagnostics and repair
+
+Run the read-only instance checks with:
+
+```text
+tit --config /srv/tit/config.toml doctor
+```
+
+Also check one or more backup archives with:
+
+```text
+tit --config /srv/tit/config.toml doctor --backup /var/backups/tit-2026-07-23.tar
+```
+
+Doctor checks configuration, private permissions, the schema, record
+relations, indexes, incomplete intents, Git refs and reachable objects,
+quarantine debris, the SSH host key, and each supplied backup. It does not
+change the instance.
+
+Use the separate repair commands only after you review the doctor error:
+
+```text
+tit --config /srv/tit/config.toml repair intents
+tit --config /srv/tit/config.toml repair quarantine
+```
+
+Stop the server before repair. Intent repair uses the normal recovery rules.
+Quarantine repair refuses to run while an incomplete intent exists.
+
+Inspect one typed record as JSON:
+
+```text
+tit --config /srv/tit/config.toml inspect account alice
+tit --config /srv/tit/config.toml inspect repository alice example
+tit --config /srv/tit/config.toml inspect intent 0123456789abcdef0123456789abcdef
+```
+
+Write all SQLite rows as deterministic JSON Lines:
+
+```text
+tit --config /srv/tit/config.toml dump >tit-dump.jsonl
+```
+
+The dump can contain credential hashes, session hashes, token hashes, and SSH
+public keys. Store it as a secret. The dump is for inspection and comparison;
+it is not a restore format.
+
 An authenticated account can create a repository with SSH:
 
 ```text
@@ -540,3 +587,18 @@ the global maintenance gate, manifest checksum failures, empty restore targets,
 database validation, and restored Git object access. Read the
 [backup and restore architectural decision record](docs/adr/0029-backup-and-restore.md)
 for the archive, gate, credential, and activation contracts.
+
+## Milestone 6.3 gate
+
+Install stock Git and stock `ssh-keygen`. Then, run the diagnostics gate:
+
+```text
+./scripts/check-m6-3
+```
+
+This command tests read-only doctor checks, explicit repair, typed inspection,
+deterministic JSON Lines output, damaged Git state, incomplete intents,
+quarantine debris, missing indexes, unsafe permissions, and changed backup
+data. Read the
+[read-only diagnostics architectural decision record](docs/adr/0030-read-only-diagnostics.md)
+for the check, repair, inspection, and dump contracts.

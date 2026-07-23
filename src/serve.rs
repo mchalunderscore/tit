@@ -145,6 +145,19 @@ fn load_or_create_host_key(instance_dir: &Path) -> Result<PrivateKey, ServeError
     read_host_key(&path)
 }
 
+pub(crate) fn check_host_key(instance_dir: &Path) -> Result<(), ServeError> {
+    let path = instance_dir.join(HOST_KEY_FILE);
+    let metadata = fs::symlink_metadata(&path).map_err(|source| ServeError::HostKeyIo {
+        path: path.clone(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(ServeError::InvalidHostKeyFile(path));
+    }
+    read_host_key(&path)?;
+    Ok(())
+}
+
 fn create_host_key(path: &Path) -> Result<PrivateKey, ServeError> {
     let key = PrivateKey::random(&mut rng(), Algorithm::Ed25519)?;
     let encoded = key.to_openssh(LineEnding::LF)?;

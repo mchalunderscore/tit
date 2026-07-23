@@ -50,8 +50,24 @@ pub(crate) enum Command {
     Serve,
     /// Create a single-use signup invitation
     InviteCode,
-    /// Check the instance database
-    Doctor,
+    /// Check the instance without changing it
+    Doctor {
+        /// Also check the manifest and checksums in FILE
+        #[arg(long = "backup", value_name = "FILE")]
+        backups: Vec<PathBuf>,
+    },
+    /// Show one typed instance record as JSON
+    Inspect {
+        #[command(subcommand)]
+        command: InspectCommand,
+    },
+    /// Write all SQLite rows as deterministic JSON Lines
+    Dump,
+    /// Run an explicit repair operation
+    Repair {
+        #[command(subcommand)]
+        command: RepairCommand,
+    },
     /// Create a backup archive
     Backup {
         /// Write the backup archive to FILE
@@ -74,6 +90,24 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: AdminCommand,
     },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum RepairCommand {
+    /// Recover incomplete Git and pull-request ref intents
+    Intents,
+    /// Remove quarantine debris after all intents are complete
+    Quarantine,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum InspectCommand {
+    /// Show an account and its SSH key metadata
+    Account { username: String },
+    /// Show a repository record after Git validation
+    Repository { owner: String, slug: String },
+    /// Show a Git operation intent
+    Intent { id: String },
 }
 
 #[derive(Clone, Debug, Subcommand)]

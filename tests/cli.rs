@@ -85,6 +85,7 @@ fn doctor_checks_an_existing_current_database() {
         .execute_batch(CURRENT_DATABASE)
         .expect("create the current database");
     drop(database);
+    prepare_doctor_files(&instance);
 
     let output = instance.run(&[
         "--config",
@@ -92,7 +93,11 @@ fn doctor_checks_an_existing_current_database() {
         "doctor",
     ]);
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "doctor failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
 }
@@ -146,6 +151,7 @@ fn doctor_reports_a_foreign_key_violation() {
         )
         .expect("create a foreign-key violation");
     drop(database);
+    prepare_doctor_files(&instance);
 
     let output = instance.run(&[
         "--config",
@@ -155,7 +161,24 @@ fn doctor_reports_a_foreign_key_violation() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("foreign key violation"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("foreign key violation"),
+        "unexpected doctor error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn prepare_doctor_files(instance: &TestInstance) {
+    fs::set_permissions(
+        instance.path().join("tit.sqlite3"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("make the database private");
+    let repositories = instance.path().join("repositories");
+    fs::create_dir(&repositories).expect("create the repository directory");
+    fs::set_permissions(&repositories, fs::Permissions::from_mode(0o700))
+        .expect("make the repository directory private");
+    create_ssh_key_fixture(&instance.path().join("ssh_host_ed25519_key"));
 }
 
 #[test]
@@ -685,6 +708,216 @@ fn imports_bare_repositories_and_rejects_unsafe_sources() {
         assert_eq!(rejected.status.code(), Some(1), "accepted {slug:?}");
         assert!(rejected.stdout.is_empty());
     }
+}
+
+#[test]
+fn doctor_inspect_and_dump_are_read_only_and_detect_operational_damage() {
+    let instance = TestInstance::new();
+    create_administrator(&instance, "alice");
+    let config = instance.config().to_str().expect("a UTF-8 path");
+    let created = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "create",
+        "alice",
+        "project",
+    ]);
+    assert!(created.status.success());
+    create_ssh_key_fixture(&instance.path().join("ssh_host_ed25519_key"));
+
+    let doctor = instance.run(&["--config", config, "doctor"]);
+    assert!(
+        doctor.status.success(),
+        "doctor failed: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(doctor.stdout.is_empty());
+
+    let account = instance.run(&["--config", config, "inspect", "account", "alice"]);
+    assert!(account.status.success());
+    let account: serde_json::Value =
+        serde_json::from_slice(&account.stdout).expect("parse the account inspection");
+    assert_eq!(account["type"], "account");
+    assert_eq!(account["username"], "alice");
+    assert_eq!(account["keys"].as_array().map(Vec::len), Some(1));
+
+    let repository = instance.run(&[
+        "--config",
+        config,
+        "inspect",
+        "repository",
+        "alice",
+        "project",
+    ]);
+    assert!(repository.status.success());
+    let repository: serde_json::Value =
+        serde_json::from_slice(&repository.stdout).expect("parse the repository inspection");
+    assert_eq!(repository["type"], "repository");
+    assert_eq!(repository["object_format"], "sha1");
+    let repository_id = repository["id"]
+        .as_str()
+        .expect("read the repository identifier")
+        .to_owned();
+
+    let first_dump = instance.run(&["--config", config, "dump"]);
+    let second_dump = instance.run(&["--config", config, "dump"]);
+    assert!(first_dump.status.success());
+    assert_eq!(first_dump.stdout, second_dump.stdout);
+    let dump_rows = String::from_utf8(first_dump.stdout).expect("read the JSON Lines dump");
+    assert!(!dump_rows.is_empty());
+    for line in dump_rows.lines() {
+        let row: serde_json::Value = serde_json::from_str(line).expect("parse a dump row");
+        assert_eq!(row["type"], "sqlite-row");
+        assert!(row["table"].is_string());
+        assert!(row["columns"].is_array());
+    }
+    assert!(dump_rows.contains("\"type\":\"blob-hex\""));
+
+    let backup_directory = TempDir::new().expect("create a backup directory");
+    let backup = backup_directory.path().join("instance.tar");
+    let backup_output = instance.run(&[
+        "--config",
+        config,
+        "backup",
+        backup.to_str().expect("a UTF-8 backup path"),
+    ]);
+    assert!(backup_output.status.success());
+    let checked_backup = instance.run(&[
+        "--config",
+        config,
+        "doctor",
+        "--backup",
+        backup.to_str().expect("a UTF-8 backup path"),
+    ]);
+    assert!(checked_backup.status.success());
+
+    let database_path = instance.path().join("tit.sqlite3");
+    let database = rusqlite::Connection::open(&database_path).expect("open the database");
+    let repository_path = instance
+        .path()
+        .join("repositories")
+        .join(format!("{repository_id}.git"));
+    let intent_id = "11111111111111111111111111111111";
+    let quarantine = repository_path
+        .join("objects")
+        .join("tit-quarantine")
+        .join(intent_id);
+    database
+        .execute(
+            "INSERT INTO git_operation_intent
+             (id, repository_path, actor, initial_refs, proposed_refs, event_payload,
+              quarantine_path, state, pack_name, created_at)
+             VALUES (?1, ?2, 'alice', X'', X'', X'', ?3, 'pending', NULL, 1)",
+            rusqlite::params![
+                intent_id,
+                repository_path.to_str().expect("a UTF-8 repository path"),
+                quarantine.to_str().expect("a UTF-8 quarantine path")
+            ],
+        )
+        .expect("create an incomplete intent");
+    drop(database);
+
+    let incomplete = instance.run(&["--config", config, "doctor"]);
+    assert_eq!(incomplete.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&incomplete.stderr).contains("incomplete intents"));
+    let intent = instance.run(&["--config", config, "inspect", "intent", intent_id]);
+    assert!(intent.status.success());
+    let intent: serde_json::Value =
+        serde_json::from_slice(&intent.stdout).expect("parse the intent inspection");
+    assert_eq!(intent["state"], "pending");
+    let database = rusqlite::Connection::open(&database_path).expect("reopen the database");
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT state FROM git_operation_intent WHERE id = ?1",
+                [intent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read the intent state"),
+        "pending"
+    );
+    drop(database);
+    let repaired_intent = instance.run(&["--config", config, "repair", "intents"]);
+    assert!(
+        repaired_intent.status.success(),
+        "intent repair failed: {}",
+        String::from_utf8_lossy(&repaired_intent.stderr)
+    );
+    let database = rusqlite::Connection::open(&database_path).expect("reopen the database");
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT state FROM git_operation_intent WHERE id = ?1",
+                [intent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read the repaired intent state"),
+        "abandoned"
+    );
+    drop(database);
+
+    fs::create_dir_all(&quarantine).expect("create quarantine debris");
+    fs::write(quarantine.join("incoming.pack"), b"debris").expect("write quarantine debris");
+    let debris = instance.run(&["--config", config, "doctor"]);
+    assert_eq!(debris.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&debris.stderr).contains("quarantine debris"));
+    let repaired_quarantine = instance.run(&["--config", config, "repair", "quarantine"]);
+    assert!(
+        repaired_quarantine.status.success(),
+        "quarantine repair failed: {}",
+        String::from_utf8_lossy(&repaired_quarantine.stderr)
+    );
+
+    let database = rusqlite::Connection::open(&database_path).expect("reopen the database");
+    database
+        .execute_batch("DROP INDEX audit_event_history")
+        .expect("remove a required index");
+    drop(database);
+    let missing_index = instance.run(&["--config", config, "doctor"]);
+    assert_eq!(missing_index.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing_index.stderr).contains("audit_event_history"));
+    let database = rusqlite::Connection::open(&database_path).expect("reopen the database");
+    database
+        .execute_batch(
+            "CREATE INDEX audit_event_history
+             ON audit_event (created_at DESC, id DESC)",
+        )
+        .expect("restore the required index");
+    drop(database);
+
+    let bad_ref = repository_path.join("refs").join("heads").join("broken");
+    fs::create_dir_all(bad_ref.parent().expect("the ref has a parent"))
+        .expect("create the ref directory");
+    fs::write(&bad_ref, b"deadbeef\n").expect("damage a Git ref");
+    let damaged_git = instance.run(&["--config", config, "doctor"]);
+    assert_eq!(damaged_git.status.code(), Some(1));
+    fs::remove_file(&bad_ref).expect("remove the damaged ref");
+
+    fs::set_permissions(instance.config(), fs::Permissions::from_mode(0o644))
+        .expect("make the configuration unsafe");
+    let unsafe_permissions = instance.run(&["--config", config, "doctor"]);
+    assert_eq!(unsafe_permissions.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&unsafe_permissions.stderr).contains("owner-only"));
+    fs::set_permissions(instance.config(), fs::Permissions::from_mode(0o600))
+        .expect("restore the configuration permissions");
+
+    let mut backup_bytes = fs::read(&backup).expect("read the backup");
+    let offset = backup_bytes
+        .windows(b"version = 1".len())
+        .position(|candidate| candidate == b"version = 1")
+        .expect("find archived configuration data");
+    backup_bytes[offset] ^= 1;
+    fs::write(&backup, backup_bytes).expect("damage the backup");
+    let damaged_backup = instance.run(&[
+        "--config",
+        config,
+        "doctor",
+        "--backup",
+        backup.to_str().expect("a UTF-8 backup path"),
+    ]);
+    assert_eq!(damaged_backup.status.code(), Some(1));
 }
 
 fn create_administrator(instance: &TestInstance, username: &str) {

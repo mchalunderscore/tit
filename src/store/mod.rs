@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use rusqlite::OpenFlags;
 use rusqlite::backup::Backup;
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use serde::Serialize;
 use thiserror::Error;
 
 mod event;
@@ -226,6 +228,16 @@ impl Store {
     pub(crate) fn open_unmigrated(path: &Path) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
         configure(&connection)?;
+        Ok(Self { connection })
+    }
+
+    pub(crate) fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.pragma_update(None, "foreign_keys", true)?;
         Ok(Self { connection })
     }
 
@@ -2933,6 +2945,158 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub(crate) fn index_names(&self) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'index' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )?;
+        statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn inspect_account(&self, username: &str) -> Result<AccountInspection, StoreError> {
+        let account = self
+            .connection
+            .query_row(
+                "SELECT id, username, is_administrator, state, created_at
+                 FROM account WHERE username = ?1",
+                [username],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::AccountNotFound(username.to_owned()))?;
+        let mut statement = self.connection.prepare(
+            "SELECT label, fingerprint, created_at, last_used_at, revoked_at
+             FROM ssh_public_key WHERE account_id = ?1 ORDER BY id",
+        )?;
+        let keys = statement
+            .query_map([account.0], |row| {
+                Ok(KeyInspection {
+                    label: row.get(0)?,
+                    fingerprint: row.get(1)?,
+                    created_at: row.get(2)?,
+                    last_used_at: row.get(3)?,
+                    revoked_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AccountInspection {
+            record_type: "account",
+            username: account.1,
+            administrator: account.2,
+            state: account.3,
+            created_at: account.4,
+            keys,
+        })
+    }
+
+    pub(crate) fn inspect_git_intent(&self, id: &str) -> Result<GitIntentInspection, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, repository_path, actor, quarantine_path, state, pack_name, created_at
+                 FROM git_operation_intent WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(GitIntentInspection {
+                        record_type: "git-intent",
+                        id: row.get(0)?,
+                        repository_path: row.get(1)?,
+                        actor: row.get(2)?,
+                        quarantine_path: row.get(3)?,
+                        state: row.get(4)?,
+                        pack_name: row.get(5)?,
+                        created_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::Integrity(format!("Git intent does not exist: {id}")))
+    }
+
+    pub(crate) fn dump_rows(
+        &self,
+        mut visit: impl FnMut(DumpRow) -> bool,
+    ) -> Result<(), StoreError> {
+        let mut tables_statement = self.connection.prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )?;
+        let tables = tables_statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for table in tables {
+            let columns = self.table_columns(&table)?;
+            let order = columns
+                .iter()
+                .filter(|column| column.primary_key > 0)
+                .map(|column| (column.primary_key, quote_identifier(&column.name)))
+                .collect::<Vec<_>>();
+            let order = if order.is_empty() {
+                "rowid".to_owned()
+            } else {
+                let mut order = order;
+                order.sort_by_key(|item| item.0);
+                order
+                    .into_iter()
+                    .map(|item| item.1)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let sql = format!(
+                "SELECT * FROM {} ORDER BY {order}",
+                quote_identifier(&table)
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let mut values = Vec::with_capacity(columns.len());
+                for (index, column) in columns.iter().enumerate() {
+                    values.push(DumpColumn {
+                        name: column.name.clone(),
+                        value: dump_value(row.get_ref(index)?),
+                    });
+                }
+                let output = DumpRow {
+                    record_type: "sqlite-row",
+                    table: table.clone(),
+                    columns: values,
+                };
+                if !visit(output) {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn table_columns(&self, table: &str) -> Result<Vec<TableColumn>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT name, pk FROM pragma_table_info(?1)
+             ORDER BY cid",
+        )?;
+        statement
+            .query_map([table], |row| {
+                Ok(TableColumn {
+                    name: row.get(0)?,
+                    primary_key: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     #[allow(
         dead_code,
         reason = "some integration tests import the store without public HTTP routes"
@@ -3243,6 +3407,99 @@ pub(crate) struct RepositoryRecord {
     pub(crate) object_format: String,
     pub(crate) created_at: i64,
     pub(crate) archived_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AccountInspection {
+    #[serde(rename = "type")]
+    pub(crate) record_type: &'static str,
+    pub(crate) username: String,
+    pub(crate) administrator: bool,
+    pub(crate) state: String,
+    pub(crate) created_at: i64,
+    pub(crate) keys: Vec<KeyInspection>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct KeyInspection {
+    pub(crate) label: String,
+    pub(crate) fingerprint: String,
+    pub(crate) created_at: i64,
+    pub(crate) last_used_at: Option<i64>,
+    pub(crate) revoked_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct GitIntentInspection {
+    #[serde(rename = "type")]
+    pub(crate) record_type: &'static str,
+    pub(crate) id: String,
+    pub(crate) repository_path: String,
+    pub(crate) actor: String,
+    pub(crate) quarantine_path: String,
+    pub(crate) state: String,
+    pub(crate) pack_name: Option<String>,
+    pub(crate) created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RepositoryInspection {
+    #[serde(rename = "type")]
+    pub(crate) record_type: &'static str,
+    pub(crate) id: String,
+    pub(crate) owner: String,
+    pub(crate) slug: String,
+    pub(crate) visibility: String,
+    pub(crate) state: String,
+    pub(crate) object_format: String,
+    pub(crate) created_at: i64,
+    pub(crate) archived_at: Option<i64>,
+}
+
+impl From<RepositoryRecord> for RepositoryInspection {
+    fn from(repository: RepositoryRecord) -> Self {
+        Self {
+            record_type: "repository",
+            id: repository.id,
+            owner: repository.owner,
+            slug: repository.slug,
+            visibility: repository.visibility,
+            state: repository.state,
+            object_format: repository.object_format,
+            created_at: repository.created_at,
+            archived_at: repository.archived_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DumpRow {
+    #[serde(rename = "type")]
+    pub(crate) record_type: &'static str,
+    pub(crate) table: String,
+    pub(crate) columns: Vec<DumpColumn>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DumpColumn {
+    pub(crate) name: String,
+    pub(crate) value: DumpValue,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "kebab-case")]
+pub(crate) enum DumpValue {
+    Null,
+    Integer(i64),
+    Real(String),
+    TextUtf8(String),
+    TextHex(String),
+    BlobHex(String),
+}
+
+struct TableColumn {
+    name: String,
+    primary_key: i64,
 }
 
 #[allow(
@@ -4537,6 +4794,33 @@ fn repository_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryRe
     })
 }
 
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn dump_value(value: ValueRef<'_>) -> DumpValue {
+    match value {
+        ValueRef::Null => DumpValue::Null,
+        ValueRef::Integer(value) => DumpValue::Integer(value),
+        ValueRef::Real(value) => DumpValue::Real(format!("{value:.17e}")),
+        ValueRef::Text(value) => match std::str::from_utf8(value) {
+            Ok(value) => DumpValue::TextUtf8(value.to_owned()),
+            Err(_) => DumpValue::TextHex(hex(value)),
+        },
+        ValueRef::Blob(value) => DumpValue::BlobHex(hex(value)),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[(byte >> 4) as usize]));
+        output.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    output
+}
+
 fn is_unique_constraint(error: &rusqlite::Error) -> bool {
     matches!(
         error,
@@ -4552,12 +4836,7 @@ fn is_unique_constraint(error: &rusqlite::Error) -> bool {
 )]
 pub(crate) fn doctor(instance_dir: &Path) -> Result<(), StoreError> {
     let path = instance_dir.join(DATABASE_FILE);
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    configure(&connection)?;
-    let store = Store { connection };
+    let store = Store::open_read_only(&path)?;
     let actual = store.schema_version()?;
     if actual != SCHEMA_VERSION {
         return Err(StoreError::SchemaVersion {
