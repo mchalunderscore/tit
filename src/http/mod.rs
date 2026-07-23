@@ -1479,7 +1479,7 @@ async fn style() -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/css; charset=utf-8")
-        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(STYLE))
         .expect("the embedded CSS response is valid")
 }

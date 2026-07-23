@@ -105,7 +105,7 @@ async fn serves_the_semantic_shell_without_javascript() {
     let css = request(server.address(), "GET", "/assets/style.css", &[]);
     assert_eq!(css.status, 200);
     assert_eq!(css.header("content-type"), "text/css; charset=utf-8");
-    assert_eq!(css.header("cache-control"), "public, max-age=3600");
+    assert_eq!(css.header("cache-control"), "no-cache");
     assert_eq!(css.body, include_str!("../assets/style.css"));
     assert_security_policy(&css);
 

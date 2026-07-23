@@ -91,7 +91,7 @@ pre {
   max-width: 100%;
   padding: 1rem;
   overflow: auto;
-  border: 1px solid GrayText;
+  border: 0.125rem solid GrayText;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
