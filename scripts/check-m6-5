@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+./scripts/check
+cargo test --locked --release --test account_lifecycle
+cargo test --locked --release --test web_session
+cargo test --locked --release --test serve serves_an_imported_repository_through_http_and_ssh
+cargo test --locked --release --bin tit telemetry::tests::emits_only_fixed_bounded_metrics

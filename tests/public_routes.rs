@@ -70,6 +70,8 @@ mod session;
 )]
 #[path = "../src/store/mod.rs"]
 mod store;
+#[path = "../src/telemetry.rs"]
+mod telemetry;
 #[allow(dead_code, reason = "the public-route test does not change watches")]
 #[path = "../src/watch.rs"]
 mod watch;

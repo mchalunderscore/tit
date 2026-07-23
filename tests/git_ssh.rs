@@ -36,6 +36,8 @@ mod ssh;
 #[allow(dead_code, reason = "the SSH Git test does not use the intent store")]
 #[path = "../src/store/mod.rs"]
 mod store;
+#[path = "../src/telemetry.rs"]
+mod telemetry;
 
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};

@@ -45,6 +45,8 @@ mod ssh;
 )]
 #[path = "../src/store/mod.rs"]
 mod store;
+#[path = "../src/telemetry.rs"]
+mod telemetry;
 
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};

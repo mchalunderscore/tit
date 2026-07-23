@@ -497,7 +497,63 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     assert_eq!(locked.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&locked.stderr).contains("owns the instance lock"));
 
-    server.terminate();
+    let metrics = http_get(http, "/metrics");
+    assert!(metrics.starts_with("HTTP/1.1 200"));
+    assert!(metrics.contains("tit_http_requests_total "));
+    assert!(metrics.contains("tit_http_requests_in_flight 1"));
+    assert!(metrics.contains("tit_ssh_connections_total "));
+    assert!(metrics.contains("tit_ssh_operations_total "));
+
+    let authorization_secret = "Bearer tit-secret-authorization";
+    let cookie_secret = "tit-session=tit-secret-cookie";
+    let feed_secret = "tit-secret-feed-token";
+    let _ = http_get_with_headers(
+        http,
+        "/",
+        &[
+            ("Authorization", authorization_secret),
+            ("Cookie", cookie_secret),
+        ],
+    );
+    let _ = http_get(http, &format!("/feeds/{feed_secret}.atom"));
+
+    let logs = server.terminate_capture();
+    let logs = String::from_utf8(logs).expect("read structured server logs");
+    assert!(!logs.contains(authorization_secret));
+    assert!(!logs.contains(cookie_secret));
+    assert!(!logs.contains(feed_secret));
+    for secret in [
+        recovery,
+        challenge,
+        signature.as_str(),
+        invitation.trim(),
+        private_cookies.as_str(),
+        upload_signature.as_str(),
+    ] {
+        assert!(!logs.contains(secret));
+    }
+    let events: Vec<serde_json::Value> = logs
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse a structured server log"))
+        .collect();
+    assert!(events.iter().any(|event| {
+        event["event"] == "http.request"
+            && event["request_id"]
+                .as_str()
+                .is_some_and(|request_id| request_id.len() == 32)
+    }));
+    assert!(events.iter().any(|event| {
+        event["event"] == "ssh.operation"
+            && event["operation_id"]
+                .as_str()
+                .is_some_and(|operation_id| operation_id.len() == 32)
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "server.shutdown" && event["outcome"] == "completed")
+    );
+
     assert!(!control_socket.exists());
     let host_key = fs::read(instance.path().join("ssh_host_ed25519_key"))
         .expect("read the generated SSH host key");
@@ -1779,6 +1835,24 @@ fn git_revision(worktree: &Path, revision: &str) -> String {
 struct ChildGuard(Option<Child>);
 
 impl ChildGuard {
+    fn terminate_capture(&mut self) -> Vec<u8> {
+        let child = self.0.take().expect("the server process is active");
+        let signal = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .output()
+            .expect("send SIGTERM to the tit server");
+        assert!(signal.status.success(), "cannot send SIGTERM");
+        let output = child
+            .wait_with_output()
+            .expect("wait for the tit server and read its output");
+        assert!(
+            output.status.success(),
+            "tit serve did not stop cleanly: {}",
+            output.status
+        );
+        output.stderr
+    }
+
     fn terminate(&mut self) {
         if let Some(mut child) = self.0.take() {
             let signal = Command::new("kill")

@@ -36,6 +36,8 @@ mod ssh;
 #[allow(dead_code, reason = "the SSH push test does not use each store API")]
 #[path = "../src/store/mod.rs"]
 mod store;
+#[path = "../src/telemetry.rs"]
+mod telemetry;
 
 use std::env;
 use std::fs;

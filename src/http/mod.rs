@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use askama::Template;
 use axum::Router;
@@ -39,6 +39,7 @@ use crate::repository::{RepositoryService, RepositoryServiceError};
 use crate::search::MetadataSearchService;
 use crate::session::{SessionError, WebLoginService};
 use crate::store::StoreError;
+use crate::telemetry::Telemetry;
 use crate::watch::WatchService;
 
 use self::public::PublicWeb;
@@ -63,6 +64,7 @@ struct WebState {
     requests: Arc<Semaphore>,
     login_attempts: AttemptLimiter<IpAddr>,
     max_request_bytes: usize,
+    telemetry: Telemetry,
     key_reloader: Option<AccountKeyReloader>,
     login: Option<WebLoginService>,
     repositories: Option<RepositoryService>,
@@ -128,6 +130,7 @@ impl RunningWebServer {
                 requests: Arc::new(Semaphore::new(1024)),
                 login_attempts: login_attempt_limiter(),
                 max_request_bytes: 1024 * 1024,
+                telemetry: Telemetry::default(),
                 key_reloader: None,
                 login: None,
                 repositories: None,
@@ -147,7 +150,7 @@ impl RunningWebServer {
         address: SocketAddr,
         config: PublicWebConfig,
     ) -> Result<Self, WebError> {
-        Self::start_public_inner(address, config, None, None, None).await
+        Self::start_public_inner(address, config, None, None, None, Telemetry::default()).await
     }
 
     pub(crate) async fn start_public_with_key_reload(
@@ -156,6 +159,7 @@ impl RunningWebServer {
         key_reloader: AccountKeyReloader,
         readiness: ListenerReadiness,
         maintenance: MaintenanceGate,
+        telemetry: Telemetry,
     ) -> Result<Self, WebError> {
         Self::start_public_inner(
             address,
@@ -163,6 +167,7 @@ impl RunningWebServer {
             Some(key_reloader),
             Some(readiness),
             Some(maintenance),
+            telemetry,
         )
         .await
     }
@@ -173,6 +178,7 @@ impl RunningWebServer {
         key_reloader: Option<AccountKeyReloader>,
         readiness: Option<ListenerReadiness>,
         maintenance: Option<MaintenanceGate>,
+        telemetry: Telemetry,
     ) -> Result<Self, WebError> {
         let jobs = Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS));
         let requests = Arc::new(Semaphore::new(config.max_connections));
@@ -209,6 +215,7 @@ impl RunningWebServer {
                 requests,
                 login_attempts: login_attempt_limiter(),
                 max_request_bytes,
+                telemetry,
                 key_reloader,
                 login: Some(login),
                 repositories: Some(repositories),
@@ -279,6 +286,7 @@ pub(crate) fn router() -> Router {
         requests: Arc::new(Semaphore::new(1024)),
         login_attempts: login_attempt_limiter(),
         max_request_bytes: 1024 * 1024,
+        telemetry: Telemetry::default(),
         key_reloader: None,
         login: None,
         repositories: None,
@@ -306,6 +314,7 @@ fn router_with_state(state: WebState) -> Router {
     Router::new()
         .route("/", get(home))
         .route("/healthz", get(health))
+        .route("/metrics", get(metrics))
         .route("/go", get(go_to_repository))
         .route(
             "/signup",
@@ -349,8 +358,20 @@ fn router_with_state(state: WebState) -> Router {
         .method_not_allowed_fallback(method_not_allowed)
         .layer(RequestBodyLimitLayer::new(max_request_bytes))
         .layer(middleware::from_fn_with_state(state.clone(), request_guard))
-        .layer(middleware::from_fn(response_policy))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            response_policy,
+        ))
         .with_state(state)
+}
+
+async fn metrics(State(state): State<WebState>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(state.telemetry.metrics()))
+        .expect("the metrics response is valid")
 }
 
 fn login_attempt_limiter() -> AttemptLimiter<IpAddr> {
@@ -1337,8 +1358,15 @@ async fn method_not_allowed(
     response
 }
 
-async fn response_policy(mut request: Request, next: Next) -> Response {
+async fn response_policy(
+    State(state): State<WebState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let request_id = RequestId(format!("{:032x}", rand::random::<u128>()));
+    let method = logged_method(request.method());
+    let started = Instant::now();
+    let _in_flight = state.telemetry.http_start();
     let is_head = request.method() == Method::HEAD;
     request.extensions_mut().insert(request_id.clone());
     let mut response = next.run(request).await;
@@ -1385,7 +1413,28 @@ async fn response_policy(mut request: Request, next: Next) -> Response {
             );
         }
     }
+    state.telemetry.http_finish(
+        &request_id.0,
+        method,
+        response.status().as_u16(),
+        started.elapsed(),
+    );
     response
+}
+
+fn logged_method(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::PATCH => "PATCH",
+        Method::DELETE => "DELETE",
+        Method::OPTIONS => "OPTIONS",
+        Method::CONNECT => "CONNECT",
+        Method::TRACE => "TRACE",
+        _ => "OTHER",
+    }
 }
 
 fn render_home(

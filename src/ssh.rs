@@ -25,6 +25,7 @@ use crate::policy::RepositoryOperation;
 use crate::rate_limit::AttemptLimiter;
 use crate::repository::{RepositoryService, RepositoryServiceError};
 use crate::store::{Store, StoreError};
+use crate::telemetry::Telemetry;
 
 const VERSION_COMMAND: &[u8] = b"tit --version";
 const GIT_PROTOCOL_VARIABLE: &str = "GIT_PROTOCOL";
@@ -150,6 +151,7 @@ impl RunningSshServer {
         repositories: GitRepositories,
         host_key: PrivateKey,
         max_connections: usize,
+        telemetry: Telemetry,
     ) -> Result<Self, SshServerError> {
         recover_pushes(&repositories).await?;
         Self::start_inner_with_keys(
@@ -159,6 +161,7 @@ impl RunningSshServer {
             Some(repositories),
             host_key,
             max_connections,
+            telemetry,
         )
         .await
     }
@@ -195,6 +198,7 @@ impl RunningSshServer {
             repositories,
             host_key,
             1024,
+            Telemetry::default(),
         )
         .await
     }
@@ -206,6 +210,7 @@ impl RunningSshServer {
         repositories: Option<GitRepositories>,
         host_key: PrivateKey,
         max_connections: usize,
+        telemetry: Telemetry,
     ) -> Result<Self, SshServerError> {
         let listener = TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
@@ -248,6 +253,7 @@ impl RunningSshServer {
                 Duration::from_secs(60),
                 MAX_SSH_CLIENTS,
             ),
+            telemetry,
         };
         let (handle_sender, handle_receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -333,12 +339,15 @@ struct SshServer {
     repositories: Option<Arc<GitRepositories>>,
     connections: Arc<Semaphore>,
     attempts: AttemptLimiter<IpAddr>,
+    telemetry: Telemetry,
 }
 
 impl Server for SshServer {
     type Handler = SshSession;
 
     fn new_client(&mut self, peer_address: Option<SocketAddr>) -> Self::Handler {
+        let connection_id = format!("{:032x}", rand::random::<u128>());
+        self.telemetry.ssh_connection(&connection_id);
         SshSession {
             authorized_keys: self.authorized_keys.clone(),
             writable_keys: Arc::clone(&self.writable_keys),
@@ -354,6 +363,8 @@ impl Server for SshServer {
                 .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             attempts: self.attempts.clone(),
             _connection_permit: self.connections.clone().try_acquire_owned().ok(),
+            telemetry: self.telemetry.clone(),
+            connection_id,
         }
     }
 }
@@ -371,6 +382,8 @@ struct SshSession {
     peer_address: IpAddr,
     attempts: AttemptLimiter<IpAddr>,
     _connection_permit: Option<OwnedSemaphorePermit>,
+    telemetry: Telemetry,
+    connection_id: String,
 }
 
 enum ExecChannel {
@@ -423,14 +436,17 @@ impl Handler for SshSession {
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
         if self._connection_permit.is_none() || !self.attempts.allow(self.peer_address) {
+            self.telemetry.ssh_auth(&self.connection_id, false);
             return Ok(Auth::reject());
         }
         if let Some(identity) = self.authorized_keys.identity(public_key) {
             self.authenticated_identity = Some(identity);
             self.authenticated_key = Some(public_key.clone());
             self.authenticated_writer = self.writable_keys.contains(public_key);
+            self.telemetry.ssh_auth(&self.connection_id, true);
             Ok(Auth::Accept)
         } else {
+            self.telemetry.ssh_auth(&self.connection_id, false);
             Ok(Auth::reject())
         }
     }
@@ -552,6 +568,8 @@ impl Handler for SshSession {
         command: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        let operation_id = format!("{:032x}", rand::random::<u128>());
+        self.telemetry.ssh_operation(&operation_id);
         if command == VERSION_COMMAND {
             self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
             session.channel_success(channel)?;

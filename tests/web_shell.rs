@@ -59,6 +59,8 @@ mod session;
 #[allow(dead_code, reason = "the shell test does not use repository storage")]
 #[path = "../src/store/mod.rs"]
 mod store;
+#[path = "../src/telemetry.rs"]
+mod telemetry;
 #[allow(dead_code, reason = "the Web shell test does not change watches")]
 #[path = "../src/watch.rs"]
 mod watch;

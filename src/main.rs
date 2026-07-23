@@ -33,6 +33,7 @@ mod session;
 #[allow(dead_code, reason = "the server uses only part of the shared SSH API")]
 mod ssh;
 mod store;
+mod telemetry;
 mod watch;
 
 use std::process::ExitCode;

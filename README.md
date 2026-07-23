@@ -170,6 +170,24 @@ The dump can contain credential hashes, session hashes, token hashes, and SSH
 public keys. Store it as a secret. The dump is for inspection and comparison;
 it is not a restore format.
 
+## Observability
+
+The `serve` command writes one JSON object per line to standard error. HTTP
+request events contain a request ID, method, status, and duration. SSH
+connection, authentication, and command events contain an operation ID. Server
+lifecycle events record start, readiness, and shutdown.
+
+Logs do not contain URLs, request headers, request bodies, public keys, or
+client addresses. Thus, they do not contain authorization headers, cookies,
+feed tokens, recovery credentials, login challenges, raw signatures, or SSH
+private keys. Audit history continues to record durable security and mutation
+events in SQLite.
+
+`GET /metrics` returns six fixed process counters as plain text. The counters
+cover HTTP requests, HTTP errors, active HTTP requests, SSH connections,
+rejected SSH authentication, and SSH operations. The endpoint has no labels
+and does not contain repository, account, path, or client data.
+
 An authenticated account can create a repository with SSH:
 
 ```text
@@ -634,3 +652,16 @@ limits, Markdown limits, Git pack limits, and repository diff and archive
 limits. Read the
 [limits and abuse resistance architectural decision record](docs/adr/0031-limits-and-abuse-resistance.md)
 for the limit values and failure behavior.
+
+## Milestone 6.5 gate
+
+Install stock Git and OpenSSH. Then, run the observability gate:
+
+```text
+./scripts/check-m6-5
+```
+
+This command tests structured HTTP, SSH, and lifecycle logs, request and
+operation IDs, fixed metrics, audit records, and secret redaction. Read the
+[observability architectural decision record](docs/adr/0032-observability.md)
+for the event and redaction contracts.

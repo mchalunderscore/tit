@@ -21,10 +21,13 @@ use crate::policy::PolicyError;
 use crate::pull_request::{PullRequestError, PullRequestService};
 use crate::ssh::{AuthorizedSshKeys, RunningSshServer, SshServerError};
 use crate::store::{Store, StoreError};
+use crate::telemetry::Telemetry;
 
 const SHUTDOWN_DRAIN_LIMIT: Duration = Duration::from_secs(10);
 
 pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
+    let telemetry = Telemetry::enabled();
+    telemetry.lifecycle("server.start", "started");
     let _lock = InstanceLock::acquire(&config.instance_dir)?;
     let database = prepare_database(&config.instance_dir)?;
     let repository_root = prepare_repository_root(&config.instance_dir)?;
@@ -76,6 +79,7 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
         reload_keys,
         readiness.clone(),
         maintenance,
+        telemetry.clone(),
     )
     .await?;
     let ssh = match RunningSshServer::start_with_dynamic_keys(
@@ -84,6 +88,7 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
         git,
         host_key,
         usize::try_from(config.max_connections).map_err(|_| ServeError::ConnectionLimit)?,
+        telemetry.clone(),
     )
     .await
     {
@@ -95,9 +100,11 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
         }
     };
     readiness.mark_ready();
+    telemetry.lifecycle("server.readiness", "ready");
 
     let signal = shutdown_signal().await;
     readiness.mark_stopping();
+    telemetry.lifecycle("server.shutdown", "started");
     let (ssh_result, web_result, control_result) = tokio::join!(
         ssh.shutdown_bounded(SHUTDOWN_DRAIN_LIMIT),
         web.shutdown_bounded(SHUTDOWN_DRAIN_LIMIT),
@@ -110,6 +117,10 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
     if !drained {
         eprintln!("tit: the shutdown drain limit expired; unfinished connections were canceled");
     }
+    telemetry.lifecycle(
+        "server.shutdown",
+        if drained { "completed" } else { "bounded" },
+    );
     signal.map_err(ServeError::Signal)
 }
 
