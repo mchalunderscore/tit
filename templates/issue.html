@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}#{{ number }} {{ title }} · {{ owner }}/{{ repository }} · tit{% endblock %}
+{% block content %}
+  <header class="repository-header">
+    <h1><a href="/{{ owner }}/{{ repository }}">{{ owner }}/{{ repository }}</a></h1>
+    <nav aria-label="Repository">
+      <a href="/{{ owner }}/{{ repository }}">Summary</a>
+      <a href="/{{ owner }}/{{ repository }}/refs">Refs</a>
+      <a href="/{{ owner }}/{{ repository }}/issues">Issues</a>
+      <a href="/{{ owner }}/{{ repository }}/atom.xml">Atom</a>
+      <a href="/{{ owner }}/{{ repository }}/rss.xml">RSS</a>
+    </nav>
+  </header>
+
+  <article>
+    <h2>#{{ number }} {{ title }}</h2>
+    <p>{{ state }} · opened by {{ author }} at <time>{{ created_at }}</time> · updated <time>{{ updated_at }}</time></p>
+{% if labels.is_empty() %}{% else %}
+    <p>Labels:{% for label in labels %} <span>{{ label }}</span>{% endfor %}</p>
+{% endif %}
+{% if assignees.is_empty() %}{% else %}
+    <p>Assignees:{% for assignee in assignees %} <span>{{ assignee }}</span>{% endfor %}</p>
+{% endif %}
+    <div class="markdown">{{ body_html|safe }}</div>
+  </article>
+
+  <section aria-labelledby="comments-heading">
+    <h2 id="comments-heading">Comments</h2>
+{% if comments.is_empty() %}
+    <p>This issue has no comments.</p>
+{% else %}
+{% for comment in comments %}
+    <article id="comment-{{ comment.id }}">
+      <h3>{{ comment.author }} commented at <time>{{ comment.created_at }}</time></h3>
+      <div class="markdown">{{ comment.body_html|safe }}</div>
+    </article>
+{% endfor %}
+{% endif %}
+  </section>
+
+  <section aria-labelledby="timeline-heading">
+    <h2 id="timeline-heading">Timeline</h2>
+    <ol>
+{% for event in timeline %}
+      <li value="{{ event.sequence }}">{{ event.actor }}: {{ event.kind }} at <time>{{ event.created_at }}</time></li>
+{% endfor %}
+    </ol>
+  </section>
+
+{% if can_comment %}
+  <section aria-labelledby="comment-heading">
+    <h2 id="comment-heading">Add a comment</h2>
+    <form method="post" action="/{{ owner }}/{{ repository }}/issues/{{ number }}/comments">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="field">
+        <label for="comment-body">Comment (Markdown)</label>
+        <textarea id="comment-body" name="body" maxlength="262144" rows="8" required></textarea>
+      </div>
+      <button type="submit">Add comment</button>
+    </form>
+  </section>
+{% endif %}
+
+{% if can_edit %}
+  <section aria-labelledby="edit-heading">
+    <h2 id="edit-heading">Edit this issue</h2>
+    <form method="post" action="/{{ owner }}/{{ repository }}/issues/{{ number }}/edit">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="field">
+        <label for="edit-title">Title</label>
+        <input id="edit-title" name="title" maxlength="200" value="{{ title }}" required>
+      </div>
+      <div class="field">
+        <label for="edit-body">Description (Markdown)</label>
+        <textarea id="edit-body" name="body" maxlength="262144" rows="10">{{ body }}</textarea>
+      </div>
+      <button type="submit">Save issue</button>
+    </form>
+    <form method="post" action="/{{ owner }}/{{ repository }}/issues/{{ number }}/state">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+{% if is_open %}
+      <input type="hidden" name="state" value="closed">
+      <button type="submit">Close issue</button>
+{% else %}
+      <input type="hidden" name="state" value="open">
+      <button type="submit">Reopen issue</button>
+{% endif %}
+    </form>
+  </section>
+{% endif %}
+
+{% if can_maintain %}
+  <section aria-labelledby="organize-heading">
+    <h2 id="organize-heading">Organize this issue</h2>
+    <form method="post" action="/{{ owner }}/{{ repository }}/issues/{{ number }}/labels">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="field">
+        <label for="label-name">Label</label>
+        <input id="label-name" name="label" maxlength="80" required>
+      </div>
+      <button name="operation" value="add" type="submit">Add label</button>
+      <button name="operation" value="remove" type="submit">Remove label</button>
+    </form>
+    <form method="post" action="/{{ owner }}/{{ repository }}/issues/{{ number }}/assignees">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="field">
+        <label for="assignee-name">Assignee</label>
+        <input id="assignee-name" name="assignee" maxlength="39" required>
+      </div>
+      <button name="operation" value="add" type="submit">Assign</button>
+      <button name="operation" value="remove" type="submit">Unassign</button>
+    </form>
+  </section>
+{% endif %}
+{% endblock %}

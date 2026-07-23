@@ -13,6 +13,15 @@ pub(super) enum EventKind {
     TagCreated,
     TagUpdated,
     TagDeleted,
+    IssueCreated,
+    IssueEdited,
+    IssueCommented,
+    IssueClosed,
+    IssueReopened,
+    IssueLabeled,
+    IssueUnlabeled,
+    IssueAssigned,
+    IssueUnassigned,
 }
 
 impl EventKind {
@@ -27,6 +36,15 @@ impl EventKind {
             Self::TagCreated => "tag-created",
             Self::TagUpdated => "tag-updated",
             Self::TagDeleted => "tag-deleted",
+            Self::IssueCreated => "issue-created",
+            Self::IssueEdited => "issue-edited",
+            Self::IssueCommented => "issue-commented",
+            Self::IssueClosed => "issue-closed",
+            Self::IssueReopened => "issue-reopened",
+            Self::IssueLabeled => "issue-labeled",
+            Self::IssueUnlabeled => "issue-unlabeled",
+            Self::IssueAssigned => "issue-assigned",
+            Self::IssueUnassigned => "issue-unassigned",
         }
     }
 }
@@ -91,6 +109,119 @@ pub(super) fn reference(
             "name_hex": encode_hex(name),
             "old_target": old_target,
             "new_target": new_target,
+        })
+        .to_string(),
+    }
+}
+
+pub(super) fn issue(
+    kind: EventKind,
+    issue_id: &str,
+    number: i64,
+    title: &str,
+    body: &str,
+) -> VersionedEvent {
+    debug_assert!(matches!(
+        kind,
+        EventKind::IssueCreated | EventKind::IssueEdited
+    ));
+    VersionedEvent {
+        kind,
+        payload: json!({
+            "version": PAYLOAD_VERSION,
+            "issue_id": issue_id,
+            "number": number,
+            "title": title,
+            "body": body,
+        })
+        .to_string(),
+    }
+}
+
+pub(super) fn issue_comment(
+    issue_id: &str,
+    number: i64,
+    comment_id: &str,
+    author: &str,
+    body: &str,
+) -> VersionedEvent {
+    VersionedEvent {
+        kind: EventKind::IssueCommented,
+        payload: json!({
+            "version": PAYLOAD_VERSION,
+            "issue_id": issue_id,
+            "number": number,
+            "comment_id": comment_id,
+            "author": author,
+            "body": body,
+        })
+        .to_string(),
+    }
+}
+
+pub(super) fn issue_state(
+    kind: EventKind,
+    issue_id: &str,
+    number: i64,
+    state: &str,
+) -> VersionedEvent {
+    debug_assert!(matches!(
+        kind,
+        EventKind::IssueClosed | EventKind::IssueReopened
+    ));
+    VersionedEvent {
+        kind,
+        payload: json!({
+            "version": PAYLOAD_VERSION,
+            "issue_id": issue_id,
+            "number": number,
+            "state": state,
+        })
+        .to_string(),
+    }
+}
+
+pub(super) fn issue_label(
+    kind: EventKind,
+    issue_id: &str,
+    number: i64,
+    label_id: &str,
+    label: &str,
+) -> VersionedEvent {
+    debug_assert!(matches!(
+        kind,
+        EventKind::IssueLabeled | EventKind::IssueUnlabeled
+    ));
+    VersionedEvent {
+        kind,
+        payload: json!({
+            "version": PAYLOAD_VERSION,
+            "issue_id": issue_id,
+            "number": number,
+            "label_id": label_id,
+            "label": label,
+        })
+        .to_string(),
+    }
+}
+
+pub(super) fn issue_assignee(
+    kind: EventKind,
+    issue_id: &str,
+    number: i64,
+    assignee: &str,
+) -> VersionedEvent {
+    debug_assert!(matches!(
+        kind,
+        EventKind::IssueAssigned | EventKind::IssueUnassigned
+    ));
+    VersionedEvent {
+        kind,
+        payload: json!({
+            "version": PAYLOAD_VERSION,
+            "issue_id": issue_id,
+            "number": number,
+            "assignee": assignee,
         })
         .to_string(),
     }

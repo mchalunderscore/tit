@@ -11,7 +11,7 @@ mod event;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -21,7 +21,7 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 11] = [
+const MIGRATIONS: [&str; 12] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
@@ -33,6 +33,7 @@ const MIGRATIONS: [&str; 11] = [
     include_str!("migrations/009_repository_authorization.sql"),
     include_str!("migrations/010_audit_history.sql"),
     include_str!("migrations/011_domain_events.sql"),
+    include_str!("migrations/012_issues.sql"),
 ];
 
 #[allow(
@@ -115,6 +116,20 @@ pub(crate) enum StoreError {
     EventPayload,
     #[error("audit event page limit is too large")]
     AuditLimit,
+    #[error("issue does not exist: {0}/{1}#{2}")]
+    IssueNotFound(String, String, i64),
+    #[error("issue access is not authorized")]
+    IssueDenied,
+    #[error("issue is hidden by repository access policy")]
+    IssueHidden,
+    #[error("issue state is already {0}")]
+    IssueState(String),
+    #[error("issue label already has the requested state")]
+    IssueLabelState,
+    #[error("issue assignee already has the requested state")]
+    IssueAssigneeState,
+    #[error("issue assignee does not exist or cannot read the repository: {0}")]
+    IssueAssigneeNotFound(String),
 }
 
 pub(crate) struct Store {
@@ -951,6 +966,7 @@ impl Store {
                         repository_id: repository.id,
                         source_intent_id: None,
                         source_ordinal: None,
+                        issue_id: None,
                         event: &event,
                         actor: repository.owner,
                         ref_name: None,
@@ -975,6 +991,7 @@ impl Store {
                             repository_id: repository.id,
                             source_intent_id: None,
                             source_ordinal: None,
+                            issue_id: None,
                             event: &event,
                             actor: repository.owner,
                             ref_name: Some(&reference.name),
@@ -1351,6 +1368,477 @@ impl Store {
         }
     }
 
+    pub(crate) fn create_issue(&mut self, issue: &NewIssue<'_>) -> Result<IssueRecord, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let access = repository_issue_access(
+            &transaction,
+            issue.owner,
+            issue.repository,
+            Some(issue.actor),
+        )?;
+        if !access.can_read() {
+            return Err(StoreError::IssueHidden);
+        }
+        let actor_id = access.active_actor_id.ok_or(StoreError::IssueDenied)?;
+        transaction.execute(
+            "INSERT INTO repository_counter (repository_id)
+             VALUES (?1) ON CONFLICT (repository_id) DO NOTHING",
+            [&access.repository.id],
+        )?;
+        let number = transaction.query_row(
+            "UPDATE repository_counter
+             SET next_issue_number = next_issue_number + 1
+             WHERE repository_id = ?1
+             RETURNING next_issue_number - 1",
+            [&access.repository.id],
+            |row| row.get(0),
+        )?;
+        let id: String =
+            transaction.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+        transaction.execute(
+            "INSERT INTO issue
+             (id, repository_id, number, title, body, state, author_account_id,
+              created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?7)",
+            rusqlite::params![
+                id,
+                access.repository.id,
+                number,
+                issue.title,
+                issue.body,
+                actor_id,
+                issue.created_at,
+            ],
+        )?;
+        let event = event::issue(
+            event::EventKind::IssueCreated,
+            &id,
+            number,
+            issue.title,
+            issue.body,
+        );
+        insert_domain_event(
+            &transaction,
+            &NewDomainEvent {
+                repository_id: &access.repository.id,
+                source_intent_id: None,
+                source_ordinal: None,
+                issue_id: Some(&id),
+                event: &event,
+                actor: issue.actor,
+                ref_name: None,
+                old_target: None,
+                new_target: None,
+                created_at: issue.created_at,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(IssueRecord {
+            id,
+            number,
+            title: issue.title.to_owned(),
+            body: issue.body.to_owned(),
+            state: "open".to_owned(),
+            author: issue.actor.to_owned(),
+            created_at: issue.created_at,
+            updated_at: issue.created_at,
+            closed_at: None,
+        })
+    }
+
+    pub(crate) fn edit_issue(
+        &mut self,
+        change: &IssueChange<'_>,
+        title: &str,
+        body: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (access, current) = issue_mutation_context(
+            &transaction,
+            change.owner,
+            change.repository,
+            change.number,
+            change.actor,
+        )?;
+        if !access.can_write_issue(current.author_account_id) {
+            return Err(StoreError::IssueDenied);
+        }
+        transaction.execute(
+            "UPDATE issue SET title = ?2, body = ?3, updated_at = ?4 WHERE id = ?1",
+            rusqlite::params![current.issue.id, title, body, change.changed_at],
+        )?;
+        let event = event::issue(
+            event::EventKind::IssueEdited,
+            &current.issue.id,
+            change.number,
+            title,
+            body,
+        );
+        insert_issue_event(
+            &transaction,
+            &access.repository.id,
+            &current.issue.id,
+            change.actor,
+            change.changed_at,
+            &event,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn comment_issue(
+        &mut self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        actor: &str,
+        body: &str,
+        created_at: i64,
+    ) -> Result<String, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (access, current) =
+            issue_mutation_context(&transaction, owner, repository, number, actor)?;
+        let actor_id = access.active_actor_id.ok_or(StoreError::IssueDenied)?;
+        if !access.can_read() {
+            return Err(StoreError::IssueDenied);
+        }
+        let comment_id: String =
+            transaction.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+        transaction.execute(
+            "INSERT INTO issue_comment
+             (id, issue_id, author_account_id, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![comment_id, current.issue.id, actor_id, body, created_at],
+        )?;
+        transaction.execute(
+            "UPDATE issue SET updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![current.issue.id, created_at],
+        )?;
+        let event = event::issue_comment(&current.issue.id, number, &comment_id, actor, body);
+        insert_issue_event(
+            &transaction,
+            &access.repository.id,
+            &current.issue.id,
+            actor,
+            created_at,
+            &event,
+        )?;
+        transaction.commit()?;
+        Ok(comment_id)
+    }
+
+    pub(crate) fn set_issue_state(
+        &mut self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        actor: &str,
+        state: &str,
+        changed_at: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (access, current) =
+            issue_mutation_context(&transaction, owner, repository, number, actor)?;
+        if !access.can_write_issue(current.author_account_id) {
+            return Err(StoreError::IssueDenied);
+        }
+        if current.issue.state == state {
+            return Err(StoreError::IssueState(state.to_owned()));
+        }
+        let (closed_at, kind) = match state {
+            "closed" => (Some(changed_at), event::EventKind::IssueClosed),
+            "open" => (None, event::EventKind::IssueReopened),
+            _ => return Err(StoreError::IssueState(state.to_owned())),
+        };
+        transaction.execute(
+            "UPDATE issue
+             SET state = ?2, updated_at = ?3, closed_at = ?4
+             WHERE id = ?1",
+            rusqlite::params![current.issue.id, state, changed_at, closed_at],
+        )?;
+        let event = event::issue_state(kind, &current.issue.id, number, state);
+        insert_issue_event(
+            &transaction,
+            &access.repository.id,
+            &current.issue.id,
+            actor,
+            changed_at,
+            &event,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn set_issue_label(
+        &mut self,
+        change: &IssueChange<'_>,
+        label: &str,
+        present: bool,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (access, current) = issue_mutation_context(
+            &transaction,
+            change.owner,
+            change.repository,
+            change.number,
+            change.actor,
+        )?;
+        let actor_id = access.active_actor_id.ok_or(StoreError::IssueDenied)?;
+        if !access.can_maintain() {
+            return Err(StoreError::IssueDenied);
+        }
+        let (label_id, stored_label) = if present {
+            transaction.execute(
+                "INSERT INTO label (id, repository_id, name, created_at)
+                 VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3)
+                 ON CONFLICT DO NOTHING",
+                rusqlite::params![access.repository.id, label, change.changed_at],
+            )?;
+            transaction.query_row(
+                "SELECT id, name FROM label
+                 WHERE repository_id = ?1 AND name = ?2 COLLATE NOCASE",
+                rusqlite::params![access.repository.id, label],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+        } else {
+            transaction
+                .query_row(
+                    "SELECT id, name FROM label
+                     WHERE repository_id = ?1 AND name = ?2 COLLATE NOCASE",
+                    rusqlite::params![access.repository.id, label],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+                .ok_or(StoreError::IssueLabelState)?
+        };
+        let changed = if present {
+            transaction.execute(
+                "INSERT INTO issue_label (issue_id, label_id, actor_account_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+                rusqlite::params![current.issue.id, label_id, actor_id, change.changed_at],
+            )?
+        } else {
+            transaction.execute(
+                "DELETE FROM issue_label WHERE issue_id = ?1 AND label_id = ?2",
+                rusqlite::params![current.issue.id, label_id],
+            )?
+        };
+        if changed == 0 {
+            return Err(StoreError::IssueLabelState);
+        }
+        transaction.execute(
+            "UPDATE issue SET updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![current.issue.id, change.changed_at],
+        )?;
+        let kind = if present {
+            event::EventKind::IssueLabeled
+        } else {
+            event::EventKind::IssueUnlabeled
+        };
+        let event = event::issue_label(
+            kind,
+            &current.issue.id,
+            change.number,
+            &label_id,
+            &stored_label,
+        );
+        insert_issue_event(
+            &transaction,
+            &access.repository.id,
+            &current.issue.id,
+            change.actor,
+            change.changed_at,
+            &event,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn set_issue_assignee(
+        &mut self,
+        change: &IssueChange<'_>,
+        assignee: &str,
+        present: bool,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (access, current) = issue_mutation_context(
+            &transaction,
+            change.owner,
+            change.repository,
+            change.number,
+            change.actor,
+        )?;
+        let actor_id = access.active_actor_id.ok_or(StoreError::IssueDenied)?;
+        if !access.can_maintain() {
+            return Err(StoreError::IssueDenied);
+        }
+        let assignee_access = repository_issue_access(
+            &transaction,
+            change.owner,
+            change.repository,
+            Some(assignee),
+        )?;
+        let assignee_id = assignee_access
+            .active_actor_id
+            .filter(|_| assignee_access.can_read())
+            .ok_or_else(|| StoreError::IssueAssigneeNotFound(assignee.to_owned()))?;
+        let changed = if present {
+            transaction.execute(
+                "INSERT INTO issue_assignee
+                 (issue_id, account_id, actor_account_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+                rusqlite::params![current.issue.id, assignee_id, actor_id, change.changed_at],
+            )?
+        } else {
+            transaction.execute(
+                "DELETE FROM issue_assignee WHERE issue_id = ?1 AND account_id = ?2",
+                rusqlite::params![current.issue.id, assignee_id],
+            )?
+        };
+        if changed == 0 {
+            return Err(StoreError::IssueAssigneeState);
+        }
+        transaction.execute(
+            "UPDATE issue SET updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![current.issue.id, change.changed_at],
+        )?;
+        let kind = if present {
+            event::EventKind::IssueAssigned
+        } else {
+            event::EventKind::IssueUnassigned
+        };
+        let event = event::issue_assignee(kind, &current.issue.id, change.number, assignee);
+        insert_issue_event(
+            &transaction,
+            &access.repository.id,
+            &current.issue.id,
+            change.actor,
+            change.changed_at,
+            &event,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn issues(
+        &self,
+        owner: &str,
+        repository: &str,
+        actor: Option<&str>,
+    ) -> Result<(RepositoryRecord, Vec<IssueRecord>), StoreError> {
+        let access = repository_issue_access(&self.connection, owner, repository, actor)?;
+        if !access.can_read() {
+            return Err(StoreError::IssueHidden);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT issue.id, issue.number, issue.title, issue.body, issue.state,
+                    account.username, issue.created_at, issue.updated_at, issue.closed_at
+             FROM issue
+             JOIN account ON account.id = issue.author_account_id
+             WHERE issue.repository_id = ?1
+             ORDER BY issue.number DESC LIMIT 1000",
+        )?;
+        let issues = statement
+            .query_map([&access.repository.id], issue_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        Ok((access.repository, issues))
+    }
+
+    pub(crate) fn issue_detail(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        actor: Option<&str>,
+    ) -> Result<IssueDetail, StoreError> {
+        let access = repository_issue_access(&self.connection, owner, repository, actor)?;
+        if !access.can_read() {
+            return Err(StoreError::IssueHidden);
+        }
+        let issue = find_issue(
+            &self.connection,
+            &access.repository,
+            owner,
+            repository,
+            number,
+        )?;
+        let comments = {
+            let mut statement = self.connection.prepare(
+                "SELECT issue_comment.id, account.username, issue_comment.body,
+                        issue_comment.created_at
+                 FROM issue_comment
+                 JOIN account ON account.id = issue_comment.author_account_id
+                 WHERE issue_comment.issue_id = ?1
+                 ORDER BY issue_comment.created_at, issue_comment.id",
+            )?;
+            statement
+                .query_map([&issue.issue.id], |row| {
+                    Ok(IssueCommentRecord {
+                        id: row.get(0)?,
+                        author: row.get(1)?,
+                        body: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let labels = issue_names(
+            &self.connection,
+            "SELECT label.name FROM issue_label
+             JOIN label ON label.id = issue_label.label_id
+             WHERE issue_label.issue_id = ?1 ORDER BY label.name COLLATE NOCASE",
+            &issue.issue.id,
+        )?;
+        let assignees = issue_names(
+            &self.connection,
+            "SELECT account.username FROM issue_assignee
+             JOIN account ON account.id = issue_assignee.account_id
+             WHERE issue_assignee.issue_id = ?1 ORDER BY account.username",
+            &issue.issue.id,
+        )?;
+        let timeline = {
+            let mut statement = self.connection.prepare(
+                "SELECT sequence, kind, actor, payload, created_at
+                 FROM repository_event WHERE issue_id = ?1 ORDER BY sequence",
+            )?;
+            statement
+                .query_map([&issue.issue.id], |row| {
+                    Ok(IssueTimelineRecord {
+                        sequence: row.get(0)?,
+                        kind: row.get(1)?,
+                        actor: row.get(2)?,
+                        payload: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(IssueDetail {
+            can_comment: access.active_actor_id.is_some() && access.can_read(),
+            can_edit: access.can_write_issue(issue.author_account_id),
+            can_maintain: access.can_maintain(),
+            repository: access.repository,
+            issue: issue.issue,
+            comments,
+            labels,
+            assignees,
+            timeline,
+        })
+    }
+
     #[allow(
         dead_code,
         reason = "some integration tests compile storage without authorization"
@@ -1703,6 +2191,65 @@ pub(crate) struct RepositoryEventRecord {
     pub(crate) created_at: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IssueRecord {
+    pub(crate) id: String,
+    pub(crate) number: i64,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) state: String,
+    pub(crate) author: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) closed_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IssueCommentRecord {
+    pub(crate) id: String,
+    pub(crate) author: String,
+    pub(crate) body: String,
+    pub(crate) created_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IssueTimelineRecord {
+    pub(crate) sequence: i64,
+    pub(crate) kind: String,
+    pub(crate) actor: String,
+    pub(crate) payload: String,
+    pub(crate) created_at: i64,
+}
+
+pub(crate) struct IssueDetail {
+    pub(crate) repository: RepositoryRecord,
+    pub(crate) issue: IssueRecord,
+    pub(crate) comments: Vec<IssueCommentRecord>,
+    pub(crate) labels: Vec<String>,
+    pub(crate) assignees: Vec<String>,
+    pub(crate) timeline: Vec<IssueTimelineRecord>,
+    pub(crate) can_comment: bool,
+    pub(crate) can_edit: bool,
+    pub(crate) can_maintain: bool,
+}
+
+pub(crate) struct NewIssue<'a> {
+    pub(crate) owner: &'a str,
+    pub(crate) repository: &'a str,
+    pub(crate) actor: &'a str,
+    pub(crate) title: &'a str,
+    pub(crate) body: &'a str,
+    pub(crate) created_at: i64,
+}
+
+pub(crate) struct IssueChange<'a> {
+    pub(crate) owner: &'a str,
+    pub(crate) repository: &'a str,
+    pub(crate) number: i64,
+    pub(crate) actor: &'a str,
+    pub(crate) changed_at: i64,
+}
+
 pub(crate) struct GitOperationIntent<'a> {
     pub(crate) id: &'a str,
     pub(crate) repository_path: &'a str,
@@ -1802,10 +2349,186 @@ fn insert_audit_event(
     Ok(())
 }
 
+struct RepositoryIssueAccess {
+    repository: RepositoryRecord,
+    active_actor_id: Option<i64>,
+    role: Option<String>,
+}
+
+impl RepositoryIssueAccess {
+    fn can_read(&self) -> bool {
+        self.repository.state == "active"
+            && (self.repository.visibility == "public" || self.role.is_some())
+    }
+
+    fn can_write_issue(&self, author_account_id: i64) -> bool {
+        self.can_read()
+            && (self.active_actor_id == Some(author_account_id)
+                || matches!(
+                    self.role.as_deref(),
+                    Some("owner" | "maintainer" | "writer")
+                ))
+    }
+
+    fn can_maintain(&self) -> bool {
+        self.can_read() && matches!(self.role.as_deref(), Some("owner" | "maintainer"))
+    }
+}
+
+struct StoredIssue {
+    issue: IssueRecord,
+    author_account_id: i64,
+}
+
+fn repository_issue_access(
+    connection: &Connection,
+    owner: &str,
+    repository: &str,
+    actor: Option<&str>,
+) -> Result<RepositoryIssueAccess, StoreError> {
+    let result = connection.query_row(
+        "SELECT repository.id, owner.username, repository.slug,
+                repository.visibility, repository.state, repository.object_format,
+                repository.created_at, repository.archived_at,
+                CASE WHEN actor.state = 'active' THEN actor.id END,
+                CASE
+                    WHEN actor.state != 'active' THEN NULL
+                    WHEN actor.id = repository.owner_account_id THEN 'owner'
+                    ELSE repository_collaborator.role
+                END
+         FROM repository
+         JOIN account AS owner ON owner.id = repository.owner_account_id
+         LEFT JOIN account AS actor ON actor.username = ?3
+         LEFT JOIN repository_collaborator
+           ON repository_collaborator.repository_id = repository.id
+          AND repository_collaborator.account_id = actor.id
+         WHERE owner.username = ?1 AND repository.slug = ?2",
+        rusqlite::params![owner, repository, actor],
+        |row| {
+            Ok(RepositoryIssueAccess {
+                repository: repository_from_row(row)?,
+                active_actor_id: row.get(8)?,
+                role: row.get(9)?,
+            })
+        },
+    );
+    match result {
+        Ok(access) => Ok(access),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Err(StoreError::RepositoryNotFound(
+            owner.to_owned(),
+            repository.to_owned(),
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn find_issue(
+    connection: &Connection,
+    repository: &RepositoryRecord,
+    owner: &str,
+    slug: &str,
+    number: i64,
+) -> Result<StoredIssue, StoreError> {
+    let result = connection.query_row(
+        "SELECT issue.id, issue.number, issue.title, issue.body, issue.state,
+                account.username, issue.created_at, issue.updated_at, issue.closed_at,
+                issue.author_account_id
+         FROM issue
+         JOIN account ON account.id = issue.author_account_id
+         WHERE issue.repository_id = ?1 AND issue.number = ?2",
+        rusqlite::params![repository.id, number],
+        |row| {
+            Ok(StoredIssue {
+                issue: issue_from_row(row)?,
+                author_account_id: row.get(9)?,
+            })
+        },
+    );
+    match result {
+        Ok(issue) => Ok(issue),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Err(StoreError::IssueNotFound(
+            owner.to_owned(),
+            slug.to_owned(),
+            number,
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn issue_mutation_context(
+    connection: &Connection,
+    owner: &str,
+    repository: &str,
+    number: i64,
+    actor: &str,
+) -> Result<(RepositoryIssueAccess, StoredIssue), StoreError> {
+    let access = repository_issue_access(connection, owner, repository, Some(actor))?;
+    if !access.can_read() {
+        return Err(StoreError::IssueHidden);
+    }
+    if access.active_actor_id.is_none() {
+        return Err(StoreError::IssueDenied);
+    }
+    let issue = find_issue(connection, &access.repository, owner, repository, number)?;
+    Ok((access, issue))
+}
+
+fn issue_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IssueRecord> {
+    Ok(IssueRecord {
+        id: row.get(0)?,
+        number: row.get(1)?,
+        title: row.get(2)?,
+        body: row.get(3)?,
+        state: row.get(4)?,
+        author: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        closed_at: row.get(8)?,
+    })
+}
+
+fn issue_names(
+    connection: &Connection,
+    sql: &str,
+    issue_id: &str,
+) -> Result<Vec<String>, StoreError> {
+    let mut statement = connection.prepare(sql)?;
+    statement
+        .query_map([issue_id], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn insert_issue_event(
+    transaction: &rusqlite::Transaction<'_>,
+    repository_id: &str,
+    issue_id: &str,
+    actor: &str,
+    created_at: i64,
+    event: &event::VersionedEvent,
+) -> Result<(), StoreError> {
+    insert_domain_event(
+        transaction,
+        &NewDomainEvent {
+            repository_id,
+            source_intent_id: None,
+            source_ordinal: None,
+            issue_id: Some(issue_id),
+            event,
+            actor,
+            ref_name: None,
+            old_target: None,
+            new_target: None,
+            created_at,
+        },
+    )
+}
+
 struct NewDomainEvent<'a> {
     repository_id: &'a str,
     source_intent_id: Option<&'a str>,
     source_ordinal: Option<i64>,
+    issue_id: Option<&'a str>,
     event: &'a event::VersionedEvent,
     actor: &'a str,
     ref_name: Option<&'a [u8]>,
@@ -1821,19 +2544,20 @@ fn insert_domain_event(
     transaction.execute(
         "INSERT INTO repository_event
          (event_id, repository_id, sequence, source_intent_id, source_ordinal,
-          kind, actor, ref_name, old_target, new_target, payload_version, payload,
+          issue_id, kind, actor, ref_name, old_target, new_target, payload_version, payload,
           created_at)
          VALUES (
              lower(hex(randomblob(16))),
              ?1,
              (SELECT COALESCE(MAX(sequence), 0) + 1
               FROM repository_event WHERE repository_id = ?1),
-             ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+             ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
          )",
         rusqlite::params![
             event.repository_id,
             event.source_intent_id,
             event.source_ordinal,
+            event.issue_id,
             event.event.kind.as_str(),
             event.actor,
             event.ref_name,
@@ -1895,6 +2619,7 @@ fn insert_push_events(
             repository_id,
             source_intent_id: Some(intent_id),
             source_ordinal: Some(0),
+            issue_id: None,
             event: &push,
             actor,
             ref_name: None,
@@ -1947,6 +2672,7 @@ fn insert_push_events(
                 repository_id,
                 source_intent_id: Some(intent_id),
                 source_ordinal: Some(ordinal),
+                issue_id: None,
                 event: &event,
                 actor,
                 ref_name: Some(&old_name),

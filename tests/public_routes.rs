@@ -32,6 +32,9 @@ mod http;
 )]
 #[path = "../src/instance.rs"]
 mod instance;
+#[allow(dead_code, reason = "the public-route test does not mutate issues")]
+#[path = "../src/issue.rs"]
+mod issue;
 #[path = "../src/markdown.rs"]
 mod markdown;
 #[allow(dead_code, reason = "the public-route test uses anonymous policy only")]
@@ -59,8 +62,10 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use http::{PublicWebConfig, RunningWebServer};
+use sha2::{Digest, Sha256};
 use store::{InitialAdministrator, NewRepository, RepositoryOrigin, Store};
 use tempfile::TempDir;
 
@@ -563,6 +568,168 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
 
         server.shutdown().await.expect("stop the public Web server");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runs_the_complete_issue_workflow_without_javascript() {
+    let fixture = Fixture::new("sha1");
+    let database = fixture.instance.path().join(store::DATABASE_FILE);
+    let token = "11".repeat(32);
+    let csrf = "22".repeat(32);
+    let session_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    let csrf_hash: [u8; 32] = Sha256::digest(csrf.as_bytes()).into();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("read current time")
+        .as_secs() as i64;
+    let store = Store::open(&database).expect("open the issue fixture database");
+    store
+        .connection()
+        .execute(
+            "INSERT INTO web_session
+             (session_hash, csrf_hash, account_id, created_at, expires_at)
+             SELECT ?1, ?2, id, ?3, ?4 FROM account WHERE username = 'alice'",
+            rusqlite::params![session_hash, csrf_hash, now, now + 3600,],
+        )
+        .expect("create a Web session");
+    drop(store);
+
+    let server = RunningWebServer::start_public(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        PublicWebConfig {
+            instance_dir: fixture.instance.path().to_owned(),
+            http_clone_base: "http://127.0.0.1".to_owned(),
+            ssh_clone_base: "ssh://tit.example:2222".to_owned(),
+        },
+    )
+    .await
+    .expect("start the issue Web server");
+
+    let anonymous = request(server.address(), "GET", "/alice/example/issues", &[], &[]);
+    assert_eq!(anonymous.status, 200);
+    assert!(anonymous.text().contains("This repository has no issues."));
+    assert!(!anonymous.text().contains("Create an issue</h2>"));
+
+    let cookie = format!("tit-session={token}; tit-csrf={csrf}");
+    let headers = [
+        ("Content-Type", "application/x-www-form-urlencoded"),
+        ("Cookie", cookie.as_str()),
+    ];
+    let create = form(&[
+        ("csrf", &csrf),
+        ("title", "Unsafe rendering check"),
+        ("body", "**safe**\n\n<script>alert(1)</script>"),
+    ]);
+    let created = request(
+        server.address(),
+        "POST",
+        "/alice/example/issues",
+        &headers,
+        create.as_bytes(),
+    );
+    assert_eq!(created.status, 303);
+    assert_eq!(created.header("location"), "/alice/example/issues/1");
+
+    let detail = request(
+        server.address(),
+        "GET",
+        "/alice/example/issues/1",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    );
+    assert_eq!(detail.status, 200);
+    assert!(detail.text().contains("<strong>safe</strong>"));
+    assert!(!detail.text().contains("<script>"));
+    assert!(detail.text().contains("Add a comment"));
+    assert!(detail.text().contains("Organize this issue"));
+
+    let bad_csrf = form(&[("csrf", &"33".repeat(32)), ("state", "closed")]);
+    assert_eq!(
+        request(
+            server.address(),
+            "POST",
+            "/alice/example/issues/1/state",
+            &headers,
+            bad_csrf.as_bytes(),
+        )
+        .status,
+        403
+    );
+    for (path, fields) in [
+        (
+            "/alice/example/issues/1/comments",
+            vec![("csrf", csrf.as_str()), ("body", "A **comment**.")],
+        ),
+        (
+            "/alice/example/issues/1/edit",
+            vec![
+                ("csrf", csrf.as_str()),
+                ("title", "Edited issue"),
+                ("body", "Preserved _Markdown_."),
+            ],
+        ),
+        (
+            "/alice/example/issues/1/labels",
+            vec![
+                ("csrf", csrf.as_str()),
+                ("label", "bug"),
+                ("operation", "add"),
+            ],
+        ),
+        (
+            "/alice/example/issues/1/assignees",
+            vec![
+                ("csrf", csrf.as_str()),
+                ("assignee", "alice"),
+                ("operation", "add"),
+            ],
+        ),
+        (
+            "/alice/example/issues/1/state",
+            vec![("csrf", csrf.as_str()), ("state", "closed")],
+        ),
+        (
+            "/alice/example/issues/1/state",
+            vec![("csrf", csrf.as_str()), ("state", "open")],
+        ),
+    ] {
+        let response = request(
+            server.address(),
+            "POST",
+            path,
+            &headers,
+            form(&fields).as_bytes(),
+        );
+        assert_eq!(response.status, 303, "issue mutation failed at {path}");
+    }
+
+    let final_page = request(
+        server.address(),
+        "GET",
+        "/alice/example/issues/1",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    );
+    let final_text = final_page.text();
+    assert_eq!(final_page.status, 200);
+    assert!(final_text.contains("#1 Edited issue"));
+    assert!(final_text.contains("<em>Markdown</em>"));
+    assert!(final_text.contains("<strong>comment</strong>"));
+    assert!(final_text.contains("Labels: <span>bug</span>"));
+    assert!(final_text.contains("Assignees: <span>alice</span>"));
+    assert!(final_text.contains("issue-created"));
+    assert!(final_text.contains("issue-reopened"));
+    let feed = request(server.address(), "GET", "/alice/example/atom.xml", &[], &[]);
+    assert_eq!(feed.status, 200);
+    assert!(feed.text().contains("alice reopened #1"));
+
+    server.shutdown().await.expect("stop the issue Web server");
+}
+
+fn form(fields: &[(&str, &str)]) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.extend_pairs(fields.iter().copied());
+    serializer.finish()
 }
 
 fn assert_hidden(address: SocketAddr, head: &str) {

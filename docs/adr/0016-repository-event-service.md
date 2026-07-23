@@ -32,6 +32,9 @@ The stable version 1 event types are `repository-created`,
 `repository-imported`, `push`, `ref-created`, `ref-updated`, `ref-deleted`,
 `tag-created`, `tag-updated`, and `tag-deleted`.
 
+Architectural decision record 0017 adds the version 1 issue event types to this
+service.
+
 Store `payload_version` as an explicit schema value and store `version` in each
 JSON payload. The schema accepts only a JSON object whose inner version equals
 the column value. Limit a payload to 1 MiB. Version 1 repository payloads have

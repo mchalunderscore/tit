@@ -10,8 +10,8 @@ use std::{env, ffi::OsString, fs};
 
 use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
 use store::{
-    GitOperationIntent, InitialAdministrator, NewAuditEvent, NewRepository, NewRepositoryReference,
-    RepositoryOrigin, Store, StoreError,
+    GitOperationIntent, InitialAdministrator, IssueChange, NewAuditEvent, NewIssue, NewRepository,
+    NewRepositoryReference, RepositoryOrigin, Store, StoreError,
 };
 use tempfile::TempDir;
 
@@ -39,6 +39,14 @@ const V10_FIXTURE: &str = concat!(
     include_str!("../src/store/migrations/009_repository_authorization.sql"),
     include_str!("../src/store/migrations/010_audit_history.sql"),
     "PRAGMA user_version = 10;\n",
+);
+const V11_FIXTURE: &str = concat!(
+    include_str!("fixtures/sqlite/v7.sql"),
+    include_str!("../src/store/migrations/008_web_sessions.sql"),
+    include_str!("../src/store/migrations/009_repository_authorization.sql"),
+    include_str!("../src/store/migrations/010_audit_history.sql"),
+    include_str!("../src/store/migrations/011_domain_events.sql"),
+    "PRAGMA user_version = 11;\n",
 );
 
 fn database(directory: &TempDir, name: &str) -> std::path::PathBuf {
@@ -157,7 +165,7 @@ fn configures_connections_and_creates_the_current_schema() {
     let directory = TempDir::new().expect("create a temporary directory");
     let store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
 
-    assert_eq!(store.schema_version().expect("read the schema version"), 11);
+    assert_eq!(store.schema_version().expect("read the schema version"), 12);
     assert_eq!(
         store
             .connection()
@@ -678,6 +686,221 @@ fn creates_renames_archives_and_reads_owned_repositories() {
 }
 
 #[test]
+fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
+    let directory = TempDir::new().expect("create an issue fixture directory");
+    let mut store = Store::open(&database(&directory, "issues.sqlite")).expect("open the store");
+    store
+        .create_initial_administrator(&InitialAdministrator {
+            username: "alice",
+            canonical_key: "ssh-ed25519 AAAAalice",
+            fingerprint: "SHA256:alice",
+            recovery_hash: &[7; 32],
+            created_at: 1,
+        })
+        .expect("create the repository owner");
+    store
+        .connection()
+        .execute_batch(
+            "INSERT INTO account (id, username, is_administrator, state, created_at) VALUES
+                 (2, 'bob', 0, 'active', 1),
+                 (3, 'carol', 0, 'active', 1),
+                 (4, 'maintainer', 0, 'active', 1),
+                 (5, 'stranger', 0, 'active', 1),
+                 (6, 'suspended', 0, 'suspended', 1);",
+        )
+        .expect("create issue actors");
+    store
+        .create_repository(&NewRepository {
+            id: "00112233445566778899aabbccddeeff",
+            owner: "alice",
+            slug: "project",
+            object_format: "sha1",
+            created_at: 2,
+            origin: RepositoryOrigin::Created,
+            initial_references: &[],
+            actor: "alice",
+            correlation_id: "issue-repository",
+        })
+        .expect("create an issue repository");
+    store
+        .connection()
+        .execute_batch(
+            "UPDATE repository SET visibility = 'private';
+             INSERT INTO repository_collaborator
+                 (repository_id, account_id, role, created_at)
+             VALUES
+                 ('00112233445566778899aabbccddeeff', 2, 'reader', 3),
+                 ('00112233445566778899aabbccddeeff', 3, 'writer', 3),
+                 ('00112233445566778899aabbccddeeff', 4, 'maintainer', 3);",
+        )
+        .expect("configure issue roles");
+
+    let source = "Use **the supplied Markdown**.\n\n<script>do not run</script>";
+    let issue = store
+        .create_issue(&NewIssue {
+            owner: "alice",
+            repository: "project",
+            actor: "bob",
+            title: "Preserve Markdown",
+            body: source,
+            created_at: 4,
+        })
+        .expect("create an issue as a reader");
+    assert_eq!(issue.number, 1);
+    assert_eq!(issue.body, source);
+    let second = store
+        .create_issue(&NewIssue {
+            owner: "alice",
+            repository: "project",
+            actor: "carol",
+            title: "Second issue",
+            body: "",
+            created_at: 5,
+        })
+        .expect("allocate the next issue number");
+    assert_eq!(second.number, 2);
+    assert!(matches!(
+        store.issues("alice", "project", None),
+        Err(StoreError::IssueHidden)
+    ));
+    assert_eq!(
+        store
+            .issues("alice", "project", Some("bob"))
+            .expect("list private issues as a reader")
+            .1
+            .len(),
+        2
+    );
+    let change = |actor, changed_at| IssueChange {
+        owner: "alice",
+        repository: "project",
+        number: 1,
+        actor,
+        changed_at,
+    };
+    assert!(matches!(
+        store.edit_issue(
+            &IssueChange {
+                number: 2,
+                ..change("bob", 6)
+            },
+            "Reader edit",
+            "denied",
+        ),
+        Err(StoreError::IssueDenied)
+    ));
+    store
+        .edit_issue(&change("bob", 7), "Preserve the source", source)
+        .expect("edit an authored issue");
+    store
+        .edit_issue(&change("carol", 8), "Writer edit", source)
+        .expect("edit an issue as a writer");
+    let comment_id = store
+        .comment_issue(
+            "alice",
+            "project",
+            1,
+            "bob",
+            "A comment with [text](https://example.com).",
+            9,
+        )
+        .expect("comment as a reader");
+    assert_eq!(comment_id.len(), 32);
+    assert!(matches!(
+        store.set_issue_label(&change("bob", 10), "bug", true),
+        Err(StoreError::IssueDenied)
+    ));
+    store
+        .set_issue_label(&change("maintainer", 11), "bug", true)
+        .expect("label as a maintainer");
+    store
+        .set_issue_assignee(&change("maintainer", 12), "bob", true)
+        .expect("assign a repository reader");
+    assert!(matches!(
+        store.set_issue_assignee(&change("maintainer", 13), "stranger", true),
+        Err(StoreError::IssueAssigneeNotFound(username)) if username == "stranger"
+    ));
+    store
+        .set_issue_state("alice", "project", 1, "bob", "closed", 14)
+        .expect("close an authored issue");
+    store
+        .set_issue_state("alice", "project", 1, "carol", "open", 15)
+        .expect("reopen an issue as a writer");
+
+    let detail = store
+        .issue_detail("alice", "project", 1, Some("maintainer"))
+        .expect("read the issue timeline");
+    assert_eq!(detail.repository.slug, "project");
+    assert_eq!(detail.issue.title, "Writer edit");
+    assert_eq!(detail.issue.body, source);
+    assert_eq!(detail.issue.state, "open");
+    assert_eq!(detail.comments.len(), 1);
+    assert_eq!(detail.labels, ["bug"]);
+    assert_eq!(detail.assignees, ["bob"]);
+    assert!(detail.can_comment);
+    assert!(detail.can_edit);
+    assert!(detail.can_maintain);
+    assert_eq!(
+        detail
+            .timeline
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "issue-created",
+            "issue-edited",
+            "issue-edited",
+            "issue-commented",
+            "issue-labeled",
+            "issue-assigned",
+            "issue-closed",
+            "issue-reopened",
+        ]
+    );
+    assert!(
+        detail
+            .timeline
+            .windows(2)
+            .all(|events| events[0].sequence < events[1].sequence)
+    );
+    for event in &detail.timeline {
+        let payload: serde_json::Value =
+            serde_json::from_str(&event.payload).expect("parse an issue event payload");
+        assert_eq!(payload["version"], 1);
+        assert_eq!(payload["issue_id"], issue.id);
+        assert!(event.created_at >= 4);
+        assert!(!event.actor.is_empty());
+    }
+
+    let comments_before: i64 = store
+        .connection()
+        .query_row("SELECT count(*) FROM issue_comment", [], |row| row.get(0))
+        .expect("count issue comments");
+    store
+        .connection()
+        .execute_batch(
+            "CREATE TEMP TRIGGER reject_issue_event
+             BEFORE INSERT ON repository_event
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected issue event failure');
+             END;",
+        )
+        .expect("inject an issue event failure");
+    assert!(matches!(
+        store.comment_issue("alice", "project", 1, "bob", "must roll back", 16),
+        Err(StoreError::Sqlite(_))
+    ));
+    assert_eq!(
+        store
+            .connection()
+            .query_row("SELECT count(*) FROM issue_comment", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count comments after rollback"),
+        comments_before
+    );
+}
+
+#[test]
 fn enforces_constraints_and_supports_crud_and_indexed_scans() {
     let directory = TempDir::new().expect("create a temporary directory");
     let mut store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
@@ -1015,13 +1238,14 @@ fn migrates_each_committed_historical_fixture() {
         (V8_FIXTURE, 8),
         (V9_FIXTURE, 9),
         (V10_FIXTURE, 10),
+        (V11_FIXTURE, 11),
     ] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "tit.sqlite3");
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
-        assert_eq!(store.schema_version().expect("read the schema version"), 11);
+        assert_eq!(store.schema_version().expect("read the schema version"), 12);
         store.integrity_check().expect("check migrated integrity");
         let state: String = store
             .connection()
@@ -1094,7 +1318,7 @@ fn backfills_repository_events_when_version_five_is_migrated() {
 
 #[test]
 fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
-    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 11)] {
+    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 12)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "fixture.sqlite");
         create_fixture(&path, V1_FIXTURE);

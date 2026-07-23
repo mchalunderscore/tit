@@ -16,6 +16,7 @@ mod git;
 #[allow(dead_code, reason = "the server uses only part of the shared HTTP API")]
 mod http;
 mod instance;
+mod issue;
 mod markdown;
 mod policy;
 mod repository;

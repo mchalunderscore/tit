@@ -306,3 +306,17 @@ versioned JSON payloads, atomic metadata and event writes, Git operation
 recovery, feed parsing, and sequence pagination. Read the
 [repository event service architectural decision record](docs/adr/0016-repository-event-service.md)
 for the event type and payload contracts.
+
+## Milestone 4.2 gate
+
+Run the issue workflow gate:
+
+```text
+./scripts/check-m4-2
+```
+
+This command tests issue numbers, raw Markdown storage, safe rendering, roles,
+comments, state, labels, assignees, the event timeline, transaction rollback,
+sessions, CSRF checks, and forms that operate without JavaScript. Read the
+[issue workflow architectural decision record](docs/adr/0017-issue-workflow.md)
+for the permission and event contracts.

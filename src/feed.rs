@@ -143,8 +143,47 @@ fn event_title(event: &RepositoryEventRecord) -> String {
         "tag-created" => format!("Tag {reference} created"),
         "tag-updated" => format!("Tag {reference} updated"),
         "tag-deleted" => format!("Tag {reference} deleted"),
+        "issue-created" => issue_title(event, "opened"),
+        "issue-edited" => issue_title(event, "edited"),
+        "issue-commented" => issue_title(event, "commented on"),
+        "issue-closed" => issue_title(event, "closed"),
+        "issue-reopened" => issue_title(event, "reopened"),
+        "issue-labeled" => issue_value_title(event, "added label", "label"),
+        "issue-unlabeled" => issue_value_title(event, "removed label", "label"),
+        "issue-assigned" => issue_value_title(event, "assigned", "assignee"),
+        "issue-unassigned" => issue_value_title(event, "unassigned", "assignee"),
         _ => "Repository event".to_owned(),
     }
+}
+
+fn issue_title(event: &RepositoryEventRecord, action: &str) -> String {
+    let number = issue_payload(event)
+        .and_then(|payload| payload.get("number")?.as_i64())
+        .map(|number| format!("#{number}"))
+        .unwrap_or_else(|| "Issue".to_owned());
+    format!("{} {action} {number}", event.actor)
+}
+
+fn issue_value_title(event: &RepositoryEventRecord, action: &str, field: &str) -> String {
+    let Some(payload) = issue_payload(event) else {
+        return issue_title(event, action);
+    };
+    let number = payload
+        .get("number")
+        .and_then(serde_json::Value::as_i64)
+        .map(|number| format!("#{number}"))
+        .unwrap_or_else(|| "issue".to_owned());
+    let value = payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    format!("{} {action} {value} on {number}", event.actor)
+}
+
+fn issue_payload(event: &RepositoryEventRecord) -> Option<serde_json::Value> {
+    (event.payload_version == 1)
+        .then(|| serde_json::from_str(&event.payload).ok())
+        .flatten()
 }
 
 fn event_description(event: &RepositoryEventRecord) -> String {

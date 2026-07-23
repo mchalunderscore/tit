@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+./scripts/check
+cargo test --locked --release --test sqlite runs_the_issue_workflow_with_atomic_events_and_repository_roles
+cargo test --locked --release --test public_routes runs_the_complete_issue_workflow_without_javascript

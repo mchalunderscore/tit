@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Issues · {{ owner }}/{{ repository }} · tit{% endblock %}
+{% block content %}
+  <header class="repository-header">
+    <h1><a href="/{{ owner }}/{{ repository }}">{{ owner }}/{{ repository }}</a></h1>
+    <nav aria-label="Repository">
+      <a href="/{{ owner }}/{{ repository }}">Summary</a>
+      <a href="/{{ owner }}/{{ repository }}/refs">Refs</a>
+      <a href="/{{ owner }}/{{ repository }}/issues">Issues</a>
+      <a href="/{{ owner }}/{{ repository }}/atom.xml">Atom</a>
+      <a href="/{{ owner }}/{{ repository }}/rss.xml">RSS</a>
+    </nav>
+  </header>
+
+  <h2>Issues</h2>
+{% if issues.is_empty() %}
+  <p>This repository has no issues.</p>
+{% else %}
+  <ol class="issue-list">
+{% for issue in issues %}
+    <li><a href="/{{ owner }}/{{ repository }}/issues/{{ issue.number }}">#{{ issue.number }} {{ issue.title }}</a> — {{ issue.state }}, opened by {{ issue.author }}, updated <time>{{ issue.updated_at }}</time></li>
+{% endfor %}
+  </ol>
+{% endif %}
+
+{% if can_create %}
+  <section aria-labelledby="new-issue-heading">
+    <h2 id="new-issue-heading">Create an issue</h2>
+    <form method="post" action="/{{ owner }}/{{ repository }}/issues">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="field">
+        <label for="issue-title">Title</label>
+        <input id="issue-title" name="title" maxlength="200" required>
+      </div>
+      <div class="field">
+        <label for="issue-body">Description (Markdown)</label>
+        <textarea id="issue-body" name="body" maxlength="262144" rows="10"></textarea>
+      </div>
+      <button type="submit">Create issue</button>
+    </form>
+  </section>
+{% else %}
+  <p><a href="/login">Log in</a> to create an issue.</p>
+{% endif %}
+{% endblock %}

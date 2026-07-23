@@ -1,3 +1,4 @@
+mod issues;
 mod public;
 
 use std::net::SocketAddr;
@@ -20,6 +21,7 @@ use tokio::task::JoinHandle;
 use crate::account::{AccountError, AccountService};
 use crate::auth::validate_username;
 use crate::domain::repository::validate_slug;
+use crate::issue::IssueService;
 use crate::repository::{RepositoryService, RepositoryServiceError};
 use crate::session::{SessionError, WebLoginService};
 use crate::store::StoreError;
@@ -42,6 +44,7 @@ struct WebState {
     key_reloader: Option<AccountKeyReloader>,
     login: Option<WebLoginService>,
     repositories: Option<RepositoryService>,
+    issues: Option<IssueService>,
     secure_cookies: bool,
 }
 
@@ -74,6 +77,7 @@ impl RunningWebServer {
                 key_reloader: None,
                 login: None,
                 repositories: None,
+                issues: None,
                 secure_cookies: false,
             },
         )
@@ -109,6 +113,7 @@ impl RunningWebServer {
         let login = WebLoginService::new(database, &public_url)?;
         let public = PublicWeb::open(config, Arc::clone(&jobs))?;
         let repositories = RepositoryService::new(public.database(), public.repository_root());
+        let issues = IssueService::new(public.database());
         Self::start_with_state(
             address,
             WebState {
@@ -118,6 +123,7 @@ impl RunningWebServer {
                 key_reloader,
                 login: Some(login),
                 repositories: Some(repositories),
+                issues: Some(issues),
                 secure_cookies,
             },
         )
@@ -161,15 +167,19 @@ pub(crate) fn router() -> Router {
         key_reloader: None,
         login: None,
         repositories: None,
+        issues: None,
         secure_cookies: false,
     })
 }
 
 fn router_with_state(state: WebState) -> Router {
-    let repository_routes = public::routes().layer(middleware::from_fn_with_state(
-        state.clone(),
-        repository_actor,
-    ));
+    let repository_routes =
+        issues::routes()
+            .merge(public::routes())
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                repository_actor,
+            ));
     Router::new()
         .route("/", get(home))
         .route("/go", get(go_to_repository))
