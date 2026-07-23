@@ -7,9 +7,7 @@ use std::sync::Arc;
 use askama::Template;
 use axum::Router;
 use axum::body::{Body, Bytes, HttpBody};
-use axum::extract::{
-    DefaultBodyLimit, Extension, Multipart, OriginalUri, RawQuery, Request, State,
-};
+use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -390,8 +388,18 @@ async fn login_verify_file(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
-    mut multipart: Multipart,
+    body: Body,
 ) -> Response {
+    let Some(content_type) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return login_error(&request_id.0, "", "The login response is not valid.");
+    };
+    let Ok(boundary) = multra::parse_boundary(content_type) else {
+        return login_error(&request_id.0, "", "The login response is not valid.");
+    };
+    let mut multipart = multra::Multipart::new(body.into_data_stream(), boundary);
     let mut username = None;
     let mut public_key = None;
     let mut challenge = None;

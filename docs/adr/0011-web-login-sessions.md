@@ -37,8 +37,9 @@ sessions in the same transaction as the privilege change.
 
 ## Failure and threat cases
 
-Login and signature forms have fixed body limits. Axum and `multer` parse the
-uploaded form within the 64-KiB limit. Challenge and SSHSIG parsing have the
+Login and signature forms have fixed body limits. Axum limits the request body,
+and `multra` parses the uploaded form as a stream within the 64-KiB limit.
+Challenge and SSHSIG parsing have the
 authentication limits from architectural decision record 0002. A bad
 identity, signature, expired challenge, and consumed challenge use a common Web
 UI error. The response does not disclose which input failed.
@@ -56,7 +57,8 @@ The session test signs with stock `ssh-keygen`, restarts the login service
 between issue and verification, rejects challenge replay and a bad CSRF token,
 checks the stored hashes, invalidates a session after key addition, and tests
 the function that ends all sessions. The executable test completes login and
-logout through HTTP. It also confirms CSRF rejection and session invalidation.
+logout through HTTP. It rejects an incorrect upload content type and malformed
+multipart content. It also confirms CSRF rejection and session invalidation.
 
 ## Consequences
 

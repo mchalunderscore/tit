@@ -145,6 +145,21 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     let upload_signature = sign_challenge(instance.path(), &private_key, upload_challenge);
     let upload_csrf_cookies = response_cookies(&upload_challenge_page);
     let upload_csrf = cookie_value(&upload_csrf_cookies, "tit-login-csrf");
+    let wrong_upload_type = http_form_with_headers(
+        http,
+        "/login/verify-file",
+        &[("signature-file", &upload_signature)],
+        &[("Cookie", &upload_csrf_cookies)],
+    );
+    assert!(wrong_upload_type.starts_with("HTTP/1.1 400"));
+    let malformed_upload = http_body(
+        http,
+        "/login/verify-file",
+        "multipart/form-data; boundary=tit-broken-boundary",
+        "--tit-broken-boundary\r\ninvalid",
+        &[("Cookie", &upload_csrf_cookies)],
+    );
+    assert!(malformed_upload.starts_with("HTTP/1.1 400"));
     let uploaded = http_multipart(
         http,
         "/login/verify-file",
@@ -502,6 +517,33 @@ fn http_multipart(
     stream
         .write_all(request.as_bytes())
         .expect("write a multipart HTTP form");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read an HTTP response");
+    response
+}
+
+fn http_body(
+    address: SocketAddr,
+    path: &str,
+    content_type: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> String {
+    let mut stream = TcpStream::connect(address).expect("connect to the HTTP server");
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    stream
+        .write_all(request.as_bytes())
+        .expect("write an HTTP request body");
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
