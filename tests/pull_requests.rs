@@ -448,6 +448,14 @@ impl Fixture {
                 .args(["init", "-q", "-b", "main", "--object-format", object_format])
                 .arg(&worktree),
         );
+        run(
+            &worktree,
+            Command::new("git").args(["config", "user.name", "Tit Test"]),
+        );
+        run(
+            &worktree,
+            Command::new("git").args(["config", "user.email", "tit@example.test"]),
+        );
         fs::write(worktree.join("README.md"), b"base\n").expect("write base content");
         git_commit(&worktree, "base");
         run(
