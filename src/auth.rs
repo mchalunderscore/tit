@@ -303,7 +303,7 @@ fn validate_signature_algorithm(key: &PublicKey, signature: &SshSig) -> Result<(
     }
 }
 
-fn validate_username(username: &str) -> Result<(), AuthError> {
+pub(crate) fn validate_username(username: &str) -> Result<(), AuthError> {
     let bytes = username.as_bytes();
     let valid_character = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
     if !(1..=40).contains(&bytes.len())
@@ -312,6 +312,10 @@ fn validate_username(username: &str) -> Result<(), AuthError> {
         || !bytes
             .iter()
             .all(|byte| valid_character(*byte) || *byte == b'-')
+        || matches!(
+            username,
+            "admin" | "api" | "assets" | "feeds" | "issues" | "setup"
+        )
     {
         return Err(AuthError::InvalidUsername);
     }

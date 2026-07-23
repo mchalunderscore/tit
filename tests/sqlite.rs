@@ -9,11 +9,12 @@ use std::time::{Duration, Instant};
 use std::{env, ffi::OsString, fs};
 
 use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
-use store::{GitOperationIntent, Store, StoreError};
+use store::{GitOperationIntent, InitialAdministrator, Store, StoreError};
 use tempfile::TempDir;
 
 const V1_FIXTURE: &str = include_str!("fixtures/sqlite/v1.sql");
 const V2_FIXTURE: &str = include_str!("fixtures/sqlite/v2.sql");
+const V3_FIXTURE: &str = include_str!("fixtures/sqlite/v3.sql");
 
 fn database(directory: &TempDir, name: &str) -> std::path::PathBuf {
     directory.path().join(name)
@@ -131,7 +132,7 @@ fn configures_connections_and_creates_the_current_schema() {
     let directory = TempDir::new().expect("create a temporary directory");
     let store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
 
-    assert_eq!(store.schema_version().expect("read the schema version"), 3);
+    assert_eq!(store.schema_version().expect("read the schema version"), 4);
     assert_eq!(
         store
             .connection()
@@ -231,6 +232,60 @@ fn persists_and_completes_git_operation_intents_with_their_events() {
             .incomplete_git_intents()
             .expect("list incomplete intents")
             .is_empty()
+    );
+}
+
+#[test]
+fn creates_only_one_initial_administrator_in_one_transaction() {
+    let directory = TempDir::new().expect("create a temporary directory");
+    let mut store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
+    let recovery_hash = [7_u8; 32];
+    let administrator = InitialAdministrator {
+        username: "alice",
+        canonical_key: "ssh-ed25519 AAAAexample",
+        fingerprint: "SHA256:example",
+        recovery_hash: &recovery_hash,
+        created_at: 10,
+    };
+    store
+        .create_initial_administrator(&administrator)
+        .expect("create the initial administrator");
+    let record: (String, i64, String, String, Vec<u8>) = store
+        .connection()
+        .query_row(
+            "SELECT account.username, account.is_administrator, account.state,
+                    ssh_public_key.fingerprint, recovery_credential.credential_hash
+             FROM account
+             JOIN ssh_public_key ON ssh_public_key.account_id = account.id
+             JOIN recovery_credential ON recovery_credential.account_id = account.id",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("read the initial administrator");
+    assert_eq!(record.0, "alice");
+    assert_eq!(record.1, 1);
+    assert_eq!(record.2, "active");
+    assert_eq!(record.3, "SHA256:example");
+    assert_eq!(record.4, recovery_hash);
+    assert!(matches!(
+        store.create_initial_administrator(&administrator),
+        Err(StoreError::AlreadyInitialized)
+    ));
+    assert_eq!(
+        store
+            .connection()
+            .query_row("SELECT count(*) FROM account", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count accounts"),
+        1
     );
 }
 
@@ -561,13 +616,13 @@ fn backs_up_a_consistent_database_while_writes_continue() {
 
 #[test]
 fn migrates_each_committed_historical_fixture() {
-    for (fixture, initial_version) in [(V1_FIXTURE, 1), (V2_FIXTURE, 2)] {
+    for (fixture, initial_version) in [(V1_FIXTURE, 1), (V2_FIXTURE, 2), (V3_FIXTURE, 3)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "tit.sqlite3");
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
-        assert_eq!(store.schema_version().expect("read the schema version"), 3);
+        assert_eq!(store.schema_version().expect("read the schema version"), 4);
         store.integrity_check().expect("check migrated integrity");
         let state: String = store
             .connection()
@@ -596,7 +651,7 @@ fn migrates_each_committed_historical_fixture() {
 
 #[test]
 fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
-    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 3)] {
+    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 4)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "fixture.sqlite");
         create_fixture(&path, V1_FIXTURE);

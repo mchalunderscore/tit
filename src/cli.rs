@@ -44,8 +44,24 @@ pub(crate) struct Cli {
     pub(crate) ssh_public_port: Option<u16>,
 }
 
-#[derive(Clone, Copy, Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub(crate) enum Command {
     /// Check the instance database
     Doctor,
+    /// Set up an uninitialized instance
+    Setup {
+        #[command(subcommand)]
+        command: SetupCommand,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum SetupCommand {
+    /// Create the initial administrator
+    Admin {
+        /// Use USERNAME for the administrator
+        username: String,
+        /// Use KEY as the administrator SSH public key
+        ssh_public_key: String,
+    },
 }

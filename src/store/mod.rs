@@ -9,20 +9,21 @@ use thiserror::Error;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
 )]
-const DATABASE_FILE: &str = "tit.sqlite3";
+pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
 #[allow(
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 3] = [
+const MIGRATIONS: [&str; 4] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
+    include_str!("migrations/004_identity.sql"),
 ];
 
 #[derive(Debug, Error)]
@@ -51,6 +52,8 @@ pub(crate) enum StoreError {
     },
     #[error("Git operation intent {0} is not in the required state")]
     IntentState(String),
+    #[error("the instance already has an administrator")]
+    AlreadyInitialized,
 }
 
 pub(crate) struct Store {
@@ -279,6 +282,58 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(records)
     }
+
+    pub(crate) fn create_initial_administrator(
+        &mut self,
+        administrator: &InitialAdministrator<'_>,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let accounts: i64 =
+            transaction.query_row("SELECT count(*) FROM account", [], |row| row.get(0))?;
+        if accounts != 0 {
+            return Err(StoreError::AlreadyInitialized);
+        }
+        transaction.execute(
+            "INSERT INTO account
+             (username, is_administrator, state, created_at)
+             VALUES (?1, 1, 'active', ?2)",
+            rusqlite::params![administrator.username, administrator.created_at],
+        )?;
+        let account_id = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO ssh_public_key
+             (account_id, canonical_key, fingerprint, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                account_id,
+                administrator.canonical_key,
+                administrator.fingerprint,
+                administrator.created_at,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO recovery_credential
+             (account_id, credential_hash, created_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                account_id,
+                administrator.recovery_hash,
+                administrator.created_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+pub(crate) struct InitialAdministrator<'a> {
+    pub(crate) username: &'a str,
+    pub(crate) canonical_key: &'a str,
+    pub(crate) fingerprint: &'a str,
+    pub(crate) recovery_hash: &'a [u8; 32],
+    pub(crate) created_at: i64,
 }
 
 pub(crate) struct GitOperationIntent<'a> {
