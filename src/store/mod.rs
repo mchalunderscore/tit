@@ -7,9 +7,11 @@ use rusqlite::backup::Backup;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use thiserror::Error;
 
+mod event;
+
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -19,7 +21,7 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 10] = [
+const MIGRATIONS: [&str; 11] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
@@ -30,6 +32,7 @@ const MIGRATIONS: [&str; 10] = [
     include_str!("migrations/008_web_sessions.sql"),
     include_str!("migrations/009_repository_authorization.sql"),
     include_str!("migrations/010_audit_history.sql"),
+    include_str!("migrations/011_domain_events.sql"),
 ];
 
 #[allow(
@@ -936,37 +939,49 @@ impl Store {
         );
         match result {
             Ok(1) => {
-                transaction.execute(
-                    "INSERT INTO repository_event
-                     (repository_id, kind, actor, created_at)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![
-                        repository.id,
-                        repository.origin.event_kind(),
-                        repository.owner,
-                        repository.created_at,
-                    ],
+                let event = event::repository(
+                    repository.origin.event_kind(),
+                    repository.owner,
+                    repository.slug,
+                    repository.object_format,
+                );
+                insert_domain_event(
+                    &transaction,
+                    &NewDomainEvent {
+                        repository_id: repository.id,
+                        source_intent_id: None,
+                        source_ordinal: None,
+                        event: &event,
+                        actor: repository.owner,
+                        ref_name: None,
+                        old_target: None,
+                        new_target: None,
+                        created_at: repository.created_at,
+                    },
                 )?;
                 for reference in repository.initial_references {
                     let kind = if reference.name.starts_with(b"refs/tags/") {
-                        "tag-created"
+                        event::EventKind::TagCreated
                     } else if reference.name.starts_with(b"refs/heads/") {
-                        "ref-created"
+                        event::EventKind::RefCreated
                     } else {
                         return Err(StoreError::EventPayload);
                     };
-                    transaction.execute(
-                        "INSERT INTO repository_event
-                         (repository_id, kind, actor, ref_name, new_target, created_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        rusqlite::params![
-                            repository.id,
-                            kind,
-                            repository.owner,
-                            reference.name,
-                            reference.target,
-                            repository.created_at,
-                        ],
+                    let event =
+                        event::reference(kind, &reference.name, None, Some(&reference.target));
+                    insert_domain_event(
+                        &transaction,
+                        &NewDomainEvent {
+                            repository_id: repository.id,
+                            source_intent_id: None,
+                            source_ordinal: None,
+                            event: &event,
+                            actor: repository.owner,
+                            ref_name: Some(&reference.name),
+                            old_target: None,
+                            new_target: Some(&reference.target),
+                            created_at: repository.created_at,
+                        },
                     )?;
                 }
                 let target = format!("{}/{}", repository.owner, repository.slug);
@@ -1487,22 +1502,26 @@ impl Store {
     ) -> Result<(RepositoryRecord, Vec<RepositoryEventRecord>), StoreError> {
         let limit = i64::try_from(limit).map_err(|_| StoreError::EventLimit)?;
         let mut statement = self.connection.prepare(
-            "SELECT id, kind, actor, ref_name, old_target, new_target, created_at
+            "SELECT event_id, sequence, kind, actor, ref_name, old_target, new_target,
+                    payload_version, payload, created_at
              FROM repository_event
-             WHERE repository_id = ?1 AND (?2 IS NULL OR id < ?2)
-             ORDER BY id DESC
+             WHERE repository_id = ?1 AND (?2 IS NULL OR sequence < ?2)
+             ORDER BY sequence DESC
              LIMIT ?3",
         )?;
         let events = statement
             .query_map(rusqlite::params![repository.id, before, limit], |row| {
                 Ok(RepositoryEventRecord {
-                    id: row.get(0)?,
-                    kind: row.get(1)?,
-                    actor: row.get(2)?,
-                    ref_name: row.get(3)?,
-                    old_target: row.get(4)?,
-                    new_target: row.get(5)?,
-                    created_at: row.get(6)?,
+                    event_id: row.get(0)?,
+                    sequence: row.get(1)?,
+                    kind: row.get(2)?,
+                    actor: row.get(3)?,
+                    ref_name: row.get(4)?,
+                    old_target: row.get(5)?,
+                    new_target: row.get(6)?,
+                    payload_version: row.get(7)?,
+                    payload: row.get(8)?,
+                    created_at: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1616,10 +1635,10 @@ pub(crate) enum RepositoryOrigin {
 }
 
 impl RepositoryOrigin {
-    fn event_kind(self) -> &'static str {
+    fn event_kind(self) -> event::EventKind {
         match self {
-            Self::Created => "repository-created",
-            Self::Imported => "repository-imported",
+            Self::Created => event::EventKind::RepositoryCreated,
+            Self::Imported => event::EventKind::RepositoryImported,
         }
     }
 
@@ -1672,12 +1691,15 @@ pub(crate) struct ActiveSshIdentity {
     reason = "some integration tests import storage without public event pages"
 )]
 pub(crate) struct RepositoryEventRecord {
-    pub(crate) id: i64,
+    pub(crate) event_id: String,
+    pub(crate) sequence: i64,
     pub(crate) kind: String,
     pub(crate) actor: String,
     pub(crate) ref_name: Option<Vec<u8>>,
     pub(crate) old_target: Option<String>,
     pub(crate) new_target: Option<String>,
+    pub(crate) payload_version: i64,
+    pub(crate) payload: String,
     pub(crate) created_at: i64,
 }
 
@@ -1780,6 +1802,51 @@ fn insert_audit_event(
     Ok(())
 }
 
+struct NewDomainEvent<'a> {
+    repository_id: &'a str,
+    source_intent_id: Option<&'a str>,
+    source_ordinal: Option<i64>,
+    event: &'a event::VersionedEvent,
+    actor: &'a str,
+    ref_name: Option<&'a [u8]>,
+    old_target: Option<&'a str>,
+    new_target: Option<&'a str>,
+    created_at: i64,
+}
+
+fn insert_domain_event(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &NewDomainEvent<'_>,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO repository_event
+         (event_id, repository_id, sequence, source_intent_id, source_ordinal,
+          kind, actor, ref_name, old_target, new_target, payload_version, payload,
+          created_at)
+         VALUES (
+             lower(hex(randomblob(16))),
+             ?1,
+             (SELECT COALESCE(MAX(sequence), 0) + 1
+              FROM repository_event WHERE repository_id = ?1),
+             ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+         )",
+        rusqlite::params![
+            event.repository_id,
+            event.source_intent_id,
+            event.source_ordinal,
+            event.event.kind.as_str(),
+            event.actor,
+            event.ref_name,
+            event.old_target,
+            event.new_target,
+            event::PAYLOAD_VERSION,
+            event.event.payload,
+            event.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
 fn end_sessions(
     transaction: &rusqlite::Transaction<'_>,
     account_id: i64,
@@ -1821,51 +1888,72 @@ fn insert_push_events(
     if initial.len() != proposed.len() {
         return Err(StoreError::EventPayload);
     }
-    transaction.execute(
-        "INSERT INTO repository_event
-         (repository_id, source_intent_id, source_ordinal, kind, actor, created_at)
-         VALUES (?1, ?2, 0, 'push', ?3, ?4)",
-        rusqlite::params![repository_id, intent_id, actor, created_at],
+    let push = event::push(intent_id);
+    insert_domain_event(
+        transaction,
+        &NewDomainEvent {
+            repository_id,
+            source_intent_id: Some(intent_id),
+            source_ordinal: Some(0),
+            event: &push,
+            actor,
+            ref_name: None,
+            old_target: None,
+            new_target: None,
+            created_at,
+        },
     )?;
     for (index, ((old, old_name), (new, new_name))) in initial.into_iter().zip(proposed).enumerate()
     {
         if old_name != new_name || (is_null_id(&old) && is_null_id(&new)) {
             return Err(StoreError::EventPayload);
         }
-        let prefix = if old_name.starts_with(b"refs/tags/") {
-            "tag"
+        let tag = if old_name.starts_with(b"refs/tags/") {
+            true
         } else if old_name.starts_with(b"refs/heads/") {
-            "ref"
+            false
         } else {
             return Err(StoreError::EventPayload);
         };
-        let action = if is_null_id(&old) {
-            "created"
+        let kind = if is_null_id(&old) {
+            if tag {
+                event::EventKind::TagCreated
+            } else {
+                event::EventKind::RefCreated
+            }
         } else if is_null_id(&new) {
-            "deleted"
+            if tag {
+                event::EventKind::TagDeleted
+            } else {
+                event::EventKind::RefDeleted
+            }
+        } else if tag {
+            event::EventKind::TagUpdated
         } else {
-            "updated"
+            event::EventKind::RefUpdated
         };
-        let kind = format!("{prefix}-{action}");
         let old_target = (!is_null_id(&old)).then_some(old);
         let new_target = (!is_null_id(&new)).then_some(new);
         let ordinal = i64::try_from(index + 1).map_err(|_| StoreError::EventPayload)?;
-        transaction.execute(
-            "INSERT INTO repository_event
-             (repository_id, source_intent_id, source_ordinal, kind, actor,
-              ref_name, old_target, new_target, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            rusqlite::params![
+        let event = event::reference(
+            kind,
+            &old_name,
+            old_target.as_deref(),
+            new_target.as_deref(),
+        );
+        insert_domain_event(
+            transaction,
+            &NewDomainEvent {
                 repository_id,
-                intent_id,
-                ordinal,
-                kind,
+                source_intent_id: Some(intent_id),
+                source_ordinal: Some(ordinal),
+                event: &event,
                 actor,
-                old_name,
-                old_target,
-                new_target,
+                ref_name: Some(&old_name),
+                old_target: old_target.as_deref(),
+                new_target: new_target.as_deref(),
                 created_at,
-            ],
+            },
         )?;
     }
     insert_audit_event(

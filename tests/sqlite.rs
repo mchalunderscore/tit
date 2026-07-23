@@ -33,6 +33,13 @@ const V9_FIXTURE: &str = concat!(
     include_str!("../src/store/migrations/009_repository_authorization.sql"),
     "PRAGMA user_version = 9;\n",
 );
+const V10_FIXTURE: &str = concat!(
+    include_str!("fixtures/sqlite/v7.sql"),
+    include_str!("../src/store/migrations/008_web_sessions.sql"),
+    include_str!("../src/store/migrations/009_repository_authorization.sql"),
+    include_str!("../src/store/migrations/010_audit_history.sql"),
+    "PRAGMA user_version = 10;\n",
+);
 
 fn database(directory: &TempDir, name: &str) -> std::path::PathBuf {
     directory.path().join(name)
@@ -150,7 +157,7 @@ fn configures_connections_and_creates_the_current_schema() {
     let directory = TempDir::new().expect("create a temporary directory");
     let store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
 
-    assert_eq!(store.schema_version().expect("read the schema version"), 10);
+    assert_eq!(store.schema_version().expect("read the schema version"), 11);
     assert_eq!(
         store
             .connection()
@@ -363,6 +370,109 @@ fn creates_renames_archives_and_reads_owned_repositories() {
     assert_eq!(imported_events[0].kind, "tag-created");
     assert_eq!(imported_events[1].kind, "ref-created");
     assert_eq!(imported_events[2].kind, "repository-imported");
+    assert_eq!(
+        imported_events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![3, 2, 1]
+    );
+    for event in &imported_events {
+        assert_eq!(event.event_id.len(), 32);
+        assert!(
+            event
+                .event_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(event.payload_version, 1);
+        let payload: serde_json::Value =
+            serde_json::from_str(&event.payload).expect("parse a versioned event payload");
+        assert_eq!(payload["version"], 1);
+    }
+    let imported_payload: serde_json::Value = serde_json::from_str(&imported_events[2].payload)
+        .expect("parse the repository import payload");
+    assert_eq!(imported_payload["owner"], "alice");
+    assert_eq!(imported_payload["repository"], "project");
+    assert_eq!(imported_payload["object_format"], "sha256");
+    let event_plan: String = store
+        .connection()
+        .query_row(
+            "EXPLAIN QUERY PLAN
+             SELECT event_id FROM repository_event
+             WHERE repository_id = ?1 AND sequence < ?2
+             ORDER BY sequence DESC LIMIT ?3",
+            rusqlite::params![repository.id, 100, 20],
+            |row| row.get(3),
+        )
+        .expect("read the repository event query plan");
+    assert!(
+        event_plan.contains("repository_event_feed"),
+        "query plan: {event_plan}"
+    );
+    let duplicate_sequence = store
+        .connection()
+        .execute(
+            "INSERT INTO repository_event
+             (event_id, repository_id, sequence, kind, actor, payload_version,
+              payload, created_at)
+             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', ?1, 1, 'push', 'alice',
+                     1, '{\"version\":1}', 20)",
+            [repository.id],
+        )
+        .expect_err("reject a duplicate repository event sequence");
+    assert_eq!(
+        duplicate_sequence.sqlite_error_code(),
+        Some(ErrorCode::ConstraintViolation)
+    );
+    let unversioned_payload = store
+        .connection()
+        .execute(
+            "INSERT INTO repository_event
+             (event_id, repository_id, sequence, kind, actor, payload_version,
+              payload, created_at)
+             VALUES ('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', ?1, 4, 'push', 'alice',
+                     1, '{}', 20)",
+            [repository.id],
+        )
+        .expect_err("reject an unversioned repository event payload");
+    assert_eq!(
+        unversioned_payload.sqlite_error_code(),
+        Some(ErrorCode::ConstraintViolation)
+    );
+    store
+        .connection()
+        .execute_batch(
+            "CREATE TEMP TRIGGER reject_repository_event
+             BEFORE INSERT ON repository_event
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected event failure');
+             END;",
+        )
+        .expect("install an event failure trigger");
+    let rejected_repository = NewRepository {
+        id: "11111111111111111111111111111111",
+        owner: "alice",
+        slug: "event-failure",
+        object_format: "sha1",
+        created_at: 20,
+        origin: RepositoryOrigin::Created,
+        initial_references: &[],
+        actor: "alice",
+        correlation_id: "test-event-failure",
+    };
+    assert!(matches!(
+        store.create_repository(&rejected_repository),
+        Err(StoreError::Sqlite(_))
+    ));
+    assert!(matches!(
+        store.repository("alice", "event-failure"),
+        Err(StoreError::RepositoryNotFound(_, _))
+    ));
+    store
+        .connection()
+        .execute_batch("DROP TRIGGER reject_repository_event;")
+        .expect("remove the event failure trigger");
 
     let initial = format!("{} refs/heads/main\n", "0".repeat(64));
     let proposed = format!("{} refs/heads/main\n", "a".repeat(64));
@@ -389,6 +499,33 @@ fn creates_renames_archives_and_reads_owned_repositories() {
         .expect("read events while a push is promoted");
     assert_eq!(promoted_events.len(), 3);
     store
+        .connection()
+        .execute_batch(
+            "CREATE TEMP TRIGGER reject_push_event
+             BEFORE INSERT ON repository_event
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected push event failure');
+             END;",
+        )
+        .expect("install a push event failure trigger");
+    assert!(matches!(
+        store.complete_git_intent(push.id),
+        Err(StoreError::Sqlite(_))
+    ));
+    assert!(
+        !store
+            .git_intent_completed(push.id)
+            .expect("read the rolled-back intent state")
+    );
+    let (_, rolled_back_events) = store
+        .public_repository_events("alice", "project", None, 10)
+        .expect("read events after the failed completion");
+    assert_eq!(rolled_back_events.len(), 3);
+    store
+        .connection()
+        .execute_batch("DROP TRIGGER reject_push_event;")
+        .expect("remove the push event failure trigger");
+    store
         .complete_git_intent(push.id)
         .expect("complete a managed push");
     assert!(
@@ -400,12 +537,49 @@ fn creates_renames_archives_and_reads_owned_repositories() {
         .public_repository_events("alice", "project", None, 10)
         .expect("read pushed repository events");
     assert_eq!(pushed_events.len(), 5);
+    assert_eq!(
+        pushed_events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![5, 4, 3, 2, 1]
+    );
     assert_eq!(pushed_events[0].kind, "ref-created");
     assert_eq!(
         pushed_events[0].new_target.as_deref(),
         Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     );
     assert_eq!(pushed_events[1].kind, "push");
+    let push_payload: serde_json::Value =
+        serde_json::from_str(&pushed_events[1].payload).expect("parse the push payload");
+    assert_eq!(push_payload["operation_id"], push.id);
+    let (_, older_events) = store
+        .public_repository_events("alice", "project", Some(4), 10)
+        .expect("read events before a repository sequence");
+    assert_eq!(
+        older_events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![3, 2, 1]
+    );
+    let event_ids = pushed_events
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect::<Vec<_>>();
+    let reopened = Store::open(&database(&directory, "store.sqlite"))
+        .expect("reopen the repository event store");
+    let (_, reopened_events) = reopened
+        .public_repository_events("alice", "project", None, 10)
+        .expect("read repository events after a reopen");
+    assert_eq!(
+        reopened_events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<Vec<_>>(),
+        event_ids
+    );
+    drop(reopened);
     let audits = store.audit_events(10).expect("read audit history");
     assert_eq!(audits.len(), 2);
     assert_eq!(audits[0].action, "ref.update");
@@ -459,6 +633,10 @@ fn creates_renames_archives_and_reads_owned_repositories() {
         store.create_repository(&missing_owner),
         Err(StoreError::AccountNotFound(owner)) if owner == "bob"
     ));
+    let (_, unchanged_events) = store
+        .public_repository_events("alice", "project", None, 10)
+        .expect("read events after rejected repository mutations");
+    assert_eq!(unchanged_events.len(), 5);
 
     store
         .rename_repository(
@@ -836,13 +1014,14 @@ fn migrates_each_committed_historical_fixture() {
         (V7_FIXTURE, 7),
         (V8_FIXTURE, 8),
         (V9_FIXTURE, 9),
+        (V10_FIXTURE, 10),
     ] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "tit.sqlite3");
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
-        assert_eq!(store.schema_version().expect("read the schema version"), 10);
+        assert_eq!(store.schema_version().expect("read the schema version"), 11);
         store.integrity_check().expect("check migrated integrity");
         let state: String = store
             .connection()
@@ -903,12 +1082,19 @@ fn backfills_repository_events_when_version_five_is_migrated() {
         .expect("read the backfilled event");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].kind, "repository-created");
+    assert_eq!(events[0].sequence, 1);
+    assert_eq!(events[0].payload_version, 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&events[0].payload)
+            .expect("parse the backfilled event payload")["version"],
+        1
+    );
     assert_eq!(events[0].created_at, 2);
 }
 
 #[test]
 fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
-    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 10)] {
+    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 11)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "fixture.sqlite");
         create_fixture(&path, V1_FIXTURE);

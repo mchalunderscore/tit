@@ -173,8 +173,15 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
                 .connection()
                 .execute(
                     "INSERT INTO repository_event
-                     (repository_id, kind, actor, created_at)
-                     VALUES (?1, 'push', ?2, ?3)",
+                     (event_id, repository_id, sequence, kind, actor, payload_version,
+                      payload, created_at)
+                     VALUES (
+                         lower(hex(randomblob(16))),
+                         ?1,
+                         (SELECT COALESCE(MAX(sequence), 0) + 1
+                          FROM repository_event WHERE repository_id = ?1),
+                         'push', ?2, 1, '{\"version\":1}', ?3
+                     )",
                     rusqlite::params![fixture.repository_id, actor, timestamp],
                 )
                 .expect("insert a page fixture event");

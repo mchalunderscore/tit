@@ -19,7 +19,8 @@ const CURRENT_DATABASE: &str = concat!(
     include_str!("../src/store/migrations/008_web_sessions.sql"),
     include_str!("../src/store/migrations/009_repository_authorization.sql"),
     include_str!("../src/store/migrations/010_audit_history.sql"),
-    "PRAGMA user_version = 10;\n",
+    include_str!("../src/store/migrations/011_domain_events.sql"),
+    "PRAGMA user_version = 11;\n",
 );
 
 #[test]

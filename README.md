@@ -292,3 +292,17 @@ Run the complete account and authorization gate:
 This command tests one Web and SSH identity, account recovery, key revocation,
 sessions, repository roles, private route isolation, push policy, audit history,
 and repository creation from the Web UI and SSH.
+
+## Milestone 4.1 gate
+
+Run the repository event service gate:
+
+```text
+./scripts/check-m4-1
+```
+
+This command tests event migration, random public IDs, repository sequences,
+versioned JSON payloads, atomic metadata and event writes, Git operation
+recovery, feed parsing, and sequence pagination. Read the
+[repository event service architectural decision record](docs/adr/0016-repository-event-service.md)
+for the event type and payload contracts.

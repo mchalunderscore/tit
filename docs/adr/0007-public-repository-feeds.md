@@ -1,6 +1,6 @@
 # Architectural decision record 0007: public repository feeds
 
-Status: Accepted
+Status: Superseded by architectural decision record 0016
 
 Date: 2026-07-23
 

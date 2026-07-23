@@ -333,7 +333,7 @@ async fn feed_response(
     let has_next = events.len() > PAGE_SIZE;
     events.truncate(PAGE_SIZE);
     let next_before = has_next
-        .then(|| events.last().map(|event| event.id))
+        .then(|| events.last().map(|event| event.sequence))
         .flatten();
     let name = match format {
         FeedFormat::Atom => "atom.xml",

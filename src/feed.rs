@@ -50,7 +50,7 @@ impl FeedPage<'_> {
         }
         for event in self.events {
             output.push_str("<entry>\n");
-            element(&mut output, "id", &event_id(&self.repository.id, event.id))?;
+            element(&mut output, "id", &event_id(&event.event_id))?;
             element(&mut output, "title", &event_title(event))?;
             element(&mut output, "updated", &atom_date(event.created_at)?)?;
             empty_link(&mut output, "alternate", &repository_url)?;
@@ -92,7 +92,7 @@ impl FeedPage<'_> {
             element(&mut output, "title", &event_title(event))?;
             element(&mut output, "link", &repository_url)?;
             write!(output, "<guid isPermaLink=\"false\">")?;
-            escape_xml(&event_id(&self.repository.id, event.id), &mut output)?;
+            escape_xml(&event_id(&event.event_id), &mut output)?;
             output.push_str("</guid>\n");
             element(&mut output, "pubDate", &rss_date(event.created_at)?)?;
             element(&mut output, "description", &event_description(event))?;
@@ -123,8 +123,8 @@ impl FeedPage<'_> {
     }
 }
 
-fn event_id(repository_id: &str, event_id: i64) -> String {
-    format!("urn:tit:event:{repository_id}:{event_id}")
+fn event_id(event_id: &str) -> String {
+    format!("urn:tit:event:{event_id}")
 }
 
 fn event_title(event: &RepositoryEventRecord) -> String {
