@@ -96,7 +96,7 @@ impl AccountService {
 
     pub(crate) fn suspend(&self, username: &str, suspended: bool) -> Result<(), AccountError> {
         validate_username(username)?;
-        Store::open(&self.database)?.suspend_account(username, suspended)?;
+        Store::open(&self.database)?.suspend_account(username, suspended, now()?)?;
         Ok(())
     }
 

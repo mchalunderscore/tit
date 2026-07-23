@@ -21,6 +21,7 @@ const V3_FIXTURE: &str = include_str!("fixtures/sqlite/v3.sql");
 const V4_FIXTURE: &str = include_str!("fixtures/sqlite/v4.sql");
 const V5_FIXTURE: &str = include_str!("fixtures/sqlite/v5.sql");
 const V6_FIXTURE: &str = include_str!("fixtures/sqlite/v6.sql");
+const V7_FIXTURE: &str = include_str!("fixtures/sqlite/v7.sql");
 
 fn database(directory: &TempDir, name: &str) -> std::path::PathBuf {
     directory.path().join(name)
@@ -138,7 +139,7 @@ fn configures_connections_and_creates_the_current_schema() {
     let directory = TempDir::new().expect("create a temporary directory");
     let store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
 
-    assert_eq!(store.schema_version().expect("read the schema version"), 7);
+    assert_eq!(store.schema_version().expect("read the schema version"), 8);
     assert_eq!(
         store
             .connection()
@@ -774,13 +775,14 @@ fn migrates_each_committed_historical_fixture() {
         (V4_FIXTURE, 4),
         (V5_FIXTURE, 5),
         (V6_FIXTURE, 6),
+        (V7_FIXTURE, 7),
     ] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "tit.sqlite3");
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
-        assert_eq!(store.schema_version().expect("read the schema version"), 7);
+        assert_eq!(store.schema_version().expect("read the schema version"), 8);
         store.integrity_check().expect("check migrated integrity");
         let state: String = store
             .connection()
@@ -846,7 +848,7 @@ fn backfills_repository_events_when_version_five_is_migrated() {
 
 #[test]
 fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
-    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 7)] {
+    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 8)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "fixture.sqlite");
         create_fixture(&path, V1_FIXTURE);

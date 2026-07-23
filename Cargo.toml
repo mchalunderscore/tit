@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 ammonia = "4.1.4"
 askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "original-uri", "query", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "multipart", "original-uri", "query", "tokio"] }
 clap = { version = "4.6", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 gix = { version = "0.84", default-features = false, features = ["blame", "parallel", "sha1", "sha256"] }
 gix-pack = { version = "0.71", default-features = false, features = ["generate", "sha1", "sha256", "streaming-input"] }

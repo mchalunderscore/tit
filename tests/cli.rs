@@ -12,11 +12,12 @@ use support::{
 };
 use tempfile::TempDir;
 
-const V7_DATABASE: &str = concat!(
+const V8_DATABASE: &str = concat!(
     include_str!("fixtures/sqlite/v5.sql"),
     include_str!("../src/store/migrations/006_repository_events.sql"),
     include_str!("../src/store/migrations/007_account_lifecycle.sql"),
-    "PRAGMA user_version = 7;\n",
+    include_str!("../src/store/migrations/008_web_sessions.sql"),
+    "PRAGMA user_version = 8;\n",
 );
 
 #[test]
@@ -72,7 +73,7 @@ fn doctor_checks_an_existing_current_database() {
     let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
         .expect("open the instance database");
     database
-        .execute_batch(V7_DATABASE)
+        .execute_batch(V8_DATABASE)
         .expect("create the current database");
     drop(database);
 
@@ -124,7 +125,7 @@ fn doctor_reports_a_foreign_key_violation() {
     let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
         .expect("open the instance database");
     database
-        .execute_batch(V7_DATABASE)
+        .execute_batch(V8_DATABASE)
         .expect("create the current database");
     database
         .pragma_update(None, "foreign_keys", false)

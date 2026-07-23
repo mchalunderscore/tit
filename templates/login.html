@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Log in · tit{% endblock %}
+{% block content %}
+  <h1>Log in</h1>
+  <p>Enter your username and one active SSH public key.</p>
+{% if has_error %}
+  <p class="error" role="alert">{{ error }}</p>
+{% endif %}
+  <form action="/login" method="post">
+    <div class="field">
+      <label for="username">Username</label>
+      <input id="username" name="username" value="{{ username }}" required autocomplete="username" autocapitalize="none" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="public-key">SSH public key</label>
+      <textarea id="public-key" name="public-key" required rows="5" autocomplete="off" autocapitalize="none" spellcheck="false"></textarea>
+    </div>
+    <button type="submit">Create challenge</button>
+  </form>
+{% endblock %}

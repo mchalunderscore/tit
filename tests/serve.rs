@@ -74,6 +74,91 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         0o600
     );
 
+    let login_challenge = http_form(
+        http,
+        "/login",
+        &[("username", "alice"), ("public-key", public_key.trim())],
+    );
+    assert!(login_challenge.starts_with("HTTP/1.1 200"));
+    let challenge = between(
+        &login_challenge,
+        "<textarea id=\"challenge-display\" readonly rows=\"10\">",
+        "</textarea>",
+    );
+    let signature = sign_challenge(instance.path(), &private_key, challenge);
+    let login_csrf_cookies = response_cookies(&login_challenge);
+    let login_csrf = cookie_value(&login_csrf_cookies, "tit-login-csrf");
+    let rejected_login = http_form_with_headers(
+        http,
+        "/login/verify",
+        &[
+            ("username", "alice"),
+            ("public-key", public_key.trim()),
+            ("challenge", challenge),
+            ("signature", &signature),
+            ("login-csrf", &"0".repeat(64)),
+        ],
+        &[("Cookie", &login_csrf_cookies)],
+    );
+    assert!(rejected_login.starts_with("HTTP/1.1 400"));
+    let login = http_form_with_headers(
+        http,
+        "/login/verify",
+        &[
+            ("username", "alice"),
+            ("public-key", public_key.trim()),
+            ("challenge", challenge),
+            ("signature", &signature),
+            ("login-csrf", login_csrf),
+        ],
+        &[("Cookie", &login_csrf_cookies)],
+    );
+    assert!(login.starts_with("HTTP/1.1 303"), "{login}");
+    let cookies = response_cookies(&login);
+    let account = http_get_with_headers(http, "/account", &[("Cookie", &cookies)]);
+    assert!(account.starts_with("HTTP/1.1 200"));
+    assert!(account.contains("<dd>alice</dd>"));
+    let csrf = cookie_value(&cookies, "tit-csrf");
+    let rejected_logout = http_form_with_headers(
+        http,
+        "/logout",
+        &[("csrf", &"0".repeat(64))],
+        &[("Cookie", &cookies)],
+    );
+    assert!(rejected_logout.starts_with("HTTP/1.1 403"));
+    let logout =
+        http_form_with_headers(http, "/logout", &[("csrf", csrf)], &[("Cookie", &cookies)]);
+    assert!(logout.starts_with("HTTP/1.1 303"));
+    let ended = http_get_with_headers(http, "/account", &[("Cookie", &cookies)]);
+    assert!(ended.starts_with("HTTP/1.1 303"));
+
+    let upload_challenge_page = http_form(
+        http,
+        "/login",
+        &[("username", "alice"), ("public-key", public_key.trim())],
+    );
+    let upload_challenge = between(
+        &upload_challenge_page,
+        "<textarea id=\"challenge-display\" readonly rows=\"10\">",
+        "</textarea>",
+    );
+    let upload_signature = sign_challenge(instance.path(), &private_key, upload_challenge);
+    let upload_csrf_cookies = response_cookies(&upload_challenge_page);
+    let upload_csrf = cookie_value(&upload_csrf_cookies, "tit-login-csrf");
+    let uploaded = http_multipart(
+        http,
+        "/login/verify-file",
+        &[
+            ("username", "alice"),
+            ("public-key", public_key.trim()),
+            ("challenge", upload_challenge),
+            ("signature-file", &upload_signature),
+            ("login-csrf", upload_csrf),
+        ],
+        &[("Cookie", &upload_csrf_cookies)],
+    );
+    assert!(uploaded.starts_with("HTTP/1.1 303"), "{uploaded}");
+
     let invitation_output = Command::new(env!("CARGO_BIN_EXE_tit"))
         .args([
             "--config",
@@ -316,12 +401,19 @@ fn wait_for_listener(address: SocketAddr, server: &mut ChildGuard) {
 }
 
 fn http_get(address: SocketAddr, path: &str) -> String {
+    http_get_with_headers(address, path, &[])
+}
+
+fn http_get_with_headers(address: SocketAddr, path: &str, headers: &[(&str, &str)]) -> String {
     let mut stream = TcpStream::connect(address).expect("connect to the HTTP server");
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
-    )
-    .expect("write an HTTP request");
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write an HTTP request");
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
@@ -330,21 +422,120 @@ fn http_get(address: SocketAddr, path: &str) -> String {
 }
 
 fn http_form(address: SocketAddr, path: &str, fields: &[(&str, &str)]) -> String {
+    http_form_with_headers(address, path, fields, &[])
+}
+
+fn http_form_with_headers(
+    address: SocketAddr,
+    path: &str,
+    fields: &[(&str, &str)],
+    headers: &[(&str, &str)],
+) -> String {
     let body = url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(fields.iter().copied())
         .finish();
     let mut stream = TcpStream::connect(address).expect("connect to the HTTP server");
-    write!(
-        stream,
-        "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
-    )
-    .expect("write an HTTP form");
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(&body);
+    stream
+        .write_all(request.as_bytes())
+        .expect("write an HTTP form");
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
         .expect("read an HTTP response");
     response
+}
+
+fn response_cookies(response: &str) -> String {
+    response
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+        .map(|(_, value)| {
+            value
+                .trim()
+                .split_once(';')
+                .map_or(value.trim(), |(cookie, _)| cookie)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn http_multipart(
+    address: SocketAddr,
+    path: &str,
+    fields: &[(&str, &str)],
+    headers: &[(&str, &str)],
+) -> String {
+    let boundary = "tit-test-boundary";
+    let mut body = String::new();
+    for (name, value) in fields {
+        if *name == "signature-file" {
+            body.push_str(&format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"signature.sig\"\r\nContent-Type: application/octet-stream\r\n\r\n{value}\r\n"
+            ));
+        } else {
+            body.push_str(&format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            ));
+        }
+    }
+    body.push_str(&format!("--{boundary}--\r\n"));
+    let mut stream = TcpStream::connect(address).expect("connect to the HTTP server");
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(&body);
+    stream
+        .write_all(request.as_bytes())
+        .expect("write a multipart HTTP form");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read an HTTP response");
+    response
+}
+
+fn cookie_value<'a>(cookies: &'a str, name: &str) -> &'a str {
+    cookies
+        .split("; ")
+        .find_map(|cookie| cookie.strip_prefix(&format!("{name}=")))
+        .expect("find the cookie")
+}
+
+fn sign_challenge(directory: &Path, private_key: &Path, challenge: &str) -> String {
+    let nonce = challenge
+        .lines()
+        .find_map(|line| line.strip_prefix("nonce="))
+        .expect("find the Web login nonce");
+    let path = directory.join(format!("web-login-{nonce}.challenge"));
+    fs::write(&path, challenge).expect("write the Web login challenge");
+    let output = Command::new("ssh-keygen")
+        .args(["-q", "-Y", "sign", "-f"])
+        .arg(private_key)
+        .args(["-n", "tit-auth"])
+        .arg(&path)
+        .output()
+        .expect("sign the Web login challenge");
+    assert!(
+        output.status.success(),
+        "cannot sign the Web login challenge: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::read_to_string(path.with_extension("challenge.sig")).expect("read the Web login signature")
 }
 
 fn between<'a>(value: &'a str, start: &str, end: &str) -> &'a str {

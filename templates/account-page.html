@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Account · tit{% endblock %}
+{% block content %}
+  <h1>Account</h1>
+  <dl>
+    <dt>Username</dt>
+    <dd>{{ username }}</dd>
+    <dt>Administrator</dt>
+    <dd>{% if administrator %}Yes{% else %}No{% endif %}</dd>
+  </dl>
+  <form action="/logout" method="post">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit">Log out all sessions</button>
+  </form>
+{% endblock %}

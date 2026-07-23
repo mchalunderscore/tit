@@ -159,3 +159,17 @@ This command tests invitation, signup, recovery, key revocation, account
 suspension, and the owner-only control socket. Read the
 [account lifecycle architectural decision record](docs/adr/0010-account-lifecycle.md)
 for the credential and failure behavior.
+
+## Milestone 3.2 gate
+
+Install stock OpenSSH. Then, run the Web login gate:
+
+```text
+./scripts/check-m3-2
+```
+
+Open `/login`, create a challenge, and sign its exact content with the
+`tit-auth` SSHSIG namespace. The Web UI accepts the pasted SSHSIG envelope and
+creates an opaque session. Read the
+[Web login architectural decision record](docs/adr/0011-web-login-sessions.md)
+for the session and CSRF behavior.

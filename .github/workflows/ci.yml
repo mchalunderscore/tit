@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
       - run: cargo --version
       - run: cargo test --locked --all-targets --all-features
-      - run: cargo test --locked --release --test auth --test ssh --test account_lifecycle
+      - run: cargo test --locked --release --test auth --test ssh --test account_lifecycle --test web_session
       - run: cargo test --locked --release --test git_repository --test git_http --test git_ssh --test public_routes --test serve
       - run: cargo test --locked --release --test git_reads measures_bounded_search_without_an_index -- --ignored --nocapture
       - run: cargo test --locked --release --test sqlite_workload -- --ignored --nocapture

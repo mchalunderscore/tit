@@ -64,19 +64,8 @@ pub(crate) struct LoginChallenges {
 
 impl LoginChallenges {
     pub(crate) fn new(public_url: &Url) -> Result<Self, AuthError> {
-        if !matches!(public_url.scheme(), "http" | "https")
-            || public_url.host().is_none()
-            || !public_url.username().is_empty()
-            || public_url.password().is_some()
-            || public_url.query().is_some()
-            || public_url.fragment().is_some()
-            || public_url.path() != "/"
-        {
-            return Err(AuthError::InvalidOrigin);
-        }
-
         Ok(Self {
-            origin: public_url.origin().ascii_serialization(),
+            origin: login_origin(public_url)?,
             nonces: Mutex::new(HashMap::new()),
         })
     }
@@ -97,11 +86,13 @@ impl LoginChallenges {
             .ok_or(AuthError::InvalidLifetime)?;
 
         let nonce = self.new_nonce(issued_at, expires_at)?;
-        Ok(format!(
-            "{CHALLENGE_HEADER}\npurpose={CHALLENGE_PURPOSE}\norigin={}\nusername={username}\nfingerprint={}\nnonce={}\nissued-at={issued_at}\nexpires-at={expires_at}\n",
-            self.origin,
-            key.fingerprint(),
-            encode_hex(&nonce)
+        Ok(format_login_challenge(
+            &self.origin,
+            username,
+            key,
+            &nonce,
+            issued_at,
+            expires_at,
         ))
     }
 
@@ -113,52 +104,25 @@ impl LoginChallenges {
         expected_key: &SshPublicKey,
         now: u64,
     ) -> Result<VerifiedLogin, AuthError> {
-        if challenge.len() > MAX_CHALLENGE_BYTES {
-            return Err(AuthError::InputTooLarge("login challenge"));
-        }
-        if signature.len() > MAX_SIGNATURE_BYTES {
-            return Err(AuthError::InputTooLarge("SSHSIG envelope"));
-        }
-        validate_username(expected_username)?;
-
-        let fields = ChallengeFields::parse(challenge)?;
-        if fields.origin != self.origin {
-            return Err(AuthError::WrongOrigin);
-        }
-        if fields.username != expected_username {
-            return Err(AuthError::WrongUsername);
-        }
-        if fields.fingerprint != expected_key.fingerprint() {
-            return Err(AuthError::WrongKey);
-        }
-        if fields.expires_at <= fields.issued_at
-            || fields.expires_at - fields.issued_at > MAX_CHALLENGE_LIFETIME_SECONDS
-        {
-            return Err(AuthError::InvalidLifetime);
-        }
-        if now < fields.issued_at || now > fields.expires_at {
-            return Err(AuthError::ExpiredChallenge);
-        }
-
-        let sshsig = SshSig::from_pem(signature).map_err(AuthError::SignatureEnvelope)?;
-        validate_signature_algorithm(expected_key.public_key(), &sshsig)?;
-        expected_key
-            .public_key()
-            .verify(SIGNATURE_NAMESPACE, challenge.as_bytes(), &sshsig)
-            .map_err(AuthError::SignatureVerification)?;
-
-        let nonce_hash = hash_nonce(&fields.nonce);
+        let verified = verify_login_challenge(
+            &self.origin,
+            challenge,
+            signature,
+            expected_username,
+            expected_key,
+            now,
+        )?;
         let mut nonces = self.nonces.lock().map_err(|_| AuthError::NonceStore)?;
-        match nonces.get(&nonce_hash) {
-            Some(stored_expiry) if *stored_expiry == fields.expires_at => {
-                nonces.remove(&nonce_hash);
+        match nonces.get(&verified.nonce_hash) {
+            Some(stored_expiry) if *stored_expiry == verified.expires_at => {
+                nonces.remove(&verified.nonce_hash);
             }
             _ => return Err(AuthError::ConsumedChallenge),
         }
 
         Ok(VerifiedLogin {
-            username: fields.username.to_owned(),
-            fingerprint: fields.fingerprint.to_owned(),
+            username: verified.username,
+            fingerprint: verified.fingerprint,
         })
     }
 
@@ -180,6 +144,89 @@ impl LoginChallenges {
             }
         }
     }
+}
+
+pub(crate) fn login_origin(public_url: &Url) -> Result<String, AuthError> {
+    if !matches!(public_url.scheme(), "http" | "https")
+        || public_url.host().is_none()
+        || !public_url.username().is_empty()
+        || public_url.password().is_some()
+        || public_url.query().is_some()
+        || public_url.fragment().is_some()
+        || public_url.path() != "/"
+    {
+        return Err(AuthError::InvalidOrigin);
+    }
+    Ok(public_url.origin().ascii_serialization())
+}
+
+pub(crate) fn format_login_challenge(
+    origin: &str,
+    username: &str,
+    key: &SshPublicKey,
+    nonce: &[u8; NONCE_BYTES],
+    issued_at: u64,
+    expires_at: u64,
+) -> String {
+    format!(
+        "{CHALLENGE_HEADER}\npurpose={CHALLENGE_PURPOSE}\norigin={origin}\nusername={username}\nfingerprint={}\nnonce={}\nissued-at={issued_at}\nexpires-at={expires_at}\n",
+        key.fingerprint(),
+        encode_hex(nonce)
+    )
+}
+
+pub(crate) fn verify_login_challenge(
+    origin: &str,
+    challenge: &str,
+    signature: &str,
+    expected_username: &str,
+    expected_key: &SshPublicKey,
+    now: u64,
+) -> Result<PersistentVerifiedLogin, AuthError> {
+    if challenge.len() > MAX_CHALLENGE_BYTES {
+        return Err(AuthError::InputTooLarge("login challenge"));
+    }
+    if signature.len() > MAX_SIGNATURE_BYTES {
+        return Err(AuthError::InputTooLarge("SSHSIG envelope"));
+    }
+    validate_username(expected_username)?;
+    let fields = ChallengeFields::parse(challenge)?;
+    if fields.origin != origin {
+        return Err(AuthError::WrongOrigin);
+    }
+    if fields.username != expected_username {
+        return Err(AuthError::WrongUsername);
+    }
+    if fields.fingerprint != expected_key.fingerprint() {
+        return Err(AuthError::WrongKey);
+    }
+    if fields.expires_at <= fields.issued_at
+        || fields.expires_at - fields.issued_at > MAX_CHALLENGE_LIFETIME_SECONDS
+    {
+        return Err(AuthError::InvalidLifetime);
+    }
+    if now < fields.issued_at || now > fields.expires_at {
+        return Err(AuthError::ExpiredChallenge);
+    }
+    let sshsig = SshSig::from_pem(signature).map_err(AuthError::SignatureEnvelope)?;
+    validate_signature_algorithm(expected_key.public_key(), &sshsig)?;
+    expected_key
+        .public_key()
+        .verify(SIGNATURE_NAMESPACE, challenge.as_bytes(), &sshsig)
+        .map_err(AuthError::SignatureVerification)?;
+    Ok(PersistentVerifiedLogin {
+        username: fields.username.to_owned(),
+        fingerprint: fields.fingerprint.to_owned(),
+        nonce_hash: hash_nonce(&fields.nonce),
+        expires_at: fields.expires_at,
+    })
+}
+
+pub(crate) struct PersistentVerifiedLogin {
+    pub(crate) username: String,
+    pub(crate) fingerprint: String,
+    pub(crate) nonce_hash: [u8; 32],
+    pub(crate) expires_at: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]

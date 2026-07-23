@@ -7,7 +7,9 @@ use std::sync::Arc;
 use askama::Template;
 use axum::Router;
 use axum::body::{Body, Bytes, HttpBody};
-use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, RawQuery, Request, State};
+use axum::extract::{
+    DefaultBodyLimit, Extension, Multipart, OriginalUri, RawQuery, Request, State,
+};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -20,6 +22,7 @@ use tokio::task::JoinHandle;
 use crate::account::{AccountError, AccountService};
 use crate::auth::validate_username;
 use crate::domain::repository::validate_slug;
+use crate::session::{SessionError, WebLoginService};
 use crate::store::StoreError;
 
 use self::public::PublicWeb;
@@ -28,6 +31,9 @@ const STYLE: &str = include_str!("../../assets/style.css");
 const MAX_LOCATION_QUERY_BYTES: usize = 512;
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 const MAX_BLOCKING_WEB_JOBS: usize = 8;
+const SESSION_COOKIE: &str = "tit-session";
+const CSRF_COOKIE: &str = "tit-csrf";
+const LOGIN_CSRF_COOKIE: &str = "tit-login-csrf";
 
 #[derive(Clone)]
 struct WebState {
@@ -35,6 +41,8 @@ struct WebState {
     accounts: Option<AccountService>,
     jobs: Arc<Semaphore>,
     key_reloader: Option<AccountKeyReloader>,
+    login: Option<WebLoginService>,
+    secure_cookies: bool,
 }
 
 type AccountKeyReloader = Arc<dyn Fn(&AccountService) -> Result<(), AccountError> + Send + Sync>;
@@ -61,6 +69,8 @@ impl RunningWebServer {
                 accounts: None,
                 jobs: Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS)),
                 key_reloader: None,
+                login: None,
+                secure_cookies: false,
             },
         )
         .await
@@ -87,7 +97,12 @@ impl RunningWebServer {
         key_reloader: Option<AccountKeyReloader>,
     ) -> Result<Self, WebError> {
         let jobs = Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS));
-        let accounts = AccountService::new(config.instance_dir.join(crate::store::DATABASE_FILE));
+        let database = config.instance_dir.join(crate::store::DATABASE_FILE);
+        let accounts = AccountService::new(database.clone());
+        let public_url = url::Url::parse(&format!("{}/", config.http_clone_base))
+            .map_err(WebError::CanonicalUrl)?;
+        let secure_cookies = public_url.scheme() == "https";
+        let login = WebLoginService::new(database, &public_url)?;
         let public = PublicWeb::open(config, Arc::clone(&jobs))?;
         Self::start_with_state(
             address,
@@ -96,6 +111,8 @@ impl RunningWebServer {
                 accounts: Some(accounts),
                 jobs,
                 key_reloader,
+                login: Some(login),
+                secure_cookies,
             },
         )
         .await
@@ -136,6 +153,8 @@ pub(crate) fn router() -> Router {
         accounts: None,
         jobs: Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS)),
         key_reloader: None,
+        login: None,
+        secure_cookies: false,
     })
 }
 
@@ -154,6 +173,25 @@ fn router_with_state(state: WebState) -> Router {
             get(recovery_form)
                 .post(recover)
                 .layer(DefaultBodyLimit::max(20 * 1024)),
+        )
+        .route(
+            "/login",
+            get(login_form)
+                .post(login_challenge)
+                .layer(DefaultBodyLimit::max(32 * 1024)),
+        )
+        .route(
+            "/login/verify",
+            axum::routing::post(login_verify).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/login/verify-file",
+            axum::routing::post(login_verify_file).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route("/account", get(account_page))
+        .route(
+            "/logout",
+            axum::routing::post(logout).layer(DefaultBodyLimit::max(1024)),
         )
         .route("/assets/style.css", get(style))
         .merge(public::routes())
@@ -249,6 +287,387 @@ async fn recover(
     })
     .await;
     account_result(result, &request_id.0, AccountFormKind::Recovery, &username)
+}
+
+async fn login_form(Extension(request_id): Extension<RequestId>) -> Response {
+    render(
+        StatusCode::OK,
+        &LoginTemplate {
+            request_id: &request_id.0,
+            username: "",
+            error: "",
+            has_error: false,
+        },
+    )
+}
+
+async fn login_challenge(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["username", "public-key"]) {
+        Ok(fields) => fields,
+        Err(()) => return login_error(&request_id.0, "", "The login request is not valid."),
+    };
+    let username = fields[0].clone();
+    let display_username = username.clone();
+    let public_key = fields[1].clone();
+    let secure = state.secure_cookies;
+    let result = login_job(state, move |login| login.issue(&username, &public_key)).await;
+    match result {
+        Ok(challenge) => {
+            let mut response = render(
+                StatusCode::OK,
+                &LoginChallengeTemplate {
+                    request_id: &request_id.0,
+                    username: &display_username,
+                    public_key: &challenge.public_key,
+                    challenge: &challenge.challenge,
+                    login_csrf: &challenge.login_csrf,
+                },
+            );
+            append_cookie(
+                response.headers_mut(),
+                LOGIN_CSRF_COOKIE,
+                &challenge.login_csrf,
+                true,
+                secure,
+                5 * 60,
+            );
+            response
+        }
+        Err(_) => login_error(
+            &request_id.0,
+            &display_username,
+            "The username or SSH public key is not valid.",
+        ),
+    }
+}
+
+async fn login_verify(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(
+        &headers,
+        &body,
+        &[
+            "username",
+            "public-key",
+            "challenge",
+            "signature",
+            "login-csrf",
+        ],
+    ) {
+        Ok(fields) => fields,
+        Err(()) => return login_error(&request_id.0, "", "The login response is not valid."),
+    };
+    let username = fields[0].clone();
+    let public_key = fields[1].clone();
+    let challenge = fields[2].clone();
+    let signature = fields[3].clone();
+    let login_csrf = fields[4].clone();
+    if cookie(&headers, LOGIN_CSRF_COOKIE).as_deref() != Some(login_csrf.as_str()) {
+        return login_error(&request_id.0, &username, "The login response is not valid.");
+    }
+    complete_login(
+        state,
+        &request_id.0,
+        username,
+        public_key,
+        challenge,
+        signature,
+        login_csrf,
+    )
+    .await
+}
+
+async fn login_verify_file(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    let mut username = None;
+    let mut public_key = None;
+    let mut challenge = None;
+    let mut signature = None;
+    let mut login_csrf = None;
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(_) => return login_error(&request_id.0, "", "The login response is not valid."),
+        };
+        match field.name() {
+            Some("username") if username.is_none() => username = field.text().await.ok(),
+            Some("public-key") if public_key.is_none() => public_key = field.text().await.ok(),
+            Some("challenge") if challenge.is_none() => challenge = field.text().await.ok(),
+            Some("signature-file") if signature.is_none() => signature = field.text().await.ok(),
+            Some("login-csrf") if login_csrf.is_none() => login_csrf = field.text().await.ok(),
+            _ => return login_error(&request_id.0, "", "The login response is not valid."),
+        }
+    }
+    let (Some(username), Some(public_key), Some(challenge), Some(signature), Some(login_csrf)) =
+        (username, public_key, challenge, signature, login_csrf)
+    else {
+        return login_error(&request_id.0, "", "The login response is not valid.");
+    };
+    if cookie(&headers, LOGIN_CSRF_COOKIE).as_deref() != Some(login_csrf.as_str()) {
+        return login_error(&request_id.0, &username, "The login response is not valid.");
+    }
+    complete_login(
+        state,
+        &request_id.0,
+        username,
+        public_key,
+        challenge,
+        signature,
+        login_csrf,
+    )
+    .await
+}
+
+async fn complete_login(
+    state: WebState,
+    request_id: &str,
+    username: String,
+    public_key: String,
+    challenge: String,
+    signature: String,
+    login_csrf: String,
+) -> Response {
+    let display_username = username.clone();
+    let secure = state.secure_cookies;
+    let result = login_job(state, move |login| {
+        login.verify(&username, &public_key, &challenge, &signature, &login_csrf)
+    })
+    .await;
+    match result {
+        Ok(session) => {
+            let mut response = Response::builder()
+                .status(StatusCode::SEE_OTHER)
+                .header(header::LOCATION, "/account")
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(Body::empty())
+                .expect("the login redirect is valid");
+            append_cookie(
+                response.headers_mut(),
+                SESSION_COOKIE,
+                &session.token,
+                true,
+                secure,
+                SESSION_COOKIE_MAX_AGE,
+            );
+            append_cookie(
+                response.headers_mut(),
+                LOGIN_CSRF_COOKIE,
+                "",
+                true,
+                secure,
+                0,
+            );
+            append_cookie(
+                response.headers_mut(),
+                CSRF_COOKIE,
+                &session.csrf,
+                false,
+                secure,
+                SESSION_COOKIE_MAX_AGE,
+            );
+            response
+        }
+        Err(_) => login_error(
+            request_id,
+            &display_username,
+            "The signature is not valid or the challenge has expired.",
+        ),
+    }
+}
+
+const SESSION_COOKIE_MAX_AGE: i64 = 7 * 24 * 60 * 60;
+
+async fn account_page(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(session_token) = cookie(&headers, SESSION_COOKIE) else {
+        return login_redirect(false);
+    };
+    let Some(csrf) = cookie(&headers, CSRF_COOKIE) else {
+        return login_redirect(true);
+    };
+    let csrf_for_auth = csrf.clone();
+    match login_job(state, move |login| {
+        login.authenticate(&session_token, Some(&csrf_for_auth))
+    })
+    .await
+    {
+        Ok(session) => render(
+            StatusCode::OK,
+            &AccountTemplate {
+                request_id: &request_id.0,
+                username: &session.username,
+                administrator: session.is_administrator,
+                csrf: &csrf,
+            },
+        ),
+        Err(_) => login_redirect(true),
+    }
+}
+
+async fn logout(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["csrf"]) {
+        Ok(fields) => fields,
+        Err(()) => {
+            return render_error(
+                StatusCode::FORBIDDEN,
+                &request_id.0,
+                "Forbidden",
+                "The request is not authorized.",
+            );
+        }
+    };
+    let Some(session_token) = cookie(&headers, SESSION_COOKIE) else {
+        return login_redirect(true);
+    };
+    let Some(csrf) = cookie(&headers, CSRF_COOKIE) else {
+        return login_redirect(true);
+    };
+    if fields[0] != csrf {
+        return render_error(
+            StatusCode::FORBIDDEN,
+            &request_id.0,
+            "Forbidden",
+            "The request is not authorized.",
+        );
+    }
+    let result = login_job(state, move |login| {
+        let session = login.authenticate(&session_token, Some(&csrf))?;
+        login.end_all(&session.username)
+    })
+    .await;
+    if result.is_err() {
+        return login_redirect(true);
+    }
+    login_redirect(true)
+}
+
+async fn login_job<T: Send + 'static>(
+    state: WebState,
+    operation: impl FnOnce(WebLoginService) -> Result<T, SessionError> + Send + 'static,
+) -> Result<T, SessionError> {
+    let login = state.login.ok_or(SessionError::Unavailable)?;
+    let permit = state
+        .jobs
+        .acquire_owned()
+        .await
+        .map_err(|_| SessionError::Unavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation(login)
+    })
+    .await
+    .map_err(|_| SessionError::Unavailable)?
+}
+
+fn parse_named_form(
+    headers: &HeaderMap,
+    body: &[u8],
+    expected: &[&str],
+) -> Result<Vec<String>, ()> {
+    if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        != Some("application/x-www-form-urlencoded")
+        || !valid_percent_encoding(body)
+    {
+        return Err(());
+    }
+    let mut values = vec![None; expected.len()];
+    for (name, value) in url::form_urlencoded::parse(body) {
+        let Some(index) = expected.iter().position(|candidate| *candidate == name) else {
+            return Err(());
+        };
+        if values[index].is_some() {
+            return Err(());
+        }
+        values[index] = Some(value.into_owned());
+    }
+    values.into_iter().collect::<Option<Vec<_>>>().ok_or(())
+}
+
+fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    let value = headers.get(header::COOKIE)?.to_str().ok()?;
+    let mut found = None;
+    for pair in value.split(';') {
+        let (candidate, value) = pair.trim().split_once('=')?;
+        if candidate == name {
+            if found.is_some() || value.is_empty() || value.len() > 128 {
+                return None;
+            }
+            found = Some(value.to_owned());
+        }
+    }
+    found
+}
+
+fn append_cookie(
+    headers: &mut HeaderMap,
+    name: &str,
+    value: &str,
+    http_only: bool,
+    secure: bool,
+    max_age: i64,
+) {
+    let mut cookie = format!("{name}={value}; Path=/; SameSite=Strict; Max-Age={max_age}");
+    if http_only {
+        cookie.push_str("; HttpOnly");
+    }
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    headers.append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("the session cookie is a header value"),
+    );
+}
+
+fn login_redirect(clear: bool) -> Response {
+    let mut response = Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(header::LOCATION, "/login")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::empty())
+        .expect("the login redirect is valid");
+    if clear {
+        append_cookie(response.headers_mut(), SESSION_COOKIE, "", true, false, 0);
+        append_cookie(response.headers_mut(), CSRF_COOKIE, "", false, false, 0);
+    }
+    response
+}
+
+fn login_error(request_id: &str, username: &str, error: &str) -> Response {
+    render(
+        StatusCode::BAD_REQUEST,
+        &LoginTemplate {
+            request_id,
+            username,
+            error,
+            has_error: true,
+        },
+    )
 }
 
 async fn account_job<T: Send + 'static>(
@@ -424,7 +843,8 @@ async fn method_not_allowed(
         "This page does not accept the request method.",
     );
     let allow = match uri.path() {
-        "/signup" | "/recover" => "GET, HEAD, POST",
+        "/signup" | "/recover" | "/login" => "GET, HEAD, POST",
+        "/login/verify" | "/login/verify-file" | "/logout" => "POST",
         path if path.ends_with("/git-upload-pack") => "POST",
         _ => "GET, HEAD",
     };
@@ -617,12 +1037,44 @@ struct RecoveryCodeTemplate<'a> {
     recovery: &'a str,
 }
 
+#[derive(Template)]
+#[template(path = "login.html")]
+struct LoginTemplate<'a> {
+    request_id: &'a str,
+    username: &'a str,
+    error: &'a str,
+    has_error: bool,
+}
+
+#[derive(Template)]
+#[template(path = "login-challenge.html")]
+struct LoginChallengeTemplate<'a> {
+    request_id: &'a str,
+    username: &'a str,
+    public_key: &'a str,
+    challenge: &'a str,
+    login_csrf: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "account-page.html")]
+struct AccountTemplate<'a> {
+    request_id: &'a str,
+    username: &'a str,
+    administrator: bool,
+    csrf: &'a str,
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum WebError {
     #[error("HTTP listener error: {0}")]
     Io(#[from] std::io::Error),
     #[error("public Web configuration error: {0}")]
     Public(#[from] public::PublicWebError),
+    #[error("canonical URL error: {0}")]
+    CanonicalUrl(url::ParseError),
+    #[error(transparent)]
+    Session(#[from] SessionError),
     #[error("HTTP server task failed")]
     Join,
 }

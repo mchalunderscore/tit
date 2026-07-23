@@ -9,7 +9,7 @@ use thiserror::Error;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -19,7 +19,7 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 7] = [
+const MIGRATIONS: [&str; 8] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
@@ -27,6 +27,7 @@ const MIGRATIONS: [&str; 7] = [
     include_str!("migrations/005_repository.sql"),
     include_str!("migrations/006_repository_events.sql"),
     include_str!("migrations/007_account_lifecycle.sql"),
+    include_str!("migrations/008_web_sessions.sql"),
 ];
 
 #[allow(
@@ -75,6 +76,14 @@ pub(crate) enum StoreError {
     KeyNotFound,
     #[error("an account must have at least one active SSH public key")]
     LastKey,
+    #[error("login identity does not exist or is not active")]
+    LoginIdentity,
+    #[error("too many login challenges are active")]
+    LoginNonceLimit,
+    #[error("login challenge is invalid, expired, or already used")]
+    InvalidLoginChallenge,
+    #[error("Web session is invalid or expired")]
+    InvalidSession,
     #[error("repository does not exist: {0}/{1}")]
     RepositoryNotFound(String, String),
     #[error("repository already exists: {0}/{1}")]
@@ -506,6 +515,7 @@ impl Store {
              SET credential_hash = ?2, created_at = ?3 WHERE account_id = ?1",
             rusqlite::params![account_id, recovery.new_recovery_hash, recovery.created_at],
         )?;
+        end_sessions(&transaction, account_id, recovery.created_at)?;
         transaction.commit()?;
         Ok(())
     }
@@ -525,6 +535,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let account_id = active_account_id(&transaction, username)?;
         insert_ssh_key(&transaction, account_id, key, created_at)?;
+        end_sessions(&transaction, account_id, created_at)?;
         transaction.commit()?;
         Ok(())
     }
@@ -559,6 +570,7 @@ impl Store {
         if changed != 1 {
             return Err(StoreError::KeyNotFound);
         }
+        end_sessions(&transaction, account_id, revoked_at)?;
         transaction.commit()?;
         Ok(())
     }
@@ -568,18 +580,193 @@ impl Store {
         reason = "some integration tests compile storage without accounts"
     )]
     pub(crate) fn suspend_account(
-        &self,
+        &mut self,
         username: &str,
         suspended: bool,
+        changed_at: i64,
     ) -> Result<(), StoreError> {
         let state = if suspended { "suspended" } else { "active" };
-        let changed = self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
             "UPDATE account SET state = ?2 WHERE username = ?1",
             rusqlite::params![username, state],
         )?;
         if changed != 1 {
             return Err(StoreError::AccountNotFound(username.to_owned()));
         }
+        let account_id: i64 = transaction.query_row(
+            "SELECT id FROM account WHERE username = ?1",
+            [username],
+            |row| row.get(0),
+        )?;
+        end_sessions(&transaction, account_id, changed_at)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without Web login"
+    )]
+    pub(crate) fn create_login_nonce(
+        &mut self,
+        nonce: &NewLoginNonce<'_>,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM login_nonce WHERE expires_at < ?1 OR consumed_at IS NOT NULL",
+            [nonce.created_at],
+        )?;
+        let active: i64 =
+            transaction.query_row("SELECT count(*) FROM login_nonce", [], |row| row.get(0))?;
+        if active >= 1_024 {
+            return Err(StoreError::LoginNonceLimit);
+        }
+        let key = transaction
+            .query_row(
+                "SELECT account.id, ssh_public_key.id
+                 FROM account
+                 JOIN ssh_public_key ON ssh_public_key.account_id = account.id
+                 WHERE account.username = ?1 AND account.state = 'active'
+                   AND ssh_public_key.fingerprint = ?2
+                   AND ssh_public_key.revoked_at IS NULL",
+                rusqlite::params![nonce.username, nonce.fingerprint],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::LoginIdentity)?;
+        transaction.execute(
+            "INSERT INTO login_nonce
+             (nonce_hash, csrf_hash, account_id, ssh_public_key_id,
+              created_at, expires_at, consumed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            rusqlite::params![
+                nonce.nonce_hash,
+                nonce.csrf_hash,
+                key.0,
+                key.1,
+                nonce.created_at,
+                nonce.expires_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without Web login"
+    )]
+    pub(crate) fn consume_login_nonce(
+        &mut self,
+        login: &NewWebSession<'_>,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let account_id = transaction
+            .query_row(
+                "SELECT login_nonce.account_id
+                 FROM login_nonce
+                 JOIN account ON account.id = login_nonce.account_id
+                 JOIN ssh_public_key ON ssh_public_key.id = login_nonce.ssh_public_key_id
+                 WHERE login_nonce.nonce_hash = ?1
+                   AND login_nonce.consumed_at IS NULL AND login_nonce.expires_at >= ?2
+                   AND account.username = ?3 AND account.state = 'active'
+                   AND ssh_public_key.fingerprint = ?4 AND ssh_public_key.revoked_at IS NULL
+                   AND login_nonce.csrf_hash = ?5",
+                rusqlite::params![
+                    login.nonce_hash,
+                    login.created_at,
+                    login.username,
+                    login.fingerprint,
+                    login.login_csrf_hash,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::InvalidLoginChallenge)?;
+        let changed = transaction.execute(
+            "UPDATE login_nonce SET consumed_at = ?2
+             WHERE nonce_hash = ?1 AND consumed_at IS NULL",
+            rusqlite::params![login.nonce_hash, login.created_at],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidLoginChallenge);
+        }
+        transaction.execute(
+            "INSERT INTO web_session
+             (session_hash, csrf_hash, account_id, created_at, expires_at, ended_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+            rusqlite::params![
+                login.session_hash,
+                login.csrf_hash,
+                account_id,
+                login.created_at,
+                login.expires_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without Web login"
+    )]
+    pub(crate) fn web_session(
+        &self,
+        session_hash: &[u8; 32],
+        csrf_hash: Option<&[u8; 32]>,
+        now: i64,
+    ) -> Result<WebSessionRecord, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT account.username, account.is_administrator, web_session.expires_at
+                 FROM web_session
+                 JOIN account ON account.id = web_session.account_id
+                 WHERE web_session.session_hash = ?1 AND web_session.ended_at IS NULL
+                   AND web_session.expires_at >= ?3 AND account.state = 'active'
+                   AND (?2 IS NULL OR web_session.csrf_hash = ?2)",
+                rusqlite::params![session_hash, csrf_hash, now],
+                |row| {
+                    Ok(WebSessionRecord {
+                        username: row.get(0)?,
+                        is_administrator: row.get(1)?,
+                        expires_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::InvalidSession)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without Web login"
+    )]
+    pub(crate) fn end_account_sessions(
+        &mut self,
+        username: &str,
+        ended_at: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let account_id: i64 = transaction
+            .query_row(
+                "SELECT id FROM account WHERE username = ?1",
+                [username],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::AccountNotFound(username.to_owned()))?;
+        end_sessions(&transaction, account_id, ended_at)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -892,6 +1079,44 @@ pub(crate) struct AccountRecovery<'a> {
     pub(crate) created_at: i64,
 }
 
+#[allow(
+    dead_code,
+    reason = "some integration tests compile storage without Web login"
+)]
+pub(crate) struct NewLoginNonce<'a> {
+    pub(crate) nonce_hash: &'a [u8; 32],
+    pub(crate) csrf_hash: &'a [u8; 32],
+    pub(crate) username: &'a str,
+    pub(crate) fingerprint: &'a str,
+    pub(crate) created_at: i64,
+    pub(crate) expires_at: i64,
+}
+
+#[allow(
+    dead_code,
+    reason = "some integration tests compile storage without Web login"
+)]
+pub(crate) struct NewWebSession<'a> {
+    pub(crate) nonce_hash: &'a [u8; 32],
+    pub(crate) login_csrf_hash: &'a [u8; 32],
+    pub(crate) username: &'a str,
+    pub(crate) fingerprint: &'a str,
+    pub(crate) session_hash: &'a [u8; 32],
+    pub(crate) csrf_hash: &'a [u8; 32],
+    pub(crate) created_at: i64,
+    pub(crate) expires_at: i64,
+}
+
+#[allow(
+    dead_code,
+    reason = "some integration tests compile storage without Web login"
+)]
+pub(crate) struct WebSessionRecord {
+    pub(crate) username: String,
+    pub(crate) is_administrator: bool,
+    pub(crate) expires_at: i64,
+}
+
 pub(crate) struct NewRepository<'a> {
     pub(crate) id: &'a str,
     pub(crate) owner: &'a str,
@@ -1000,6 +1225,19 @@ fn insert_ssh_key(
         Err(error) => Err(error.into()),
         Ok(_) => unreachable!("an INSERT changes one row"),
     }
+}
+
+fn end_sessions(
+    transaction: &rusqlite::Transaction<'_>,
+    account_id: i64,
+    ended_at: i64,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "UPDATE web_session SET ended_at = ?2
+         WHERE account_id = ?1 AND ended_at IS NULL",
+        rusqlite::params![account_id, ended_at],
+    )?;
+    Ok(())
 }
 
 fn insert_push_events(
