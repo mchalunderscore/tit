@@ -37,8 +37,7 @@ const MAX_PULL_REQUEST_COMMAND_BYTES: usize = 512;
 const MAX_ISSUE_INPUT_BYTES: usize = MAX_TITLE_BYTES + 1 + MAX_BODY_BYTES;
 const SSH_ATTEMPTS_PER_MINUTE: usize = 30;
 const MAX_SSH_CLIENTS: usize = 4096;
-const REPOSITORY_CREATE_USAGE: &str =
-    "repo create NAME [--object-format sha1|sha256] [--output human|json]";
+const REPOSITORY_CREATE_USAGE: &str = "repo create NAME [--output human|json]";
 const ISSUE_LIST_USAGE: &str = "issue list OWNER/REPOSITORY [--output human|json]";
 const ISSUE_CREATE_USAGE: &str = "issue create OWNER/REPOSITORY [--output human|json]";
 const PULL_REQUEST_CHECKOUT_USAGE: &str =
@@ -47,7 +46,7 @@ const HELP_TEXT: &str = "\
 Available tit SSH commands:
   help
   tit --version
-  repo create NAME [--object-format sha1|sha256] [--output human|json]
+  repo create NAME [--output human|json]
   issue list OWNER/REPOSITORY [--output human|json]
   issue create OWNER/REPOSITORY [--output human|json]
   pr checkout OWNER/REPOSITORY NUMBER [--output human|json]
@@ -945,7 +944,6 @@ enum CommandOutput {
 
 struct RepositoryCreateCommand {
     slug: String,
-    object_format: gix::hash::Kind,
     output: CommandOutput,
 }
 
@@ -978,18 +976,10 @@ fn parse_repository_command(command: &[u8]) -> Result<RepositoryCreateCommand, (
         return Err(());
     }
     let slug = tokens.next().ok_or(())?.to_owned();
-    let mut object_format = None;
     let mut output = None;
     while let Some(option) = tokens.next() {
         let value = tokens.next().ok_or(())?;
         match option {
-            "--object-format" if object_format.is_none() => {
-                object_format = Some(match value {
-                    "sha1" => gix::hash::Kind::Sha1,
-                    "sha256" => gix::hash::Kind::Sha256,
-                    _ => return Err(()),
-                });
-            }
             "--output" if output.is_none() => {
                 output = Some(match value {
                     "human" => CommandOutput::Human,
@@ -1002,7 +992,6 @@ fn parse_repository_command(command: &[u8]) -> Result<RepositoryCreateCommand, (
     }
     Ok(RepositoryCreateCommand {
         slug,
-        object_format: object_format.unwrap_or(gix::hash::Kind::Sha1),
         output: output.unwrap_or(CommandOutput::Human),
     })
 }
@@ -1036,7 +1025,7 @@ async fn run_repository_command(
             .create_for_account(
                 &actor,
                 &command.slug,
-                command.object_format,
+                gix::hash::Kind::Sha1,
                 &correlation_id,
             )
             .map(|repository| (repository, output))
@@ -1057,8 +1046,8 @@ fn send_repository_command_result(
             session.data(
                 channel,
                 format!(
-                    "Created repository {}/{}.\nObject format: {}\n",
-                    repository.owner, repository.slug, repository.object_format
+                    "Created repository {}/{}.\n",
+                    repository.owner, repository.slug
                 )
                 .into_bytes(),
             )?;
@@ -1068,8 +1057,8 @@ fn send_repository_command_result(
             session.data(
                 channel,
                 format!(
-                    "{{\"version\":1,\"status\":\"success\",\"repository\":{{\"owner\":\"{}\",\"name\":\"{}\",\"object_format\":\"{}\"}}}}\n",
-                    repository.owner, repository.slug, repository.object_format
+                    "{{\"version\":1,\"status\":\"success\",\"repository\":{{\"owner\":\"{}\",\"name\":\"{}\"}}}}\n",
+                    repository.owner, repository.slug
                 )
                 .into_bytes(),
             )?;

@@ -36,7 +36,7 @@ use crate::store::{DATABASE_FILE, RepositoryRecord, Store, StoreError};
 use super::{PublicWebConfig, RequestActor, RequestId, WebState, render_error};
 
 const MAX_HISTORY_COMMITS: usize = 10_000;
-const MAX_SUMMARY_COMMITS: usize = 50;
+const MAX_SUMMARY_COMMITS: usize = 10;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
 
 #[derive(Clone)]
@@ -272,6 +272,7 @@ pub(super) fn routes() -> Router<WebState> {
         )
         .route("/{owner}/{repository}/issues/rss.xml", get(issue_rss_feed))
         .route("/{owner}/{repository}/search", get(search))
+        .route("/{owner}/{repository}/commits", get(commits))
         .route("/{owner}/{repository}/commit/{commit}", get(commit))
         .route("/{owner}/{repository}/diff/{old}/{new}", get(diff))
         .route("/{owner}/{repository}/tree/{commit}", get(tree_root))
@@ -494,6 +495,34 @@ async fn refs(
             let cancellation = ReadCancellation::default();
             let references = service.references(&cancellation)?;
             Ok(RepositoryPage::refs(record, references))
+        })
+        .await;
+    render_page(result, &request_id.0, signed_in)
+}
+
+async fn commits(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
+    AxumPath(path): AxumPath<RepositoryPath>,
+) -> Response {
+    let Some(web) = state.public else {
+        return route_error(RouteError::NotFound, &request_id.0);
+    };
+    let signed_in = actor.0.is_some();
+    let result = web
+        .read(actor.0, path.owner, path.repository, |record, service| {
+            let cancellation = ReadCancellation::default();
+            let references = service.references(&cancellation)?;
+            let head = references
+                .iter()
+                .find(|reference| reference.name == b"HEAD")
+                .map(|reference| reference.target);
+            let history = match head {
+                Some(head) => service.history(head, &cancellation)?,
+                None => Vec::new(),
+            };
+            Ok(RepositoryPage::commits(record, head, history))
         })
         .await;
     render_page(result, &request_id.0, signed_in)
@@ -1248,7 +1277,6 @@ struct RepositoryPage {
     signed_in: bool,
     owner: String,
     repository: String,
-    object_format: String,
     created_at: i64,
     page_title: String,
     page_kind: &'static str,
@@ -1288,7 +1316,6 @@ impl RepositoryPage {
             signed_in: false,
             owner: record.owner,
             repository: record.slug,
-            object_format: record.object_format,
             created_at: record.created_at,
             page_title: title,
             page_kind,
@@ -1375,6 +1402,14 @@ impl RepositoryPage {
                 }
             })
             .collect();
+        page
+    }
+
+    fn commits(record: RepositoryRecord, head: Option<ObjectId>, history: Vec<CommitInfo>) -> Self {
+        let mut page = Self::base(record, "commits", "Commits".to_owned());
+        page.has_head = head.is_some();
+        page.commit_id = head.map(|id| id.to_string()).unwrap_or_default();
+        page.history = history.into_iter().map(CommitView::from).collect();
         page
     }
 

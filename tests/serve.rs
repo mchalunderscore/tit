@@ -231,6 +231,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     assert!(!account.contains("<a href=\"/signup\">Create account</a>"));
     assert!(!account.contains("<a href=\"/recover\">Recover account</a>"));
     assert!(account.contains("action=\"/account/repositories\""));
+    assert!(!account.contains("object-format"));
     for path in ["/login", "/signup", "/recover"] {
         let response = http_get_with_headers(http, path, &[("Cookie", &cookies)]);
         assert!(response.starts_with("HTTP/1.1 303"));
@@ -253,22 +254,14 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     let rejected_repository = http_form_with_headers(
         http,
         "/account/repositories",
-        &[
-            ("csrf", &"0".repeat(64)),
-            ("name", "web-created"),
-            ("object-format", "sha1"),
-        ],
+        &[("csrf", &"0".repeat(64)), ("name", "web-created")],
         &[("Cookie", &cookies)],
     );
     assert!(rejected_repository.starts_with("HTTP/1.1 403"));
     let created_repository = http_form_with_headers(
         http,
         "/account/repositories",
-        &[
-            ("csrf", csrf),
-            ("name", "web-created"),
-            ("object-format", "sha256"),
-        ],
+        &[("csrf", csrf), ("name", "web-created")],
         &[("Cookie", &cookies)],
     );
     assert!(created_repository.starts_with("HTTP/1.1 303"));
@@ -770,7 +763,7 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
     assert!(human.status.success());
     assert_eq!(
         String::from_utf8(human.stdout).expect("read human command output"),
-        "Created repository bob/example.\nObject format: sha1\n"
+        "Created repository bob/example.\n"
     );
     assert!(human.stderr.is_empty());
     assert!(ssh_clone_repository_succeeds(
@@ -885,20 +878,12 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
     let machine = ssh_exec(
         ssh,
         &private_key,
-        &[
-            "repo",
-            "create",
-            "hash-agile",
-            "--object-format",
-            "sha256",
-            "--output",
-            "json",
-        ],
+        &["repo", "create", "hash-agile", "--output", "json"],
     );
     assert!(machine.status.success());
     assert_eq!(
         String::from_utf8(machine.stdout).expect("read machine command output"),
-        "{\"version\":1,\"status\":\"success\",\"repository\":{\"owner\":\"alice\",\"name\":\"hash-agile\",\"object_format\":\"sha256\"}}\n"
+        "{\"version\":1,\"status\":\"success\",\"repository\":{\"owner\":\"alice\",\"name\":\"hash-agile\"}}\n"
     );
     assert!(machine.stderr.is_empty());
 
@@ -1080,7 +1065,7 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
             (
                 "alice".to_owned(),
                 "hash-agile".to_owned(),
-                "sha256".to_owned()
+                "sha1".to_owned()
             ),
         ]
     );

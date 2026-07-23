@@ -16,7 +16,6 @@
     <dl>
       <dt>HTTP</dt><dd><code>{{ http_clone_url }}</code></dd>
       <dt>SSH</dt><dd><code>{{ ssh_clone_url }}</code></dd>
-      <dt>Object format</dt><dd>{{ object_format }}</dd>
       <dt>Created</dt><dd><time>{{ created_at }}</time></dd>
     </dl>
   </section>
@@ -28,6 +27,7 @@
       <li><a href="/{{ owner }}/{{ repository }}/commit/{{ item.id }}"><code>{{ item.id }}</code></a> {{ item.summary }} — {{ item.author_name }}</li>
 {% endfor %}
     </ol>
+    <p><a href="/{{ owner }}/{{ repository }}/commits">View all commits</a></p>
   </section>
 {% if has_readme %}
   <section aria-labelledby="readme-heading">
@@ -39,6 +39,19 @@
 {% endif %}
   </section>
 {% endif %}
+{% else %}
+  <p>This repository has no commits.</p>
+{% endif %}
+{% endif %}
+
+{% if page_kind == "commits" %}
+  <h2>All commits</h2>
+{% if has_head %}
+  <ol class="commit-list">
+{% for item in history %}
+    <li><a href="/{{ owner }}/{{ repository }}/commit/{{ item.id }}"><code>{{ item.id }}</code></a> {{ item.summary }} — {{ item.author_name }}</li>
+{% endfor %}
+  </ol>
 {% else %}
   <p>This repository has no commits.</p>
 {% endif %}

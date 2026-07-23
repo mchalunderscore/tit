@@ -128,6 +128,27 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         assert!(summary_text.contains("/alice/example/atom.xml"));
         assert!(summary_text.contains("/alice/example/rss.xml"));
         assert!(summary_text.contains("/alice/example/search"));
+        assert!(summary_text.contains("/alice/example/commits\">View all commits</a>"));
+        assert_eq!(
+            summary_text
+                .matches("<li><a href=\"/alice/example/commit/")
+                .count(),
+            10
+        );
+        assert!(!summary_text.contains("Object format"));
+
+        let commits = request(server.address(), "GET", "/alice/example/commits", &[], &[]);
+        assert_eq!(commits.status, 200);
+        assert_html_policy(&commits);
+        assert_repository_navigation(&commits, "alice", "example");
+        assert!(commits.text().contains("<h2>All commits</h2>"));
+        assert_eq!(
+            commits
+                .text()
+                .matches("<li><a href=\"/alice/example/commit/")
+                .count(),
+            12
+        );
         let mut feed_entry_ids = Vec::new();
         for (path, content_type) in [
             (
@@ -250,6 +271,7 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
 
         let routes = [
             "/alice/example/refs".to_owned(),
+            "/alice/example/commits".to_owned(),
             "/alice/example/search".to_owned(),
             format!("/alice/example/commit/{}", fixture.head),
             format!("/alice/example/tree/{}", fixture.head),
@@ -1354,6 +1376,9 @@ impl Fixture {
             .expect("write malformed UTF-8 content");
         commit_all(&worktree, "first commit");
         let parent = rev_parse(&worktree, "HEAD");
+        for index in 1..=10 {
+            commit_empty(&worktree, &format!("intermediate commit {index}"));
+        }
         fs::write(
             worktree.join("nested/file.txt"),
             b"first line\nsecond line\n",
@@ -1441,6 +1466,17 @@ fn commit_all(worktree: &Path, message: &str) {
         .arg("-C")
         .arg(worktree)
         .args(["commit", "-q", "-m", message])
+        .env("GIT_AUTHOR_NAME", "Fixture Author")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.test")
+        .env("GIT_COMMITTER_NAME", "Fixture Author")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.test"));
+}
+
+fn commit_empty(worktree: &Path, message: &str) {
+    run(Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["commit", "-q", "--allow-empty", "-m", message])
         .env("GIT_AUTHOR_NAME", "Fixture Author")
         .env("GIT_AUTHOR_EMAIL", "fixture@example.test")
         .env("GIT_COMMITTER_NAME", "Fixture Author")

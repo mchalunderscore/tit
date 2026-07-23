@@ -946,7 +946,7 @@ async fn create_repository(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let fields = match parse_named_form(&headers, &body, &["csrf", "name", "object-format"]) {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "name"]) {
         Ok(fields) => fields,
         Err(()) => {
             return repository_form_error(
@@ -969,17 +969,6 @@ async fn create_repository(
             "The request is not authorized.",
         );
     }
-    let object_format = match fields[2].as_str() {
-        "sha1" => gix::hash::Kind::Sha1,
-        "sha256" => gix::hash::Kind::Sha256,
-        _ => {
-            return repository_form_error(
-                &request_id.0,
-                StatusCode::BAD_REQUEST,
-                "The repository request is not valid.",
-            );
-        }
-    };
     let csrf_for_auth = csrf.clone();
     let session = match login_job(state.clone(), move |login| {
         login.authenticate(&session_token, Some(&csrf_for_auth))
@@ -998,7 +987,7 @@ async fn create_repository(
         repositories.create_for_account(
             &owner_for_job,
             &slug_for_job,
-            object_format,
+            gix::hash::Kind::Sha1,
             &correlation_id,
         )
     })
