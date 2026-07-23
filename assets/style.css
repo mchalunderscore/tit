@@ -1,0 +1,104 @@
+:root {
+  color-scheme: light dark;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  line-height: 1.5;
+  background: Canvas;
+  color: CanvasText;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: min(100% - 2rem, 64rem);
+  margin: 0 auto;
+}
+
+.site-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 0;
+  border-bottom: 1px solid GrayText;
+}
+
+.brand {
+  color: inherit;
+  font-size: 1.5rem;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+main {
+  min-height: 65vh;
+  padding: 2rem 0;
+}
+
+footer {
+  padding: 1rem 0;
+  border-top: 1px solid GrayText;
+}
+
+form {
+  max-width: 32rem;
+}
+
+.field {
+  margin-block: 1rem;
+}
+
+label {
+  display: block;
+  margin-bottom: 0.25rem;
+  font-weight: 700;
+}
+
+input,
+button {
+  max-width: 100%;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid GrayText;
+  border-radius: 0.25rem;
+  background: Canvas;
+  color: CanvasText;
+  font: inherit;
+}
+
+input {
+  width: 100%;
+}
+
+button {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+a {
+  color: LinkText;
+}
+
+:focus-visible {
+  outline: 0.2rem solid Highlight;
+  outline-offset: 0.2rem;
+}
+
+.error {
+  padding: 0.75rem;
+  border-left: 0.25rem solid #b42318;
+}
+
+.skip-link {
+  position: absolute;
+  left: -10000px;
+  top: auto;
+}
+
+.skip-link:focus {
+  left: 1rem;
+  top: 1rem;
+  z-index: 1;
+  padding: 0.5rem;
+  background: Canvas;
+}

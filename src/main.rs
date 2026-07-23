@@ -10,6 +10,11 @@ mod config;
 mod domain;
 #[allow(dead_code, reason = "M1C proves Git reads before the CLI serves them")]
 mod git;
+#[allow(
+    dead_code,
+    reason = "M2.4 establishes the HTTP shell before tit serve calls it"
+)]
+mod http;
 mod instance;
 #[allow(dead_code, reason = "M1B proves the SSH server before M2 calls it")]
 mod ssh;

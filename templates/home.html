@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Repositories · tit{% endblock %}
+{% block content %}
+  <h1>Repositories</h1>
+  <p>Enter an owner and a repository to open its public page.</p>
+{% if has_error %}
+  <p class="error" role="alert">{{ error }}</p>
+{% endif %}
+  <form action="/go" method="get">
+    <div class="field">
+      <label for="owner">Owner</label>
+      <input id="owner" name="owner" value="{{ owner }}" required autocomplete="off" autocapitalize="none" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="repository">Repository</label>
+      <input id="repository" name="repository" value="{{ repository }}" required autocomplete="off" autocapitalize="none" spellcheck="false">
+    </div>
+    <button type="submit">Open repository</button>
+  </form>
+{% endblock %}

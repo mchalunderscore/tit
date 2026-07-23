@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Repositories · tit</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="tit home">tit</a>
+    <nav aria-label="Primary">
+      <a href="/">Home</a>
+    </nav>
+  </header>
+  <main id="main">
+
+  <h1>Repositories</h1>
+  <p>Enter an owner and a repository to open its public page.</p>
+
+  <p class="error" role="alert">Enter a valid lowercase owner and repository.</p>
+
+  <form action="/go" method="get">
+    <div class="field">
+      <label for="owner">Owner</label>
+      <input id="owner" name="owner" value="&#60;script&#62;" required autocomplete="off" autocapitalize="none" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="repository">Repository</label>
+      <input id="repository" name="repository" value="example" required autocomplete="off" autocapitalize="none" spellcheck="false">
+    </div>
+    <button type="submit">Open repository</button>
+  </form>
+
+  </main>
+  <footer>
+    <small>Request <code><request-id></code></small>
+  </footer>
+</body>
+</html>
