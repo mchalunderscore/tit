@@ -71,7 +71,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::time::Duration;
 
 use http::RunningWebServer;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serves_the_semantic_shell_without_javascript() {
@@ -270,10 +270,21 @@ async fn cancels_a_connection_after_the_shutdown_drain_limit() {
         .await
         .expect("connect a stalled client");
     stalled
-        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+        .write_all(
+            b"POST /login HTTP/1.1\r\n\
+              Host: localhost\r\n\
+              Content-Type: application/x-www-form-urlencoded\r\n\
+              Content-Length: 10\r\n\
+              Expect: 100-continue\r\n\r\n",
+        )
         .await
         .expect("write an incomplete request");
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut response = [0_u8; 25];
+    stalled
+        .read_exact(&mut response)
+        .await
+        .expect("read the continue response");
+    assert_eq!(&response, b"HTTP/1.1 100 Continue\r\n\r\n");
 
     assert!(
         !server
