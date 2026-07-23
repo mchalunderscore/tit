@@ -113,6 +113,9 @@ fn rejects_unadvertised_wants_and_damaged_reachable_objects() {
 
 fn make_fixture(path: &Path, format: &str) -> ObjectId {
     init_bare(path, format);
+    run(git(path).args(["config", "user.name", "Tit Test"]));
+    run(git(path).args(["config", "user.email", "tit@example.invalid"]));
+    run(git(path).args(["config", "tag.gpgsign", "false"]));
     let blob = write_blob(path, b"hello from tit\n");
     let tree = write_tree(path, blob, "non-ascii-\u{00e5}.txt");
     let commit = write_commit(path, tree, None, "first commit");

@@ -392,11 +392,6 @@ impl Handler for SshSession {
                         }
                         Some((_, Err(_))) | None => fail_git_channel(channel, session)?,
                     }
-                } else if packets.last() == Some(&Packet::Flush) {
-                    let mut response = Vec::new();
-                    encode_data(b"NAK\n", &mut response).expect("a NAK packet is within the limit");
-                    session.data(channel, response)?;
-                    self.git_channels.insert(channel, git);
                 } else {
                     self.git_channels.insert(channel, git);
                 }
