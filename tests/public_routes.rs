@@ -34,6 +34,9 @@ mod http;
 mod instance;
 #[path = "../src/markdown.rs"]
 mod markdown;
+#[allow(dead_code, reason = "the public-route test uses anonymous policy only")]
+#[path = "../src/policy.rs"]
+mod policy;
 #[allow(dead_code, reason = "the public-route test does not complete a login")]
 #[path = "../src/session.rs"]
 mod session;

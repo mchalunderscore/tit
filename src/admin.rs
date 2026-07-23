@@ -86,6 +86,51 @@ pub(crate) fn archive_repository(
     inspect_with_store(instance_dir, &store, owner, slug)
 }
 
+pub(crate) fn set_repository_visibility(
+    instance_dir: &Path,
+    owner: &str,
+    slug: &str,
+    visibility: &str,
+) -> Result<RepositoryRecord, AdminError> {
+    validate_names(owner, slug)?;
+    let _lock = InstanceLock::acquire(instance_dir)?;
+    let database = prepare_database(instance_dir)?;
+    let mut store = Store::open(&database)?;
+    store.set_repository_visibility(owner, slug, visibility)?;
+    inspect_with_store(instance_dir, &store, owner, slug)
+}
+
+pub(crate) fn set_repository_collaborator(
+    instance_dir: &Path,
+    owner: &str,
+    slug: &str,
+    username: &str,
+    role: &str,
+) -> Result<RepositoryRecord, AdminError> {
+    validate_names(owner, slug)?;
+    validate_username(username)?;
+    let _lock = InstanceLock::acquire(instance_dir)?;
+    let database = prepare_database(instance_dir)?;
+    let mut store = Store::open(&database)?;
+    store.set_repository_collaborator(owner, slug, username, role, timestamp()?)?;
+    inspect_with_store(instance_dir, &store, owner, slug)
+}
+
+pub(crate) fn remove_repository_collaborator(
+    instance_dir: &Path,
+    owner: &str,
+    slug: &str,
+    username: &str,
+) -> Result<RepositoryRecord, AdminError> {
+    validate_names(owner, slug)?;
+    validate_username(username)?;
+    let _lock = InstanceLock::acquire(instance_dir)?;
+    let database = prepare_database(instance_dir)?;
+    let mut store = Store::open(&database)?;
+    store.remove_repository_collaborator(owner, slug, username)?;
+    inspect_with_store(instance_dir, &store, owner, slug)
+}
+
 pub(crate) fn inspect_repository(
     instance_dir: &Path,
     owner: &str,

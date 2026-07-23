@@ -17,6 +17,7 @@ mod git;
 mod http;
 mod instance;
 mod markdown;
+mod policy;
 mod serve;
 mod session;
 #[allow(dead_code, reason = "the server uses only part of the shared SSH API")]
@@ -29,7 +30,8 @@ use std::{io, io::Write};
 use clap::Parser;
 
 use crate::cli::{
-    AccountCommand, AdminCommand, Cli, Command, ObjectFormat, RepositoryCommand, SetupCommand,
+    AccountCommand, AdminCommand, Cli, CollaboratorRole, Command, ObjectFormat, RepositoryCommand,
+    RepositoryVisibility, SetupCommand,
 };
 
 #[tokio::main]
@@ -190,6 +192,40 @@ fn run_repository_command(instance_dir: &std::path::Path, command: RepositoryCom
         RepositoryCommand::Archive { owner, slug } => {
             admin::archive_repository(instance_dir, &owner, &slug)
         }
+        RepositoryCommand::Visibility {
+            owner,
+            slug,
+            visibility,
+        } => admin::set_repository_visibility(
+            instance_dir,
+            &owner,
+            &slug,
+            match visibility {
+                RepositoryVisibility::Public => "public",
+                RepositoryVisibility::Private => "private",
+            },
+        ),
+        RepositoryCommand::CollaboratorSet {
+            owner,
+            slug,
+            username,
+            role,
+        } => admin::set_repository_collaborator(
+            instance_dir,
+            &owner,
+            &slug,
+            &username,
+            match role {
+                CollaboratorRole::Maintainer => "maintainer",
+                CollaboratorRole::Writer => "writer",
+                CollaboratorRole::Reader => "reader",
+            },
+        ),
+        RepositoryCommand::CollaboratorRemove {
+            owner,
+            slug,
+            username,
+        } => admin::remove_repository_collaborator(instance_dir, &owner, &slug, &username),
         RepositoryCommand::Inspect { owner, slug } => {
             admin::inspect_repository(instance_dir, &owner, &slug)
         }

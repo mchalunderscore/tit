@@ -14,6 +14,7 @@ use crate::control::{ControlError, RunningControlServer};
 use crate::git::transport::{GitRepositories, RepositoryPathError};
 use crate::http::{PublicWebConfig, RunningWebServer, WebError};
 use crate::instance::{InstanceError, InstanceLock, prepare_database, prepare_repository_root};
+use crate::policy::{PolicyError, RepositoryPolicy};
 use crate::ssh::{AuthorizedSshKeys, RunningSshServer, SshServerError};
 use crate::store::{Store, StoreError};
 
@@ -27,8 +28,9 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
         .into_iter()
         .map(|key| SshPublicKey::parse(&key))
         .collect::<Result<Vec<_>, _>>()?;
-    let repositories = store
-        .active_public_repositories()?
+    let policy = RepositoryPolicy::new(&database);
+    let repositories = policy
+        .public_repositories()?
         .into_iter()
         .map(|repository| (repository.owner, repository.slug, repository.id));
     let git = GitRepositories::new_managed_public(&repository_root, repositories)?;
@@ -203,6 +205,8 @@ pub(crate) enum ServeError {
     Instance(#[from] InstanceError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
     #[error(transparent)]
     Authentication(#[from] AuthError),
     #[error(transparent)]

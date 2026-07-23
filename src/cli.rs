@@ -120,8 +120,40 @@ pub(crate) enum RepositoryCommand {
     },
     /// Archive a repository
     Archive { owner: String, slug: String },
+    /// Set repository visibility
+    Visibility {
+        owner: String,
+        slug: String,
+        visibility: RepositoryVisibility,
+    },
+    /// Set a collaborator role
+    CollaboratorSet {
+        owner: String,
+        slug: String,
+        username: String,
+        role: CollaboratorRole,
+    },
+    /// Remove a collaborator
+    CollaboratorRemove {
+        owner: String,
+        slug: String,
+        username: String,
+    },
     /// Inspect a repository
     Inspect { owner: String, slug: String },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum RepositoryVisibility {
+    Public,
+    Private,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum CollaboratorRole {
+    Maintainer,
+    Writer,
+    Reader,
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]

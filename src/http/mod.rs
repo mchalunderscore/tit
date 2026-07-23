@@ -43,6 +43,9 @@ struct WebState {
     secure_cookies: bool,
 }
 
+#[derive(Clone)]
+pub(super) struct RequestActor(pub(super) Option<String>);
+
 type AccountKeyReloader = Arc<dyn Fn(&AccountService) -> Result<(), AccountError> + Send + Sync>;
 
 #[derive(Clone, Debug)]
@@ -157,6 +160,10 @@ pub(crate) fn router() -> Router {
 }
 
 fn router_with_state(state: WebState) -> Router {
+    let repository_routes = public::routes().layer(middleware::from_fn_with_state(
+        state.clone(),
+        repository_actor,
+    ));
     Router::new()
         .route("/", get(home))
         .route("/go", get(go_to_repository))
@@ -192,11 +199,27 @@ fn router_with_state(state: WebState) -> Router {
             axum::routing::post(logout).layer(DefaultBodyLimit::max(1024)),
         )
         .route("/assets/style.css", get(style))
-        .merge(public::routes())
+        .merge(repository_routes)
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
         .layer(middleware::from_fn(response_policy))
+}
+
+async fn repository_actor(
+    State(state): State<WebState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let actor = match cookie(request.headers(), SESSION_COOKIE) {
+        Some(session) => login_job(state, move |login| login.authenticate(&session, None))
+            .await
+            .ok()
+            .map(|record| record.username),
+        None => None,
+    };
+    request.extensions_mut().insert(RequestActor(actor));
+    next.run(request).await
 }
 
 async fn home(Extension(request_id): Extension<RequestId>) -> Response {

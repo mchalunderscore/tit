@@ -30,9 +30,10 @@ use crate::git::read::{
 };
 use crate::git::upload_pack::{ProtocolVersion, UploadPack};
 use crate::markdown::{self, RenderedMarkdown};
+use crate::policy::{PolicyError, RepositoryOperation, RepositoryPolicy};
 use crate::store::{DATABASE_FILE, RepositoryRecord, Store, StoreError};
 
-use super::{PublicWebConfig, RequestId, WebState, render_error};
+use super::{PublicWebConfig, RequestActor, RequestId, WebState, render_error};
 
 const MAX_HISTORY_COMMITS: usize = 10_000;
 const MAX_SUMMARY_COMMITS: usize = 50;
@@ -45,6 +46,7 @@ pub(super) struct PublicWeb {
     http_clone_base: String,
     ssh_clone_base: String,
     jobs: Arc<Semaphore>,
+    policy: RepositoryPolicy,
 }
 
 impl PublicWeb {
@@ -59,6 +61,7 @@ impl PublicWeb {
         }
         let database = config.instance_dir.join(DATABASE_FILE);
         Store::open(&database)?;
+        let policy = RepositoryPolicy::new(&database);
         let http_clone_base = clone_base(&config.http_clone_base)?;
         let ssh_clone_base = clone_base(&config.ssh_clone_base)?;
         Ok(Self {
@@ -67,11 +70,13 @@ impl PublicWeb {
             http_clone_base,
             ssh_clone_base,
             jobs,
+            policy,
         })
     }
 
     async fn read<T, F>(
         &self,
+        actor: Option<String>,
         owner: String,
         repository: String,
         operation: F,
@@ -91,7 +96,8 @@ impl PublicWeb {
         let web = self.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let (repository, path) = web.resolve_repository(&owner, &repository)?;
+            let (repository, path) =
+                web.resolve_repository(actor.as_deref(), &owner, &repository)?;
             let limits = ReadLimits {
                 max_history_commits: MAX_HISTORY_COMMITS,
                 ..ReadLimits::default()
@@ -105,6 +111,7 @@ impl PublicWeb {
 
     async fn event_page(
         &self,
+        actor: Option<String>,
         owner: String,
         repository: String,
         before: Option<i64>,
@@ -118,10 +125,17 @@ impl PublicWeb {
             .await
             .map_err(|_| RouteError::Unavailable)?;
         let database = self.database.clone();
+        let policy = self.policy.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            policy.authorize(
+                actor.as_deref(),
+                &owner,
+                &repository,
+                RepositoryOperation::Read,
+            )?;
             Store::open(&database)?
-                .public_repository_events(&owner, &repository, before, PAGE_SIZE + 1)
+                .repository_events(&owner, &repository, before, PAGE_SIZE + 1)
                 .map_err(Into::into)
         })
         .await
@@ -130,6 +144,7 @@ impl PublicWeb {
 
     async fn path_job<T, F>(
         &self,
+        actor: Option<String>,
         owner: String,
         repository: String,
         operation: F,
@@ -147,7 +162,7 @@ impl PublicWeb {
         let web = self.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let (record, path) = web.resolve_repository(&owner, &repository)?;
+            let (record, path) = web.resolve_repository(actor.as_deref(), &owner, &repository)?;
             operation(record, path)
         })
         .await
@@ -156,14 +171,16 @@ impl PublicWeb {
 
     fn resolve_repository(
         &self,
+        actor: Option<&str>,
         owner: &str,
         repository: &str,
     ) -> Result<(RepositoryRecord, PathBuf), RouteError> {
         if validate_username(owner).is_err() || validate_slug(repository).is_err() {
             return Err(RouteError::NotFound);
         }
-        let store = Store::open(&self.database)?;
-        let record = store.public_repository(owner, repository)?;
+        let record = self
+            .policy
+            .authorize(actor, owner, repository, RepositoryOperation::Read)?;
         let candidate = self.repositories.join(format!("{}.git", record.id));
         let path = fs::canonicalize(&candidate).map_err(|_| RouteError::Internal)?;
         if path.parent() != Some(self.repositories.as_path()) || !path.is_dir() {
@@ -181,12 +198,13 @@ impl PublicWeb {
 
     async fn archive(
         &self,
+        actor: Option<String>,
         owner: String,
         repository: String,
         id: ObjectId,
     ) -> Result<Body, RouteError> {
         let path = self
-            .path_job(owner, repository, move |record, path| {
+            .path_job(actor, owner, repository, move |record, path| {
                 require_id_format(id, &record)?;
                 let service = RepositoryReadService::open(&path, ReadLimits::default())?;
                 let cancellation = ReadCancellation::default();
@@ -243,26 +261,47 @@ pub(super) fn routes() -> Router<WebState> {
 async fn atom_feed(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<RepositoryPath>,
     Query(query): Query<FeedQuery>,
     headers: HeaderMap,
 ) -> Response {
-    feed_response(state, request_id, path, query, headers, FeedFormat::Atom).await
+    feed_response(
+        state,
+        request_id,
+        actor,
+        path,
+        query,
+        headers,
+        FeedFormat::Atom,
+    )
+    .await
 }
 
 async fn rss_feed(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<RepositoryPath>,
     Query(query): Query<FeedQuery>,
     headers: HeaderMap,
 ) -> Response {
-    feed_response(state, request_id, path, query, headers, FeedFormat::Rss).await
+    feed_response(
+        state,
+        request_id,
+        actor,
+        path,
+        query,
+        headers,
+        FeedFormat::Rss,
+    )
+    .await
 }
 
 async fn feed_response(
     state: WebState,
     request_id: RequestId,
+    actor: RequestActor,
     path: RepositoryPath,
     query: FeedQuery,
     headers: HeaderMap,
@@ -277,7 +316,7 @@ async fn feed_response(
     let owner = path.owner;
     let repository = path.repository;
     let (record, mut events) = match web
-        .event_page(owner.clone(), repository.clone(), query.before)
+        .event_page(actor.0, owner.clone(), repository.clone(), query.before)
         .await
     {
         Ok(page) => page,
@@ -315,12 +354,13 @@ async fn feed_response(
         Ok(body) => body,
         Err(_) => return route_error(RouteError::Internal, &request_id.0),
     };
-    conditional_feed(&headers, name, body, newest)
+    conditional_feed(&headers, name, body, newest, record.visibility == "public")
 }
 
 async fn summary(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<RepositoryPath>,
 ) -> Response {
     if let Some(repository) = path.repository.strip_suffix(".git")
@@ -334,28 +374,33 @@ async fn summary(
     };
     let clone_urls = web.clone_urls(&path.owner, &path.repository);
     let result = web
-        .read(path.owner, path.repository, move |record, service| {
-            let cancellation = ReadCancellation::default();
-            let references = service.references(&cancellation)?;
-            let head = references
-                .iter()
-                .find(|reference| reference.name == b"HEAD")
-                .map(|reference| reference.target);
-            let (history, readme) = match head {
-                Some(head) => (
-                    service.history(head, &cancellation)?,
-                    service.readme(head, &cancellation)?,
-                ),
-                None => (Vec::new(), None),
-            };
-            Ok(RepositoryPage::summary(
-                record,
-                clone_urls,
-                head,
-                history,
-                readme.map(|readme| (readme.path, readme.blob.data)),
-            ))
-        })
+        .read(
+            actor.0,
+            path.owner,
+            path.repository,
+            move |record, service| {
+                let cancellation = ReadCancellation::default();
+                let references = service.references(&cancellation)?;
+                let head = references
+                    .iter()
+                    .find(|reference| reference.name == b"HEAD")
+                    .map(|reference| reference.target);
+                let (history, readme) = match head {
+                    Some(head) => (
+                        service.history(head, &cancellation)?,
+                        service.readme(head, &cancellation)?,
+                    ),
+                    None => (Vec::new(), None),
+                };
+                Ok(RepositoryPage::summary(
+                    record,
+                    clone_urls,
+                    head,
+                    history,
+                    readme.map(|readme| (readme.path, readme.blob.data)),
+                ))
+            },
+        )
         .await;
     render_page(result, &request_id.0)
 }
@@ -363,13 +408,14 @@ async fn summary(
 async fn refs(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<RepositoryPath>,
 ) -> Response {
     let Some(web) = state.public else {
         return route_error(RouteError::NotFound, &request_id.0);
     };
     let result = web
-        .read(path.owner, path.repository, |record, service| {
+        .read(actor.0, path.owner, path.repository, |record, service| {
             let cancellation = ReadCancellation::default();
             let references = service.references(&cancellation)?;
             Ok(RepositoryPage::refs(record, references))
@@ -381,6 +427,7 @@ async fn refs(
 async fn search(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<RepositoryPath>,
     Query(query): Query<SearchQuery>,
 ) -> Response {
@@ -393,25 +440,30 @@ async fn search(
         return route_error(RouteError::InvalidRequest, &request_id.0);
     }
     let result = web
-        .read(path.owner, path.repository, move |record, service| {
-            let cancellation = ReadCancellation::default();
-            let references = service.references(&cancellation)?;
-            let selected = select_search_ref(&references, query.reference.as_deref())?;
-            let outcome = match (&query.query, selected.as_ref()) {
-                (Some(query), Some((_, commit))) => {
-                    Some(service.search(*commit, query.as_bytes(), &cancellation)?)
-                }
-                (Some(_), None) => return Err(RouteError::NotFound),
-                (None, _) => None,
-            };
-            Ok(RepositoryPage::search(
-                record,
-                references,
-                selected,
-                query.query.unwrap_or_default(),
-                outcome,
-            ))
-        })
+        .read(
+            actor.0,
+            path.owner,
+            path.repository,
+            move |record, service| {
+                let cancellation = ReadCancellation::default();
+                let references = service.references(&cancellation)?;
+                let selected = select_search_ref(&references, query.reference.as_deref())?;
+                let outcome = match (&query.query, selected.as_ref()) {
+                    (Some(query), Some((_, commit))) => {
+                        Some(service.search(*commit, query.as_bytes(), &cancellation)?)
+                    }
+                    (Some(_), None) => return Err(RouteError::NotFound),
+                    (None, _) => None,
+                };
+                Ok(RepositoryPage::search(
+                    record,
+                    references,
+                    selected,
+                    query.query.unwrap_or_default(),
+                    outcome,
+                ))
+            },
+        )
         .await;
     render_page(result, &request_id.0)
 }
@@ -419,6 +471,7 @@ async fn search(
 async fn commit(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<CommitPath>,
 ) -> Response {
     let Some(web) = state.public else {
@@ -429,12 +482,17 @@ async fn commit(
         Err(error) => return route_error(error, &request_id.0),
     };
     let result = web
-        .read(path.owner, path.repository, move |record, service| {
-            require_id_format(id, &record)?;
-            let cancellation = ReadCancellation::default();
-            let commit = service.commit(id, &cancellation)?;
-            Ok(RepositoryPage::commit(record, commit))
-        })
+        .read(
+            actor.0,
+            path.owner,
+            path.repository,
+            move |record, service| {
+                require_id_format(id, &record)?;
+                let cancellation = ReadCancellation::default();
+                let commit = service.commit(id, &cancellation)?;
+                Ok(RepositoryPage::commit(record, commit))
+            },
+        )
         .await;
     render_page(result, &request_id.0)
 }
@@ -442,6 +500,7 @@ async fn commit(
 async fn diff(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<DiffPath>,
 ) -> Response {
     let Some(web) = state.public else {
@@ -452,13 +511,18 @@ async fn diff(
         _ => return route_error(RouteError::NotFound, &request_id.0),
     };
     let result = web
-        .read(path.owner, path.repository, move |record, service| {
-            require_id_format(old, &record)?;
-            require_id_format(new, &record)?;
-            let cancellation = ReadCancellation::default();
-            let files = service.diff(old, new, &cancellation)?;
-            Ok(RepositoryPage::diff(record, old, new, files))
-        })
+        .read(
+            actor.0,
+            path.owner,
+            path.repository,
+            move |record, service| {
+                require_id_format(old, &record)?;
+                require_id_format(new, &record)?;
+                let cancellation = ReadCancellation::default();
+                let files = service.diff(old, new, &cancellation)?;
+                Ok(RepositoryPage::diff(record, old, new, files))
+            },
+        )
         .await;
     render_page(result, &request_id.0)
 }
@@ -466,26 +530,29 @@ async fn diff(
 async fn tree_root(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<CommitPath>,
 ) -> Response {
-    tree_response(state, request_id, path, Vec::new()).await
+    tree_response(state, request_id, actor, path, Vec::new()).await
 }
 
 async fn tree(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     OriginalUri(uri): OriginalUri,
 ) -> Response {
     let (path, git_path) = match content_route(uri.path(), "tree") {
         Ok(route) => route,
         Err(error) => return route_error(error, &request_id.0),
     };
-    tree_response(state, request_id, path, git_path).await
+    tree_response(state, request_id, actor, path, git_path).await
 }
 
 async fn tree_response(
     state: WebState,
     request_id: RequestId,
+    actor: RequestActor,
     path: CommitPath,
     git_path: Vec<u8>,
 ) -> Response {
@@ -497,12 +564,17 @@ async fn tree_response(
         Err(error) => return route_error(error, &request_id.0),
     };
     let result = web
-        .read(path.owner, path.repository, move |record, service| {
-            require_id_format(id, &record)?;
-            let cancellation = ReadCancellation::default();
-            let entries = service.tree(id, &git_path, &cancellation)?;
-            Ok(RepositoryPage::tree(record, id, git_path, entries))
-        })
+        .read(
+            actor.0,
+            path.owner,
+            path.repository,
+            move |record, service| {
+                require_id_format(id, &record)?;
+                let cancellation = ReadCancellation::default();
+                let entries = service.tree(id, &git_path, &cancellation)?;
+                Ok(RepositoryPage::tree(record, id, git_path, entries))
+            },
+        )
         .await;
     render_page(result, &request_id.0)
 }
@@ -510,6 +582,7 @@ async fn tree_response(
 async fn blob(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     OriginalUri(uri): OriginalUri,
 ) -> Response {
     let (path, git_path) = match content_route(uri.path(), "blob") {
@@ -524,12 +597,17 @@ async fn blob(
         Err(error) => return route_error(error, &request_id.0),
     };
     let result = web
-        .read(path.owner, path.repository, move |record, service| {
-            require_id_format(id, &record)?;
-            let cancellation = ReadCancellation::default();
-            let blob = service.blob(id, &git_path, &cancellation)?;
-            Ok(RepositoryPage::blob(record, id, git_path, blob.data))
-        })
+        .read(
+            actor.0,
+            path.owner,
+            path.repository,
+            move |record, service| {
+                require_id_format(id, &record)?;
+                let cancellation = ReadCancellation::default();
+                let blob = service.blob(id, &git_path, &cancellation)?;
+                Ok(RepositoryPage::blob(record, id, git_path, blob.data))
+            },
+        )
         .await;
     render_page(result, &request_id.0)
 }
@@ -537,6 +615,7 @@ async fn blob(
 async fn raw(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     OriginalUri(uri): OriginalUri,
 ) -> Response {
     let (path, git_path) = match content_route(uri.path(), "raw") {
@@ -551,19 +630,31 @@ async fn raw(
         Err(error) => return route_error(error, &request_id.0),
     };
     let result = web
-        .read(path.owner, path.repository, move |record, service| {
-            require_id_format(id, &record)?;
-            let cancellation = ReadCancellation::default();
-            let mut content = Vec::new();
-            service.raw(id, &git_path, &cancellation, &mut content)?;
-            Ok(content)
-        })
+        .read(
+            actor.0,
+            path.owner,
+            path.repository,
+            move |record, service| {
+                require_id_format(id, &record)?;
+                let cancellation = ReadCancellation::default();
+                let mut content = Vec::new();
+                service.raw(id, &git_path, &cancellation, &mut content)?;
+                Ok((record.visibility == "public", content))
+            },
+        )
         .await;
     match result {
-        Ok(content) => Response::builder()
+        Ok((is_public, content)) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+            .header(
+                header::CACHE_CONTROL,
+                if is_public {
+                    "public, max-age=31536000, immutable"
+                } else {
+                    "private, no-store"
+                },
+            )
             .body(Body::from(content))
             .expect("the raw response is valid"),
         Err(error) => route_error(error, &request_id.0),
@@ -573,6 +664,7 @@ async fn raw(
 async fn blame(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     OriginalUri(uri): OriginalUri,
 ) -> Response {
     let (path, git_path) = match content_route(uri.path(), "blame") {
@@ -587,15 +679,20 @@ async fn blame(
         Err(error) => return route_error(error, &request_id.0),
     };
     let result = web
-        .read(path.owner, path.repository, move |record, service| {
-            require_id_format(id, &record)?;
-            let cancellation = ReadCancellation::default();
-            let blob = service.blob(id, &git_path, &cancellation)?;
-            let hunks = service.blame(id, &git_path, &cancellation)?;
-            Ok(RepositoryPage::blame(
-                record, id, git_path, blob.data, hunks,
-            ))
-        })
+        .read(
+            actor.0,
+            path.owner,
+            path.repository,
+            move |record, service| {
+                require_id_format(id, &record)?;
+                let cancellation = ReadCancellation::default();
+                let blob = service.blob(id, &git_path, &cancellation)?;
+                let hunks = service.blame(id, &git_path, &cancellation)?;
+                Ok(RepositoryPage::blame(
+                    record, id, git_path, blob.data, hunks,
+                ))
+            },
+        )
         .await;
     render_page(result, &request_id.0)
 }
@@ -603,6 +700,7 @@ async fn blame(
 async fn archive(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<ArchivePath>,
 ) -> Response {
     let Some(commit) = path.archive.strip_suffix(".tar") else {
@@ -615,7 +713,7 @@ async fn archive(
     let Some(web) = state.public else {
         return route_error(RouteError::NotFound, &request_id.0);
     };
-    let result = web.archive(path.owner, path.repository, id).await;
+    let result = web.archive(actor.0, path.owner, path.repository, id).await;
     match result {
         Ok(body) => Response::builder()
             .status(StatusCode::OK)
@@ -634,6 +732,7 @@ async fn archive(
 async fn info_refs(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(mut path): AxumPath<RepositoryPath>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
@@ -654,11 +753,16 @@ async fn info_refs(
         Err(()) => return plain_error(StatusCode::BAD_REQUEST, "Invalid Git protocol version.\n"),
     };
     let result = web
-        .path_job(path.owner, path.repository, move |_record, path| {
-            UploadPack::open(&path)
-                .and_then(|service| service.advertisement(version, true))
-                .map_err(|_| RouteError::Internal)
-        })
+        .path_job(
+            actor.0,
+            path.owner,
+            path.repository,
+            move |_record, path| {
+                UploadPack::open(&path)
+                    .and_then(|service| service.advertisement(version, true))
+                    .map_err(|_| RouteError::Internal)
+            },
+        )
         .await;
     match result {
         Ok(body) => git_response("application/x-git-upload-pack-advertisement", body),
@@ -670,6 +774,7 @@ async fn info_refs(
 async fn git_upload_pack(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
     AxumPath(mut path): AxumPath<RepositoryPath>,
     headers: HeaderMap,
     body: Bytes,
@@ -697,11 +802,16 @@ async fn git_upload_pack(
         Err(()) => return plain_error(StatusCode::BAD_REQUEST, "Invalid Git protocol version.\n"),
     };
     let result = web
-        .path_job(path.owner, path.repository, move |_record, path| {
-            UploadPack::open(&path)
-                .and_then(|service| service.respond(version, &body))
-                .map_err(|_| RouteError::InvalidRequest)
-        })
+        .path_job(
+            actor.0,
+            path.owner,
+            path.repository,
+            move |_record, path| {
+                UploadPack::open(&path)
+                    .and_then(|service| service.respond(version, &body))
+                    .map_err(|_| RouteError::InvalidRequest)
+            },
+        )
         .await;
     match result {
         Ok(body) => git_response("application/x-git-upload-pack-result", body),
@@ -731,7 +841,13 @@ fn render_page(result: Result<RepositoryPage, RouteError>, request_id: &str) -> 
     }
 }
 
-fn conditional_feed(headers: &HeaderMap, name: &str, body: String, timestamp: i64) -> Response {
+fn conditional_feed(
+    headers: &HeaderMap,
+    name: &str,
+    body: String,
+    timestamp: i64,
+    is_public: bool,
+) -> Response {
     let digest = Sha256::digest(body.as_bytes());
     let etag = format!("\"{}\"", encode_hex(&digest));
     let modified = u64::try_from(timestamp)
@@ -761,7 +877,14 @@ fn conditional_feed(headers: &HeaderMap, name: &str, body: String, timestamp: i6
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, "public, max-age=60")
+        .header(
+            header::CACHE_CONTROL,
+            if is_public {
+                "public, max-age=60"
+            } else {
+                "private, no-store"
+            },
+        )
         .header(header::ETAG, etag)
         .header(header::LAST_MODIFIED, httpdate::fmt_http_date(modified))
         .body(if not_modified {
@@ -1501,6 +1624,17 @@ impl From<StoreError> for RouteError {
     fn from(error: StoreError) -> Self {
         match error {
             StoreError::RepositoryNotFound(_, _) => Self::NotFound,
+            _ => Self::Internal,
+        }
+    }
+}
+
+impl From<PolicyError> for RouteError {
+    fn from(error: PolicyError) -> Self {
+        match error {
+            PolicyError::Denied | PolicyError::Store(StoreError::RepositoryNotFound(_, _)) => {
+                Self::NotFound
+            }
             _ => Self::Internal,
         }
     }

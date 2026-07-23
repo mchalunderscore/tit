@@ -173,6 +173,33 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         &[("Cookie", &upload_csrf_cookies)],
     );
     assert!(uploaded.starts_with("HTTP/1.1 303"), "{uploaded}");
+    let private_cookies = response_cookies(&uploaded);
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the repository database");
+    database
+        .execute(
+            "UPDATE repository SET visibility = 'private' WHERE slug = 'example'",
+            [],
+        )
+        .expect("make the repository private");
+    assert!(http_get(http, "/alice/example").starts_with("HTTP/1.1 404"));
+    let private_summary =
+        http_get_with_headers(http, "/alice/example", &[("Cookie", &private_cookies)]);
+    assert!(private_summary.starts_with("HTTP/1.1 200"));
+    let private_feed = http_get_with_headers(
+        http,
+        "/alice/example/atom.xml",
+        &[("Cookie", &private_cookies)],
+    );
+    assert!(private_feed.starts_with("HTTP/1.1 200"));
+    assert!(private_feed.contains("cache-control: private, no-store"));
+    database
+        .execute(
+            "UPDATE repository SET visibility = 'public' WHERE slug = 'example'",
+            [],
+        )
+        .expect("make the repository public");
+    drop(database);
 
     let invitation_output = Command::new(env!("CARGO_BIN_EXE_tit"))
         .args([
@@ -317,6 +344,86 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         host_key
     );
     restarted.terminate();
+}
+
+#[test]
+fn hides_a_private_repository_from_http_and_ssh_discovery() {
+    let instance = TempDir::new().expect("create an instance directory");
+    let http = free_address();
+    let ssh = free_address();
+    let config = instance.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "version = 1\npublic_url = \"http://{http}/\"\n\n[http]\nlisten = \"{http}\"\n\n[ssh]\nlisten = \"{ssh}\"\npublic_host = \"127.0.0.1\"\npublic_port = {}\n",
+            ssh.port()
+        ),
+    )
+    .expect("write the server configuration");
+    let private_key = instance.path().join("administrator");
+    create_ssh_key_fixture(&private_key);
+    let public_key = fs::read_to_string(private_key.with_extension("pub"))
+        .expect("read the administrator public key");
+    let config_text = config.to_str().expect("a UTF-8 configuration path");
+    command(
+        instance.path(),
+        [
+            "--config",
+            config_text,
+            "setup",
+            "admin",
+            "alice",
+            public_key.trim(),
+        ],
+    );
+    let source = create_source_repository(instance.path());
+    command(
+        instance.path(),
+        [
+            "--config",
+            config_text,
+            "admin",
+            "repository",
+            "import",
+            "alice",
+            "private",
+            source.to_str().expect("a UTF-8 source path"),
+        ],
+    );
+    command(
+        instance.path(),
+        [
+            "--config",
+            config_text,
+            "admin",
+            "repository",
+            "visibility",
+            "alice",
+            "private",
+            "private",
+        ],
+    );
+
+    let mut server = spawn_server(&config);
+    wait_for_listener(http, &mut server);
+    wait_for_listener(ssh, &mut server);
+    let discovery = http_get(http, "/alice/private.git/info/refs?service=git-upload-pack");
+    assert!(discovery.starts_with("HTTP/1.1 404"), "{discovery}");
+
+    let ssh_command = format!(
+        "ssh -F /dev/null -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+        private_key.display()
+    );
+    let ssh_discovery = Command::new("git")
+        .args([
+            "ls-remote",
+            &format!("ssh://ignored@127.0.0.1:{}/alice/private.git", ssh.port()),
+        ])
+        .env("GIT_SSH_COMMAND", ssh_command)
+        .output()
+        .expect("query the private repository through SSH");
+    assert!(!ssh_discovery.status.success());
+    server.terminate();
 }
 
 fn spawn_server(config: &Path) -> ChildGuard {

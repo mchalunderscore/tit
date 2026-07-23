@@ -42,6 +42,20 @@ The code is valid for one signup during the next 24 hours. Open `/signup` to
 create the account. Store the recovery credential offline when the Web UI shows
 it. Open `/recover` to replace all account keys with a new key.
 
+Stop the server before you change repository access with an offline
+administrator command:
+
+```text
+tit --config /srv/tit/config.toml admin repository visibility alice example private
+tit --config /srv/tit/config.toml admin repository collaborator-set alice example bob writer
+tit --config /srv/tit/config.toml admin repository collaborator-remove alice example bob
+```
+
+The policy permits a reader to read and a writer to write. It permits a
+maintainer to change repository settings and collaborators. Only the owner can
+change ownership. An owner or collaborator can read a private repository in the
+Web UI after login. Authenticated Git enforcement starts in Milestone 3.4.
+
 ## Quality gate
 
 Install `cargo-deny` version 0.20.2. Then, run this command from the repository
@@ -173,3 +187,16 @@ Open `/login`, create a challenge, and sign its exact content with the
 creates an opaque session. Read the
 [Web login architectural decision record](docs/adr/0011-web-login-sessions.md)
 for the session and CSRF behavior.
+
+## Milestone 3.3 gate
+
+Run the repository authorization gate:
+
+```text
+./scripts/check-m3-3
+```
+
+This command tests public and private visibility, each collaborator role,
+suspended accounts, archived repositories, and anonymous HTTP routes. Read the
+[repository authorization architectural decision record](docs/adr/0012-repository-authorization.md)
+for the complete access matrix.

@@ -12,12 +12,13 @@ use support::{
 };
 use tempfile::TempDir;
 
-const V8_DATABASE: &str = concat!(
+const V9_DATABASE: &str = concat!(
     include_str!("fixtures/sqlite/v5.sql"),
     include_str!("../src/store/migrations/006_repository_events.sql"),
     include_str!("../src/store/migrations/007_account_lifecycle.sql"),
     include_str!("../src/store/migrations/008_web_sessions.sql"),
-    "PRAGMA user_version = 8;\n",
+    include_str!("../src/store/migrations/009_repository_authorization.sql"),
+    "PRAGMA user_version = 9;\n",
 );
 
 #[test]
@@ -73,7 +74,7 @@ fn doctor_checks_an_existing_current_database() {
     let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
         .expect("open the instance database");
     database
-        .execute_batch(V8_DATABASE)
+        .execute_batch(V9_DATABASE)
         .expect("create the current database");
     drop(database);
 
@@ -125,7 +126,7 @@ fn doctor_reports_a_foreign_key_violation() {
     let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
         .expect("open the instance database");
     database
-        .execute_batch(V8_DATABASE)
+        .execute_batch(V9_DATABASE)
         .expect("create the current database");
     database
         .pragma_update(None, "foreign_keys", false)
@@ -489,6 +490,97 @@ fn administers_repositories_with_immutable_canonical_paths() {
         "project",
     ]);
     assert_eq!(missing_owner.status.code(), Some(1));
+}
+
+#[test]
+fn administers_repository_visibility_and_collaborators() {
+    let instance = TestInstance::new();
+    create_administrator(&instance, "alice");
+    let config = instance.config().to_str().expect("a UTF-8 path");
+    let created = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "create",
+        "alice",
+        "project",
+    ]);
+    assert!(created.status.success());
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the repository database");
+    database
+        .execute(
+            "INSERT INTO account (username, is_administrator, state, created_at)
+             VALUES ('bob', 0, 'active', 1)",
+            [],
+        )
+        .expect("create a collaborator account");
+    drop(database);
+
+    let visibility = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "visibility",
+        "alice",
+        "project",
+        "private",
+    ]);
+    assert!(visibility.status.success());
+    assert_eq!(
+        repository_output(&visibility.stdout)
+            .get("visibility")
+            .map(String::as_str),
+        Some("private")
+    );
+
+    let collaborator = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "collaborator-set",
+        "alice",
+        "project",
+        "bob",
+        "reader",
+    ]);
+    assert!(collaborator.status.success());
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the repository database");
+    let role: String = database
+        .query_row(
+            "SELECT role FROM repository_collaborator
+             JOIN account ON account.id = repository_collaborator.account_id
+             WHERE account.username = 'bob'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the collaborator role");
+    assert_eq!(role, "reader");
+    drop(database);
+
+    let removed = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "collaborator-remove",
+        "alice",
+        "project",
+        "bob",
+    ]);
+    assert!(removed.status.success());
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the repository database");
+    let collaborators: i64 = database
+        .query_row("SELECT count(*) FROM repository_collaborator", [], |row| {
+            row.get(0)
+        })
+        .expect("count repository collaborators");
+    assert_eq!(collaborators, 0);
 }
 
 #[test]

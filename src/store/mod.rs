@@ -9,7 +9,7 @@ use thiserror::Error;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -19,7 +19,7 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 8] = [
+const MIGRATIONS: [&str; 9] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
@@ -28,6 +28,7 @@ const MIGRATIONS: [&str; 8] = [
     include_str!("migrations/006_repository_events.sql"),
     include_str!("migrations/007_account_lifecycle.sql"),
     include_str!("migrations/008_web_sessions.sql"),
+    include_str!("migrations/009_repository_authorization.sql"),
 ];
 
 #[allow(
@@ -92,6 +93,14 @@ pub(crate) enum StoreError {
     RepositoryIdentifierCollision,
     #[error("repository is already archived: {0}/{1}")]
     RepositoryArchived(String, String),
+    #[error("repository visibility is not valid")]
+    InvalidRepositoryVisibility,
+    #[error("collaborator role is not valid")]
+    InvalidCollaboratorRole,
+    #[error("repository owner cannot be a collaborator")]
+    OwnerCollaborator,
+    #[error("collaborator account does not exist or is not active: {0}")]
+    CollaboratorNotFound(String),
     #[allow(
         dead_code,
         reason = "some integration tests import storage without public event pages"
@@ -907,6 +916,137 @@ impl Store {
         Ok(())
     }
 
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without admin commands"
+    )]
+    pub(crate) fn set_repository_visibility(
+        &mut self,
+        owner: &str,
+        slug: &str,
+        visibility: &str,
+    ) -> Result<(), StoreError> {
+        if !matches!(visibility, "public" | "private") {
+            return Err(StoreError::InvalidRepositoryVisibility);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner_id = active_account_id(&transaction, owner)?;
+        let changed = transaction.execute(
+            "UPDATE repository SET visibility = ?3
+             WHERE owner_account_id = ?1 AND slug = ?2 AND state = 'active'",
+            rusqlite::params![owner_id, slug, visibility],
+        )?;
+        if changed == 0 {
+            return Err(repository_state_error(&transaction, owner_id, owner, slug)?);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without admin commands"
+    )]
+    pub(crate) fn set_repository_collaborator(
+        &mut self,
+        owner: &str,
+        slug: &str,
+        username: &str,
+        role: &str,
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        if !matches!(role, "maintainer" | "writer" | "reader") {
+            return Err(StoreError::InvalidCollaboratorRole);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner_id = active_account_id(&transaction, owner)?;
+        let repository_id: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM repository
+                 WHERE owner_account_id = ?1 AND slug = ?2 AND state = 'active'",
+                rusqlite::params![owner_id, slug],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(repository_id) = repository_id else {
+            return Err(repository_state_error(&transaction, owner_id, owner, slug)?);
+        };
+        let collaborator_id = match active_account_id(&transaction, username) {
+            Ok(account_id) => account_id,
+            Err(StoreError::AccountNotFound(_)) => {
+                return Err(StoreError::CollaboratorNotFound(username.to_owned()));
+            }
+            Err(error) => return Err(error),
+        };
+        if collaborator_id == owner_id {
+            return Err(StoreError::OwnerCollaborator);
+        }
+        transaction.execute(
+            "INSERT INTO repository_collaborator
+             (repository_id, account_id, role, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (repository_id, account_id)
+             DO UPDATE SET role = excluded.role",
+            rusqlite::params![repository_id, collaborator_id, role, created_at],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without admin commands"
+    )]
+    pub(crate) fn remove_repository_collaborator(
+        &mut self,
+        owner: &str,
+        slug: &str,
+        username: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner_id = active_account_id(&transaction, owner)?;
+        let repository_id: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM repository
+                 WHERE owner_account_id = ?1 AND slug = ?2 AND state = 'active'",
+                rusqlite::params![owner_id, slug],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(repository_id) = repository_id else {
+            return Err(repository_state_error(&transaction, owner_id, owner, slug)?);
+        };
+        let collaborator_id: Option<i64> = transaction
+            .query_row(
+                "SELECT id FROM account WHERE username = ?1",
+                [username],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(collaborator_id) = collaborator_id else {
+            return Err(StoreError::CollaboratorNotFound(username.to_owned()));
+        };
+        if collaborator_id == owner_id {
+            return Err(StoreError::OwnerCollaborator);
+        }
+        let changed = transaction.execute(
+            "DELETE FROM repository_collaborator
+             WHERE repository_id = ?1 AND account_id = ?2",
+            rusqlite::params![repository_id, collaborator_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::CollaboratorNotFound(username.to_owned()));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn repository(
         &self,
         owner: &str,
@@ -930,6 +1070,70 @@ impl Store {
             )),
             Err(error) => Err(error.into()),
         }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without authorization"
+    )]
+    pub(crate) fn repository_authorization(
+        &self,
+        owner: &str,
+        slug: &str,
+        username: Option<&str>,
+    ) -> Result<RepositoryAuthorizationRecord, StoreError> {
+        let result = self.connection.query_row(
+            "SELECT repository.id, owner.username, repository.slug,
+                    repository.visibility, repository.state, repository.object_format,
+                    repository.created_at, repository.archived_at,
+                    CASE
+                        WHEN actor.state != 'active' THEN NULL
+                        WHEN actor.id = repository.owner_account_id THEN 'owner'
+                        ELSE repository_collaborator.role
+                    END
+             FROM repository
+             JOIN account AS owner ON owner.id = repository.owner_account_id
+             LEFT JOIN account AS actor ON actor.username = ?3
+             LEFT JOIN repository_collaborator
+               ON repository_collaborator.repository_id = repository.id
+              AND repository_collaborator.account_id = actor.id
+             WHERE owner.username = ?1 AND repository.slug = ?2",
+            rusqlite::params![owner, slug, username],
+            |row| {
+                Ok(RepositoryAuthorizationRecord {
+                    repository: repository_from_row(row)?,
+                    role: row.get(8)?,
+                })
+            },
+        );
+        match result {
+            Ok(record) => Ok(record),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(StoreError::RepositoryNotFound(
+                owner.to_owned(),
+                slug.to_owned(),
+            )),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests compile storage without authorization"
+    )]
+    pub(crate) fn active_repositories(&self) -> Result<Vec<RepositoryRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT repository.id, account.username, repository.slug,
+                    repository.visibility, repository.state, repository.object_format,
+                    repository.created_at, repository.archived_at
+             FROM repository
+             JOIN account ON account.id = repository.owner_account_id
+             WHERE repository.state = 'active'
+             ORDER BY account.username, repository.slug",
+        )?;
+        statement
+            .query_map([], repository_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     #[allow(
@@ -1012,6 +1216,30 @@ impl Store {
         limit: usize,
     ) -> Result<(RepositoryRecord, Vec<RepositoryEventRecord>), StoreError> {
         let repository = self.public_repository(owner, slug)?;
+        self.repository_events_for(repository, before, limit)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "some integration tests use only public event queries"
+    )]
+    pub(crate) fn repository_events(
+        &self,
+        owner: &str,
+        slug: &str,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<(RepositoryRecord, Vec<RepositoryEventRecord>), StoreError> {
+        let repository = self.repository(owner, slug)?;
+        self.repository_events_for(repository, before, limit)
+    }
+
+    fn repository_events_for(
+        &self,
+        repository: RepositoryRecord,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<(RepositoryRecord, Vec<RepositoryEventRecord>), StoreError> {
         let limit = i64::try_from(limit).map_err(|_| StoreError::EventLimit)?;
         let mut statement = self.connection.prepare(
             "SELECT id, kind, actor, ref_name, old_target, new_target, created_at
@@ -1161,6 +1389,15 @@ pub(crate) struct RepositoryRecord {
     pub(crate) object_format: String,
     pub(crate) created_at: i64,
     pub(crate) archived_at: Option<i64>,
+}
+
+#[allow(
+    dead_code,
+    reason = "some integration tests compile storage without authorization"
+)]
+pub(crate) struct RepositoryAuthorizationRecord {
+    pub(crate) repository: RepositoryRecord,
+    pub(crate) role: Option<String>,
 }
 
 #[allow(
