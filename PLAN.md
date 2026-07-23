@@ -331,7 +331,7 @@ Work proceeds through milestone gates. Do not start a milestone before the
 preceding gate passes. If a feasibility gate fails, change the design before
 you continue the feature work.
 
-**Current milestone:** Milestone 6.2 — Backup and restore.
+**Current milestone:** Milestone 6.3 — Doctor.
 Update this marker only after the current milestone gate passes.
 
 ### Architecture
