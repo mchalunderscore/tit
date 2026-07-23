@@ -32,6 +32,46 @@ impl RepositoryPolicy {
         }
     }
 
+    pub(crate) fn authorize_ref_change(
+        &self,
+        actor: &str,
+        owner: &str,
+        repository: &str,
+        ref_name: &[u8],
+        change: RefChange,
+    ) -> Result<RepositoryRecord, PolicyError> {
+        let record = Store::open(&self.database)?.repository_authorization(
+            owner,
+            repository,
+            Some(actor),
+        )?;
+        if !allows(&record, RepositoryOperation::Write)? {
+            return Err(PolicyError::Denied);
+        }
+        let protected = ref_name == b"refs/heads/main";
+        if matches!(change, RefChange::Force)
+            || (protected && matches!(change, RefChange::Delete))
+            || (protected && !allows(&record, RepositoryOperation::Maintain)?)
+        {
+            return Err(PolicyError::Denied);
+        }
+        Ok(record.repository)
+    }
+
+    pub(crate) fn authorize_merge(
+        &self,
+        actor: &str,
+        owner: &str,
+        repository: &str,
+    ) -> Result<RepositoryRecord, PolicyError> {
+        self.authorize(
+            Some(actor),
+            owner,
+            repository,
+            RepositoryOperation::Maintain,
+        )
+    }
+
     #[allow(
         dead_code,
         reason = "policy tests verify anonymous catalog behavior independently"
@@ -53,6 +93,15 @@ impl RepositoryPolicy {
             })
             .collect()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RefChange {
+    Create,
+    FastForward,
+    Force,
+    Delete,
+    TagUpdate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

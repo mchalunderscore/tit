@@ -16,6 +16,7 @@ use thiserror::Error;
 
 use super::packetline::{Packet, PacketLineError, decode, encode_data, encode_flush};
 use super::upload_pack::hash_name;
+use crate::policy::{PolicyError, RefChange, RepositoryPolicy};
 use crate::store::{GitIntentRecord, GitOperationIntent, NewAuditEvent, Store};
 
 const MAX_COMMANDS: usize = 256;
@@ -35,6 +36,7 @@ pub(crate) struct ReceivePack {
     quarantine: PathBuf,
     incoming_pack: PathBuf,
     cleanup_on_drop: bool,
+    policy_context: Option<(String, String)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,6 +51,30 @@ impl ReceivePack {
         repository_path: &Path,
         database_path: &Path,
         actor: String,
+    ) -> Result<Self, ReceivePackError> {
+        Self::open_inner(repository_path, database_path, actor, None)
+    }
+
+    pub(crate) fn open_authorized(
+        repository_path: &Path,
+        database_path: &Path,
+        actor: String,
+        owner: String,
+        repository: String,
+    ) -> Result<Self, ReceivePackError> {
+        Self::open_inner(
+            repository_path,
+            database_path,
+            actor,
+            Some((owner, repository)),
+        )
+    }
+
+    fn open_inner(
+        repository_path: &Path,
+        database_path: &Path,
+        actor: String,
+        policy_context: Option<(String, String)>,
     ) -> Result<Self, ReceivePackError> {
         let repository = open_bare(repository_path)?;
         let object_format = repository.object_hash();
@@ -68,6 +94,7 @@ impl ReceivePack {
             quarantine,
             incoming_pack,
             cleanup_on_drop: true,
+            policy_context,
         })
     }
 
@@ -159,13 +186,11 @@ impl ReceivePack {
         let result = (|| {
             let has_pack =
                 self.incoming_pack.exists() && fs::metadata(&self.incoming_pack)?.len() != 0;
-            let needs_objects = commands.iter().any(|command| !command.new.is_null());
             let pack_name = if has_pack {
                 self.index_and_validate_pack(&repository, &commands)?
             } else {
-                if needs_objects {
-                    validate_proposed_objects(&repository, None, &commands)?;
-                }
+                let changes = validate_proposed_objects(&repository, None, &commands)?;
+                self.validate_policy(&commands, &changes)?;
                 None
             };
 
@@ -295,7 +320,8 @@ impl ReceivePack {
             return Err(ReceivePackError::ObjectLimit);
         }
         if outcome.index.num_objects == 0 {
-            validate_proposed_objects(repository, None, commands)?;
+            let changes = validate_proposed_objects(repository, None, commands)?;
+            self.validate_policy(commands, &changes)?;
             if let Some(path) = outcome.data_path {
                 let _ = fs::remove_file(path);
             }
@@ -312,7 +338,8 @@ impl ReceivePack {
             .ok_or(ReceivePackError::MissingPack)?
             .map_err(|error| ReceivePackError::Pack(error.to_string()))?;
         validate_delta_depth(&bundle)?;
-        validate_proposed_objects(repository, Some(&bundle), commands)?;
+        let changes = validate_proposed_objects(repository, Some(&bundle), commands)?;
+        self.validate_policy(commands, &changes)?;
 
         let source_pack = outcome.data_path.ok_or(ReceivePackError::MissingPack)?;
         let source_index = outcome.index_path.ok_or(ReceivePackError::MissingPack)?;
@@ -349,6 +376,41 @@ impl ReceivePack {
         }
         sync_directory(&destination)?;
         Ok(promoted.then_some(destination_pack))
+    }
+
+    fn validate_policy(
+        &self,
+        commands: &[RefCommand],
+        changes: &[RefChange],
+    ) -> Result<(), ReceivePackError> {
+        let Some((owner, repository)) = &self.policy_context else {
+            if changes
+                .iter()
+                .any(|change| matches!(change, RefChange::Force))
+            {
+                return Err(ReceivePackError::NonFastForward);
+            }
+            return Ok(());
+        };
+        let policy = RepositoryPolicy::new(&self.database_path);
+        for (command, change) in commands.iter().zip(changes) {
+            let authorization = policy.authorize_ref_change(
+                &self.actor,
+                owner,
+                repository,
+                command.name.as_bstr(),
+                *change,
+            );
+            match authorization {
+                Ok(_) => {}
+                Err(PolicyError::Denied) if matches!(change, RefChange::Force) => {
+                    return Err(ReceivePackError::NonFastForward);
+                }
+                Err(PolicyError::Denied) => return Err(ReceivePackError::RefPolicy),
+                Err(error) => return Err(ReceivePackError::Policy(error)),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -605,10 +667,12 @@ fn validate_proposed_objects(
     repository: &gix::Repository,
     bundle: Option<&gix_pack::Bundle>,
     commands: &[RefCommand],
-) -> Result<(), ReceivePackError> {
+) -> Result<Vec<RefChange>, ReceivePackError> {
     let mut finder = CombinedObjects::new(repository, bundle);
+    let mut changes = Vec::with_capacity(commands.len());
     for command in commands {
         if command.new.is_null() {
+            changes.push(RefChange::Delete);
             continue;
         }
         let kind = finder.kind_and_links(command.new)?.0;
@@ -616,14 +680,18 @@ fn validate_proposed_objects(
             return Err(ReceivePackError::BranchNotCommit);
         }
         finder.validate_reachable(command.new)?;
-        if !command.old.is_null()
-            && command.name.as_bstr().starts_with(b"refs/heads/")
-            && !finder.is_ancestor(command.old, command.new)?
-        {
-            return Err(ReceivePackError::NonFastForward);
-        }
+        let change = if command.old.is_null() {
+            RefChange::Create
+        } else if command.name.as_bstr().starts_with(b"refs/tags/") {
+            RefChange::TagUpdate
+        } else if finder.is_ancestor(command.old, command.new)? {
+            RefChange::FastForward
+        } else {
+            RefChange::Force
+        };
+        changes.push(change);
     }
-    Ok(())
+    Ok(changes)
 }
 
 struct CombinedObjects<'a> {
@@ -889,6 +957,10 @@ pub(crate) enum ReceivePackError {
     BranchNotCommit,
     #[error("a branch update is not a fast-forward")]
     NonFastForward,
+    #[error("reference policy rejects the update")]
+    RefPolicy,
+    #[error("cannot check reference policy: {0}")]
+    Policy(PolicyError),
     #[error("cannot update Git references: {0}")]
     RefTransaction(String),
     #[error("incomplete Git operation {0} has mixed reference state")]
@@ -922,6 +994,8 @@ impl ReceivePackError {
         match self {
             Self::StaleRef => "stale reference",
             Self::NonFastForward => "non-fast-forward",
+            Self::RefPolicy => "reference policy rejected the update",
+            Self::Policy(_) => "reference policy is unavailable",
             Self::BranchNotCommit => "branch target is not a commit",
             Self::RefName => "reference name is not allowed",
             Self::ObjectFormat => "object format does not match",

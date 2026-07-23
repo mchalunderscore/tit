@@ -1399,10 +1399,21 @@ impl SshSession {
                 let database = repositories.push_database()?.to_owned();
                 let actor = identity.username.clone();
                 let public_key = self.authenticated_key.clone()?;
+                let uses_policy = repositories.uses_policy();
                 let permit = repositories.blocking_permit().await.ok()?;
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
-                    let service = ReceivePack::open(&path, &database, actor)?;
+                    let service = if uses_policy {
+                        ReceivePack::open_authorized(
+                            &path,
+                            &database,
+                            actor,
+                            owner.clone(),
+                            repository.clone(),
+                        )?
+                    } else {
+                        ReceivePack::open(&path, &database, actor)?
+                    };
                     let advertisement = service.advertisement()?;
                     Ok::<_, ReceivePackError>(InitialGitService::Receive(Box::new(
                         InitialReceiveService {

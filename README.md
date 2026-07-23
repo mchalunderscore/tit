@@ -435,3 +435,17 @@ updates, atomic events, the no-JavaScript Web form, and historical schema
 migration. Read the
 [pull-request merge architectural decision record](docs/adr/0025-pull-request-merge.md)
 for the merge, permission, intent, and recovery contracts.
+
+## Milestone 5.5 gate
+
+Run the branch-rule gate:
+
+```text
+./scripts/check-m5-5
+```
+
+This command tests protected-ref access, fast-forward-only branches,
+force-push rejection, protected-ref deletion rejection, topic-branch access,
+and pull-request merge permission. Read the
+[branch-rule architectural decision record](docs/adr/0026-branch-rules.md) for
+the ref, role, transport, and merge contracts.

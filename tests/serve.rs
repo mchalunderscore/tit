@@ -995,12 +995,34 @@ fn enforces_account_roles_and_ref_policy_through_the_production_ssh_server() {
     ));
 
     let writer_clone = instance.path().join("writer-private");
+    command(&writer_clone, ["switch", "-q", "-c", "topic"]);
     fs::write(writer_clone.join("writer.txt"), b"writer update\n").expect("write a writer change");
     git_commit(&writer_clone, "writer update");
-    assert!(git_push(&writer_key, &writer_clone, &["main"]).success());
+    assert!(git_push(&writer_key, &writer_clone, &["topic"]).success());
+    fs::write(writer_clone.join("writer-2.txt"), b"second writer update\n")
+        .expect("write a second writer change");
+    git_commit(&writer_clone, "second writer update");
+    assert!(git_push(&writer_key, &writer_clone, &["topic"]).success());
+    assert!(git_push(&writer_key, &writer_clone, &["--delete", "topic"]).success());
+    assert!(!git_push(&writer_key, &writer_clone, &["HEAD:main"]).success());
     assert!(!git_push(&writer_key, &writer_clone, &["HEAD:refs/notes/test"]).success());
-    command(&writer_clone, ["reset", "--hard", "HEAD~1"]);
-    assert!(!git_push(&writer_key, &writer_clone, &["--force", "main"]).success());
+
+    let owner_clone = instance.path().join("owner-private");
+    fs::write(owner_clone.join("owner.txt"), b"owner update\n").expect("write an owner change");
+    git_commit(&owner_clone, "owner update");
+    assert!(git_push(&owner_key, &owner_clone, &["main"]).success());
+    assert!(!git_push(&owner_key, &owner_clone, &["--delete", "main"]).success());
+    command(&owner_clone, ["switch", "-q", "-c", "force-test"]);
+    fs::write(owner_clone.join("force.txt"), b"first history\n").expect("write a branch change");
+    git_commit(&owner_clone, "first branch history");
+    assert!(git_push(&owner_key, &owner_clone, &["force-test"]).success());
+    command(&owner_clone, ["reset", "--hard", "HEAD~1"]);
+    fs::write(owner_clone.join("force.txt"), b"replacement history\n")
+        .expect("write replacement history");
+    git_commit(&owner_clone, "replacement branch history");
+    let force_result = git_push_output(&owner_key, &owner_clone, &["--force", "force-test"]);
+    assert!(!force_result.status.success());
+    assert!(String::from_utf8_lossy(&force_result.stderr).contains("non-fast-forward"));
 
     let reader_clone = instance.path().join("reader-write-private");
     assert!(ssh_clone_repository_succeeds(
@@ -1014,7 +1036,7 @@ fn enforces_account_roles_and_ref_policy_through_the_production_ssh_server() {
     git_commit(&reader_clone, "reader update");
     assert!(!git_push(&reader_key, &reader_clone, &["main"]).success());
 
-    command(&writer_clone, ["reset", "--hard", "origin/main"]);
+    command(&writer_clone, ["switch", "-q", "main"]);
     fs::write(writer_clone.join("removed-role.txt"), b"removed role\n")
         .expect("write a change before role removal");
     git_commit(&writer_clone, "change before role removal");
@@ -1028,7 +1050,14 @@ fn enforces_account_roles_and_ref_policy_through_the_production_ssh_server() {
         )
         .expect("remove the writer role");
     drop(database);
-    assert!(!git_push(&writer_key, &writer_clone, &["main"]).success());
+    assert!(
+        !git_push(
+            &writer_key,
+            &writer_clone,
+            &["HEAD:refs/heads/removed-role"]
+        )
+        .success()
+    );
     server.terminate();
     let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
         .expect("open the push audit database");
@@ -1048,7 +1077,7 @@ fn enforces_account_roles_and_ref_policy_through_the_production_ssh_server() {
             |row| row.get(0),
         )
         .expect("count failed push audit events");
-    assert_eq!(successful, 1);
+    assert_eq!(successful, 3);
     assert!(failed >= 2);
 }
 
@@ -1505,6 +1534,10 @@ fn git_commit(worktree: &Path, message: &str) {
 }
 
 fn git_push(private_key: &Path, worktree: &Path, refspecs: &[&str]) -> ExitStatus {
+    git_push_output(private_key, worktree, refspecs).status
+}
+
+fn git_push_output(private_key: &Path, worktree: &Path, refspecs: &[&str]) -> Output {
     let ssh_command = format!(
         "ssh -F /dev/null -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
         private_key.display()
@@ -1515,7 +1548,7 @@ fn git_push(private_key: &Path, worktree: &Path, refspecs: &[&str]) -> ExitStatu
         .args(refspecs)
         .env("GIT_SSH_COMMAND", ssh_command)
         .current_dir(worktree)
-        .status()
+        .output()
         .expect("push through the tit SSH server")
 }
 

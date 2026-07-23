@@ -20,8 +20,8 @@ clean three-way merge. Reject unrelated histories, conflicts, already-merged
 heads, stale revisions, and a method that does not match the mergeability
 state.
 
-Only a repository owner or maintainer can merge in this milestone. Milestone
-5.5 will move this rule into the common branch-policy service.
+Only a repository owner or maintainer can merge. The common repository policy
+service enforces this rule.
 
 Create a merge commit without a worktree. Use `gix` rename detection and tree
 merge code. Keep Git modes and byte paths. Use the base commit as the first

@@ -270,6 +270,19 @@ fn fast_forwards_pull_requests_with_one_durable_merge_event_for_both_hashes() {
             service.merge("alice", "project", 1, "bob", "fast-forward"),
             Err(PullRequestError::Store(StoreError::PullRequestDenied))
         ));
+        Store::open(&fixture.database)
+            .expect("open the collaborator store")
+            .connection()
+            .execute(
+                "UPDATE repository_collaborator SET role = 'writer'
+                 WHERE account_id = (SELECT id FROM account WHERE username = 'bob')",
+                [],
+            )
+            .expect("make the collaborator a writer");
+        assert!(matches!(
+            service.merge("alice", "project", 1, "bob", "fast-forward"),
+            Err(PullRequestError::Store(StoreError::PullRequestDenied))
+        ));
 
         let merged = service
             .merge("alice", "project", 1, "alice", "fast-forward")

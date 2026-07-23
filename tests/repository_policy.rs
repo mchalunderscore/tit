@@ -4,7 +4,7 @@ mod policy;
 #[path = "../src/store/mod.rs"]
 mod store;
 
-use policy::{PolicyError, RepositoryOperation, RepositoryPolicy};
+use policy::{PolicyError, RefChange, RepositoryOperation, RepositoryPolicy};
 use store::{AuditContext, NewRepository, RepositoryOrigin, Store, StoreError};
 use tempfile::TempDir;
 
@@ -159,6 +159,108 @@ fn applies_role_visibility_and_archive_changes_immediately() {
     for operation in operations() {
         assert_denied(&policy, Some("owner"), operation);
     }
+}
+
+#[test]
+fn applies_common_protected_ref_and_merge_rules() {
+    let directory = TempDir::new().expect("create a ref-policy fixture directory");
+    let database = directory.path().join("tit.sqlite3");
+    let mut store = Store::open(&database).expect("create the ref-policy database");
+    for (id, username) in [(1, "owner"), (2, "maintainer"), (3, "writer")] {
+        store
+            .connection()
+            .execute(
+                "INSERT INTO account (id, username, is_administrator, state, created_at)
+                 VALUES (?1, ?2, 0, 'active', 1)",
+                rusqlite::params![id, username],
+            )
+            .expect("create a ref-policy account");
+    }
+    store
+        .create_repository(&NewRepository {
+            id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            owner: "owner",
+            slug: "project",
+            object_format: "sha1",
+            created_at: 2,
+            origin: RepositoryOrigin::Created,
+            initial_references: &[],
+            actor: "admin-cli",
+            correlation_id: "test",
+        })
+        .expect("create a ref-policy repository");
+    for (username, role) in [("maintainer", "maintainer"), ("writer", "writer")] {
+        store
+            .set_repository_collaborator("owner", "project", username, role, &audit(3))
+            .expect("set a ref-policy collaborator");
+    }
+    let policy = RepositoryPolicy::new(&database);
+    for actor in ["owner", "maintainer"] {
+        policy
+            .authorize_ref_change(
+                actor,
+                "owner",
+                "project",
+                b"refs/heads/main",
+                RefChange::FastForward,
+            )
+            .expect("allow a maintainer fast-forward on main");
+        policy
+            .authorize_merge(actor, "owner", "project")
+            .expect("allow a maintainer merge");
+    }
+    assert!(matches!(
+        policy.authorize_ref_change(
+            "writer",
+            "owner",
+            "project",
+            b"refs/heads/main",
+            RefChange::FastForward,
+        ),
+        Err(PolicyError::Denied)
+    ));
+    assert!(matches!(
+        policy.authorize_ref_change(
+            "owner",
+            "owner",
+            "project",
+            b"refs/heads/main",
+            RefChange::Delete,
+        ),
+        Err(PolicyError::Denied)
+    ));
+    assert!(matches!(
+        policy.authorize_ref_change(
+            "owner",
+            "owner",
+            "project",
+            b"refs/heads/topic",
+            RefChange::Force,
+        ),
+        Err(PolicyError::Denied)
+    ));
+    policy
+        .authorize_ref_change(
+            "writer",
+            "owner",
+            "project",
+            b"refs/heads/topic",
+            RefChange::Create,
+        )
+        .expect("allow a writer topic branch");
+    policy
+        .authorize_ref_change(
+            "writer",
+            "owner",
+            "project",
+            b"refs/tags/v1",
+            RefChange::TagUpdate,
+        )
+        .expect("allow a writer tag update");
+    assert!(matches!(
+        policy.authorize_merge("writer", "owner", "project"),
+        Err(PolicyError::Denied)
+    ));
 }
 
 fn operations() -> [RepositoryOperation; 4] {

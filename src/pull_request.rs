@@ -13,6 +13,7 @@ use crate::git::read::{
     Comparison, ReadCancellation, ReadError, ReadLimits, RepositoryReadService,
 };
 use crate::git::repository::{GitRepository, GitRepositoryError};
+use crate::policy::{PolicyError, RepositoryPolicy};
 use crate::store::{
     GitOperationIntent, NewPullRequestMerge, NewPullRequestRefIntent, NewPullRequestReview,
     PullRequestDetail, PullRequestRecord, PullRequestRefIntentRecord, PullRequestRevisionRecord,
@@ -353,9 +354,12 @@ impl PullRequestService {
         if detail.pull_request.state != "open" {
             return Err(StoreError::PullRequestState.into());
         }
-        if !detail.can_merge {
-            return Err(StoreError::PullRequestDenied.into());
-        }
+        RepositoryPolicy::new(&self.database)
+            .authorize_merge(actor, owner, repository)
+            .map_err(|error| match error {
+                PolicyError::Denied => PullRequestError::Store(StoreError::PullRequestDenied),
+                other => PullRequestError::Policy(other),
+            })?;
         let revision = detail.revisions.last().ok_or(PullRequestError::Revision)?;
         let path = self.repository_path(&detail.repository.id)?;
         let git = GitRepository::open(&path)?;
@@ -715,6 +719,8 @@ pub(crate) enum PullRequestError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Read(#[from] ReadError),
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
     #[error(transparent)]
     ReceivePack(#[from] crate::git::receive_pack::ReceivePackError),
     #[error("cannot create a random pull-request ID")]
