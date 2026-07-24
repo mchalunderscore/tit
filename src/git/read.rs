@@ -265,6 +265,26 @@ impl RepositoryReadService {
         self.read_commit(id, &budget)
     }
 
+    pub(crate) fn commit_metadata(
+        &self,
+        ids: &[ObjectId],
+        cancellation: &ReadCancellation,
+    ) -> Result<Vec<Option<CommitInfo>>, ReadError> {
+        if ids.len() > self.limits.max_refs {
+            return Err(ReadError::Limit("commit metadata"));
+        }
+        let budget = self.budget(cancellation);
+        let commits = ids
+            .iter()
+            .map(|id| {
+                budget.check()?;
+                Ok(self.read_commit(*id, &budget).ok())
+            })
+            .collect::<Result<Vec<_>, ReadError>>()?;
+        budget.check()?;
+        Ok(commits)
+    }
+
     pub(crate) fn history(
         &self,
         start: ObjectId,
@@ -280,6 +300,17 @@ impl RepositoryReadService {
         path: &[u8],
         cancellation: &ReadCancellation,
     ) -> Result<Vec<TreeEntryInfo>, ReadError> {
+        self.tree_prefix(commit, path, self.limits.max_tree_entries, cancellation)
+            .map(|(entries, _)| entries)
+    }
+
+    pub(crate) fn tree_prefix(
+        &self,
+        commit: ObjectId,
+        path: &[u8],
+        maximum: usize,
+        cancellation: &ReadCancellation,
+    ) -> Result<(Vec<TreeEntryInfo>, bool), ReadError> {
         validate_path(path, true, self.limits.max_path_bytes)?;
         let budget = self.budget(cancellation);
         let commit = self.read_commit(commit, &budget)?;
@@ -288,8 +319,11 @@ impl RepositoryReadService {
         if tree.entries.len() > self.limits.max_tree_entries {
             return Err(ReadError::Limit("tree entries"));
         }
-        tree.entries
+        let truncated = tree.entries.len() > maximum;
+        let entries = tree
+            .entries
             .into_iter()
+            .take(maximum)
             .map(|entry| {
                 budget.check()?;
                 Ok(TreeEntryInfo {
@@ -299,7 +333,8 @@ impl RepositoryReadService {
                     kind: entry.mode.kind(),
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, ReadError>>()?;
+        Ok((entries, truncated))
     }
 
     pub(crate) fn blob(

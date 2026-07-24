@@ -37,6 +37,64 @@ main {
   padding: 2rem 0;
 }
 
+main > article,
+main > details,
+main > dl,
+main > form,
+main > ol,
+main > section:not(.repository-panel),
+main > ul,
+main > .field,
+main > .table-scroll,
+.two-column > section {
+  margin-block: 1.5rem;
+  padding: 1rem;
+  border: 1px solid GrayText;
+  border-radius: 0.25rem;
+}
+
+main > ol,
+main > ul {
+  padding-inline-start: 2.75rem;
+}
+
+main > article > :first-child,
+main > details > :first-child,
+main > dl > :first-child,
+main > form > :first-child,
+main > ol > :first-child,
+main > section:not(.repository-panel) > :first-child,
+main > ul > :first-child,
+main > .field > :first-child,
+.two-column > section > :first-child {
+  margin-top: 0;
+}
+
+main > article > :last-child,
+main > details > :last-child,
+main > dl > :last-child,
+main > form > :last-child,
+main > ol > :last-child,
+main > section:not(.repository-panel) > :last-child,
+main > ul > :last-child,
+main > .field > :last-child,
+.two-column > section > :last-child {
+  margin-bottom: 0;
+}
+
+main > .table-scroll {
+  padding: 0;
+}
+
+main > .table-scroll th,
+main > .table-scroll td {
+  padding: 0.6rem 1rem;
+}
+
+main > .table-scroll tbody tr:last-child > * {
+  border-bottom: 0;
+}
+
 footer {
   padding: 1rem 0;
   border-top: 1px solid GrayText;
@@ -90,6 +148,11 @@ summary {
   align-items: start;
 }
 
+.repository-summary-main,
+.repository-sidebar {
+  min-width: 0;
+}
+
 .repository-summary-main > section,
 .repository-sidebar > section {
   margin-bottom: 2rem;
@@ -110,12 +173,6 @@ summary {
   overflow: hidden;
 }
 
-.repository-file-panel > h2 {
-  margin: 0;
-  padding: 1rem;
-  border-bottom: 1px solid GrayText;
-}
-
 .repository-file-panel th,
 .repository-file-panel td {
   padding: 0.6rem 1rem;
@@ -123,6 +180,12 @@ summary {
 
 .repository-file-panel tbody tr:last-child > * {
   border-bottom: 0;
+}
+
+.repository-file-more {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  border-top: 1px solid GrayText;
 }
 
 .repository-file-list th:first-child {
@@ -294,10 +357,184 @@ a {
   overflow-wrap: anywhere;
 }
 
+.home-intro {
+  align-self: stretch;
+}
+
+.home-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  margin-top: 1.5rem;
+}
+
+.home-repository-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.home-repository-list li {
+  padding-block: 0.75rem;
+}
+
+.home-repository-list li + li {
+  border-top: 1px solid GrayText;
+}
+
+.repository-name {
+  font-weight: 700;
+}
+
+.repository-meta {
+  display: block;
+  margin-top: 0.25rem;
+}
+
+.home-repository-list p {
+  margin: 0.25rem 0 0;
+}
+
+.home-repository-list .inline-form {
+  margin-top: 0.75rem;
+}
+
+.home-workflow {
+  margin-top: 2rem;
+}
+
+.home-workflow ol {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 2rem;
+  margin-bottom: 0;
+  padding-left: 1.5rem;
+}
+
+.home-workflow strong {
+  display: block;
+  margin-bottom: 0.5rem;
+}
+
+.home-workflow p {
+  margin: 0;
+}
+
+.auth-page {
+  width: min(100%, 36rem);
+  margin-inline: auto;
+}
+
+.auth-panel {
+  padding: 1rem;
+  border: 1px solid GrayText;
+  border-radius: 0.25rem;
+}
+
+.auth-panel > :first-child {
+  margin-top: 0;
+}
+
+.auth-panel > :last-child {
+  margin-bottom: 0;
+}
+
+.auth-panel form {
+  max-width: none;
+}
+
+.auth-panel details {
+  margin-bottom: 0;
+  padding-top: 1rem;
+  border-top: 1px solid GrayText;
+}
+
+.search-panel form {
+  max-width: none;
+}
+
+.search-results {
+  padding-left: 1.5rem;
+}
+
+.search-results li {
+  padding-block: 0.75rem;
+}
+
+.search-results li + li {
+  border-top: 1px solid GrayText;
+}
+
+.page-section-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  margin: 2rem 0 1rem;
+}
+
+.page-section-header h2 {
+  margin: 0;
+}
+
+.collection-panel > .filter-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.75rem;
+  max-width: none;
+  margin-bottom: 0;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid GrayText;
+}
+
+.filter-form .field {
+  margin: 0;
+}
+
+.filter-form select {
+  min-width: 9rem;
+}
+
+.issue-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.issue-list li {
+  padding-block: 1rem;
+}
+
+.issue-list li + li {
+  border-top: 1px solid GrayText;
+}
+
+.issue-title {
+  font-weight: 700;
+}
+
+.issue-meta {
+  display: block;
+  margin-top: 0.25rem;
+}
+
+.collection-action {
+  margin-bottom: 0;
+  padding-top: 1rem;
+  border-top: 1px solid GrayText;
+}
+
 @media (max-width: 44rem) {
   .two-column,
   .repository-summary-layout {
     grid-template-columns: 1fr;
+  }
+
+  .home-workflow ol {
+    grid-template-columns: 1fr;
+    gap: 1rem;
   }
 }
 

@@ -2,40 +2,52 @@
 {% block title %}Issues · {{ owner }}/{{ repository }} · tit{% endblock %}
 {% block content %}
   <header class="repository-header">
-    <h1><a href="/{{ owner }}/{{ repository }}">{{ owner }}/{{ repository }}</a></h1>
+    <h1><a href="/{{ owner }}">{{ owner }}</a>/<a href="/{{ owner }}/{{ repository }}">{{ repository }}</a></h1>
 {% include "repository-nav.html" %}
   </header>
 
-  <h2>Issues</h2>
-  <p><a href="/{{ owner }}/{{ repository }}/issues/rss.xml">Issue RSS</a></p>
-  <form method="get" action="/{{ owner }}/{{ repository }}/issues">
-    <label for="issue-state">State</label>
-    <select id="issue-state" name="state">
-      <option value="open"{% if state_open %} selected{% endif %}>Open</option>
-      <option value="closed"{% if state_closed %} selected{% endif %}>Closed</option>
-      <option value="all"{% if state_all %} selected{% endif %}>All</option>
-    </select>
-    <button type="submit">Filter</button>
-  </form>
+  <header class="page-section-header">
+    <h2>Issues</h2>
+    <a href="/{{ owner }}/{{ repository }}/issues/rss.xml">Issue RSS</a>
+  </header>
+  <section class="collection-panel" aria-label="Issues">
+    <form class="filter-form" method="get" action="/{{ owner }}/{{ repository }}/issues">
+      <div class="field">
+        <label for="issue-state">State</label>
+        <select id="issue-state" name="state">
+          <option value="open"{% if state_open %} selected{% endif %}>Open</option>
+          <option value="closed"{% if state_closed %} selected{% endif %}>Closed</option>
+          <option value="all"{% if state_all %} selected{% endif %}>All</option>
+        </select>
+      </div>
+      <button type="submit">Filter</button>
+    </form>
 {% if issues.is_empty() %}
-  <p>This repository has no issues.</p>
+    <p>This repository has no issues.</p>
 {% else %}
-  <ol class="issue-list">
+    <ol class="issue-list">
 {% for issue in issues %}
-    <li><a href="/{{ owner }}/{{ repository }}/issues/{{ issue.number }}">#{{ issue.number }} {{ issue.title }}</a> — {{ issue.state }}, opened by {{ issue.author }}, updated <time datetime="{{ issue.updated_at }}">{{ issue.updated_at|human_time }}</time></li>
+      <li>
+        <a class="issue-title" href="/{{ owner }}/{{ repository }}/issues/{{ issue.number }}">#{{ issue.number }} {{ issue.title }}</a>
+        <span class="issue-meta">{{ issue.state }} · opened by {{ issue.author }} · updated <time datetime="{{ issue.updated_at }}">{{ issue.updated_at|human_time }}</time></span>
+      </li>
 {% endfor %}
-  </ol>
+    </ol>
 {% if has_previous || has_next %}
-  <nav class="pagination" aria-label="Issue pages">
+    <nav class="pagination" aria-label="Issue pages">
 {% if has_previous %}
-    <a href="/{{ owner }}/{{ repository }}/issues?state={{ state }}&page={{ previous_page }}">Newer issues</a>
+      <a href="/{{ owner }}/{{ repository }}/issues?state={{ state }}&page={{ previous_page }}">Newer issues</a>
 {% endif %}
 {% if has_next %}
-    <a href="/{{ owner }}/{{ repository }}/issues?state={{ state }}&page={{ next_page }}">Older issues</a>
+      <a href="/{{ owner }}/{{ repository }}/issues?state={{ state }}&page={{ next_page }}">Older issues</a>
 {% endif %}
-  </nav>
+    </nav>
 {% endif %}
 {% endif %}
+{% if !can_create %}
+    <p class="collection-action"><a href="/login">Log in</a> to create an issue.</p>
+{% endif %}
+  </section>
 
 {% if can_create %}
   <section aria-labelledby="new-issue-heading">
@@ -53,7 +65,5 @@
       <button type="submit">Create issue</button>
     </form>
   </section>
-{% else %}
-  <p><a href="/login">Log in</a> to create an issue.</p>
 {% endif %}
 {% endblock %}

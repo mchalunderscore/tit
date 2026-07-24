@@ -1,13 +1,19 @@
 {% extends "base.html" %}
 {% block title %}Search · tit{% endblock %}
 {% block content %}
-  <h1>Search repositories</h1>
-  <form method="get" action="/search">
-    <label for="metadata-query">Search text</label>
-    <input id="metadata-query" name="q" value="{{ query }}" maxlength="256" required>
-    <button type="submit">Search</button>
-  </form>
+  <h1 id="search-heading">Search repositories</h1>
+  <section class="search-panel" aria-labelledby="search-heading">
+    <form method="get" action="/search">
+      <div class="field">
+        <label for="metadata-query">Search text</label>
+        <input id="metadata-query" name="q" value="{{ query }}" maxlength="256" required>
+      </div>
+      <button type="submit">Search</button>
+    </form>
+  </section>
 {% if searched %}
+  <section aria-labelledby="search-results-heading">
+    <h2 id="search-results-heading">Results</h2>
   <p>Scanned {{ rows_scanned }} repository names.</p>
 {% if truncated %}
   <p>The result is incomplete because the search reached a limit.</p>
@@ -27,5 +33,6 @@
 {% endfor %}
   </ol>
 {% endif %}
+  </section>
 {% endif %}
 {% endblock %}

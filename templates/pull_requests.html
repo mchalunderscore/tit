@@ -2,40 +2,52 @@
 {% block title %}Pull requests · {{ owner }}/{{ repository }} · tit{% endblock %}
 {% block content %}
   <header class="repository-header">
-    <h1><a href="/{{ owner }}/{{ repository }}">{{ owner }}/{{ repository }}</a></h1>
+    <h1><a href="/{{ owner }}">{{ owner }}</a>/<a href="/{{ owner }}/{{ repository }}">{{ repository }}</a></h1>
 {% include "repository-nav.html" %}
   </header>
 
-  <h2>Pull requests</h2>
-  <form method="get" action="/{{ owner }}/{{ repository }}/pulls">
-    <label for="pull-request-state">State</label>
-    <select id="pull-request-state" name="state">
-      <option value="open"{% if state_open %} selected{% endif %}>Open</option>
-      <option value="closed"{% if state_closed %} selected{% endif %}>Closed</option>
-      <option value="merged"{% if state_merged %} selected{% endif %}>Merged</option>
-      <option value="all"{% if state_all %} selected{% endif %}>All</option>
-    </select>
-    <button type="submit">Filter</button>
-  </form>
+  <header class="page-section-header">
+    <h2>Pull requests</h2>
+  </header>
+  <section class="collection-panel" aria-label="Pull requests">
+    <form class="filter-form" method="get" action="/{{ owner }}/{{ repository }}/pulls">
+      <div class="field">
+        <label for="pull-request-state">State</label>
+        <select id="pull-request-state" name="state">
+          <option value="open"{% if state_open %} selected{% endif %}>Open</option>
+          <option value="closed"{% if state_closed %} selected{% endif %}>Closed</option>
+          <option value="merged"{% if state_merged %} selected{% endif %}>Merged</option>
+          <option value="all"{% if state_all %} selected{% endif %}>All</option>
+        </select>
+      </div>
+      <button type="submit">Filter</button>
+    </form>
 {% if pull_requests.is_empty() %}
-  <p>This repository has no pull requests.</p>
+    <p>This repository has no pull requests.</p>
 {% else %}
-  <ol class="issue-list">
+    <ol class="issue-list">
 {% for pull_request in pull_requests %}
-    <li><a href="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}">#{{ pull_request.number }} {{ pull_request.title }}</a> — {{ pull_request.state }}, opened by {{ pull_request.author }}, updated <time datetime="{{ pull_request.updated_at }}">{{ pull_request.updated_at|human_time }}</time></li>
+      <li>
+        <a class="issue-title" href="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}">#{{ pull_request.number }} {{ pull_request.title }}</a>
+        <span class="issue-meta">{{ pull_request.state }} · opened by {{ pull_request.author }} · updated <time datetime="{{ pull_request.updated_at }}">{{ pull_request.updated_at|human_time }}</time></span>
+      </li>
 {% endfor %}
-  </ol>
+    </ol>
 {% if has_previous || has_next %}
-  <nav class="pagination" aria-label="Pull-request pages">
+    <nav class="pagination" aria-label="Pull-request pages">
 {% if has_previous %}
-    <a href="/{{ owner }}/{{ repository }}/pulls?state={{ state }}&page={{ previous_page }}">Newer pull requests</a>
+      <a href="/{{ owner }}/{{ repository }}/pulls?state={{ state }}&page={{ previous_page }}">Newer pull requests</a>
 {% endif %}
 {% if has_next %}
-    <a href="/{{ owner }}/{{ repository }}/pulls?state={{ state }}&page={{ next_page }}">Older pull requests</a>
+      <a href="/{{ owner }}/{{ repository }}/pulls?state={{ state }}&page={{ next_page }}">Older pull requests</a>
 {% endif %}
-  </nav>
+    </nav>
 {% endif %}
 {% endif %}
+{% if !can_create %}
+    <p class="collection-action">You need write access to open a pull request.</p>
+{% endif %}
+  </section>
 
 {% if can_create %}
   <section aria-labelledby="new-pull-request-heading">
@@ -66,7 +78,5 @@
       <button type="submit">Open pull request</button>
     </form>
   </section>
-{% else %}
-  <p>You need write access to open a pull request.</p>
 {% endif %}
 {% endblock %}

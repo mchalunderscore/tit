@@ -40,6 +40,8 @@ use super::{PublicWebConfig, RequestActor, RequestId, WebState, render_error_wit
 const MAX_HISTORY_COMMITS: usize = 10_000;
 const MAX_SUMMARY_COMMITS: usize = 3;
 const MAX_SUMMARY_TAGS: usize = 3;
+const MAX_SUMMARY_TAG_CANDIDATES: usize = 128;
+const MAX_SUMMARY_FILES: usize = 50;
 const COMMITS_PER_PAGE: usize = 100;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
 
@@ -437,19 +439,31 @@ async fn summary(
                     .iter()
                     .find(|reference| reference.name == default_branch.as_bytes())
                     .map(|reference| reference.target);
-                let mut tags = references
+                let tag_references = references
                     .iter()
                     .filter(|reference| reference.name.starts_with(b"refs/tags/"))
-                    .filter_map(|reference| {
-                        let target = reference.peeled.unwrap_or(reference.target);
-                        let commit = service.commit(target, &cancellation).ok()?;
-                        Some(RepositorySummaryTag {
-                            name: reference.name[b"refs/tags/".len()..].to_vec(),
-                            target,
-                            committed_at: commit.committed_at,
-                        })
-                    })
                     .collect::<Vec<_>>();
+                let tags_omitted = tag_references.len() > MAX_SUMMARY_TAG_CANDIDATES;
+                let mut tags = if tags_omitted {
+                    Vec::new()
+                } else {
+                    let targets = tag_references
+                        .iter()
+                        .map(|reference| reference.peeled.unwrap_or(reference.target))
+                        .collect::<Vec<_>>();
+                    tag_references
+                        .into_iter()
+                        .zip(service.commit_metadata(&targets, &cancellation)?)
+                        .filter_map(|(reference, commit)| {
+                            let commit = commit?;
+                            Some(RepositorySummaryTag {
+                                name: reference.name[b"refs/tags/".len()..].to_vec(),
+                                target: commit.id,
+                                committed_at: commit.committed_at,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                };
                 tags.sort_by(|left, right| {
                     right
                         .committed_at
@@ -457,13 +471,18 @@ async fn summary(
                         .then_with(|| right.name.cmp(&left.name))
                 });
                 tags.truncate(MAX_SUMMARY_TAGS);
-                let (history, readme, entries) = match head {
-                    Some(head) => (
-                        service.history(head, &cancellation)?,
-                        service.readme(head, &cancellation)?,
-                        service.tree(head, &[], &cancellation)?,
-                    ),
-                    None => (Vec::new(), None, Vec::new()),
+                let (history, readme, entries, entries_truncated) = match head {
+                    Some(head) => {
+                        let (entries, truncated) =
+                            service.tree_prefix(head, &[], MAX_SUMMARY_FILES, &cancellation)?;
+                        (
+                            service.history(head, &cancellation)?,
+                            service.readme(head, &cancellation)?,
+                            entries,
+                            truncated,
+                        )
+                    }
+                    None => (Vec::new(), None, Vec::new(), false),
                 };
                 Ok(RepositoryPage::summary(
                     record,
@@ -474,8 +493,10 @@ async fn summary(
                         head,
                         history,
                         tags,
+                        tags_omitted,
                         readme: readme.map(|readme| (readme.path, readme.blob.data)),
                         entries,
+                        entries_truncated,
                     },
                 ))
             },
@@ -1416,7 +1437,9 @@ struct RepositoryPage {
     readme_binary: bool,
     history: Vec<CommitView>,
     tags: Vec<TagView>,
+    tags_omitted: bool,
     entries: Vec<TreeView>,
+    entries_truncated: bool,
     blob_content: String,
     blob_binary: bool,
     commit: CommitView,
@@ -1444,8 +1467,10 @@ struct RepositorySummary {
     head: Option<ObjectId>,
     history: Vec<CommitInfo>,
     tags: Vec<RepositorySummaryTag>,
+    tags_omitted: bool,
     readme: Option<(Vec<u8>, Vec<u8>)>,
     entries: Vec<TreeEntryInfo>,
+    entries_truncated: bool,
 }
 
 impl RepositoryPage {
@@ -1473,7 +1498,9 @@ impl RepositoryPage {
             readme_binary: false,
             history: Vec::new(),
             tags: Vec::new(),
+            tags_omitted: false,
             entries: Vec::new(),
+            entries_truncated: false,
             blob_content: String::new(),
             blob_binary: false,
             commit: CommitView::default(),
@@ -1523,6 +1550,8 @@ impl RepositoryPage {
                 committed_at: tag.committed_at,
             })
             .collect();
+        page.tags_omitted = summary.tags_omitted;
+        page.entries_truncated = summary.entries_truncated;
         if let Some(head) = summary.head {
             page.entries = summary
                 .entries

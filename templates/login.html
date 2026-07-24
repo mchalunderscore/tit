@@ -1,23 +1,27 @@
 {% extends "base.html" %}
 {% block title %}Log in · tit{% endblock %}
 {% block content %}
-  <h1>Log in</h1>
-  <p>Use an SSH key that is active on your account.</p>
+  <div class="auth-page">
+    <h1 id="login-heading">Log in</h1>
+    <section class="auth-panel" aria-labelledby="login-heading">
+      <p>Use an SSH key that is active on your account.</p>
 {% if has_error %}
-  <p class="error" role="alert">{{ error }}</p>
+      <p class="error" role="alert">{{ error }}</p>
 {% endif %}
-  <form action="/login/ssh" method="post">
-    <button type="submit">Log in with SSH</button>
-  </form>
-  <details>
-    <summary>Sign a challenge instead</summary>
-    <p>Use this method when you cannot connect to the tit SSH service.</p>
-    <form action="/login" method="post">
-      <div class="field">
-        <label for="username">Username</label>
-        <input id="username" name="username" value="{{ username }}" required autocomplete="username" autocapitalize="none" spellcheck="false">
-      </div>
-      <button type="submit">Create challenge</button>
-    </form>
-  </details>
+      <form action="/login/ssh" method="post">
+        <button type="submit">Log in with SSH</button>
+      </form>
+      <details>
+        <summary>Sign a challenge instead</summary>
+        <p>Use this method when you cannot connect to the tit SSH service.</p>
+        <form action="/login" method="post">
+          <div class="field">
+            <label for="username">Username</label>
+            <input id="username" name="username" value="{{ username }}" required autocomplete="username" autocapitalize="none" spellcheck="false">
+          </div>
+          <button type="submit">Create challenge</button>
+        </form>
+      </details>
+    </section>
+  </div>
 {% endblock %}

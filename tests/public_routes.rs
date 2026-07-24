@@ -106,12 +106,32 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         .await
         .expect("start the public Web server");
 
+        let home = request(server.address(), "GET", "/", &[], &[]);
+        assert_eq!(home.status, 200);
+        assert_html_policy(&home);
+        let home_text = home.text();
+        assert!(home_text.contains("<div class=\"two-column\">"));
+        assert!(home_text.contains("<h1>A small Git CDE</h1>"));
+        assert!(home_text.contains("aria-label=\"Get started\""));
+        assert!(home_text.contains("<ul class=\"home-repository-list\">"));
+        assert!(home_text.contains("href=\"/alice/example\""));
+        assert!(home_text.contains(
+            "<section class=\"home-workflow\" aria-labelledby=\"home-workflow-heading\">"
+        ));
+        assert!(home_text.contains("<code>repo create</code>"));
+
         let summary = request(server.address(), "GET", "/alice/example", &[], &[]);
         assert_eq!(summary.status, 200);
         assert_html_policy(&summary);
         assert_repository_navigation(&summary, "alice", "example");
         let summary_text = summary.text();
-        assert!(summary_text.contains("<h1><a href=\"/alice/example\">alice/example</a></h1>"));
+        assert!(summary_text.contains(
+            "<h1><a href=\"/alice\">alice</a>/<a href=\"/alice/example\">example</a></h1>"
+        ));
+        assert!(summary_text.contains(
+            "<section class=\"repository-panel repository-file-panel\" aria-label=\"Files\">"
+        ));
+        assert!(!summary_text.contains("<h2 id=\"files-heading\">Files</h2>"));
         assert!(summary_text.contains("https://tit.example/alice/example"));
         assert!(summary_text.contains("ssh://tit.example:2222/alice/example"));
         assert!(summary_text.contains(&fixture.head));
@@ -129,6 +149,8 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
             fixture.head
         )));
         assert!(summary_text.contains("README.md"));
+        assert!(summary_text.contains(">View all files</a>"));
+        assert!(!summary_text.contains("summary-overflow-50.txt"));
         assert!(summary_text.contains("<h1>tit fixture</h1>"));
         assert!(summary_text.contains("<strong>safe</strong>"));
         assert!(summary_text.contains("<code>&lt;safe&gt;</code>"));
@@ -643,6 +665,29 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
             b"first line\nsecond line\n"
         );
 
+        let tag_directory = fixture
+            .instance
+            .path()
+            .join("repositories")
+            .join(format!("{}.git", fixture.repository_id))
+            .join("refs/tags");
+        fs::create_dir_all(&tag_directory).expect("create the tag directory");
+        for index in 0..=128 {
+            fs::write(
+                tag_directory.join(format!("summary-limit-{index:03}")),
+                format!("{}\n", fixture.head),
+            )
+            .expect("write a summary-limit tag");
+        }
+        let tag_limited_summary = request(server.address(), "GET", "/alice/example", &[], &[]);
+        assert_eq!(tag_limited_summary.status, 200);
+        assert!(
+            tag_limited_summary
+                .text()
+                .contains("This repository has too many tags for the summary.")
+        );
+        assert!(!tag_limited_summary.text().contains(">v0.4</a>"));
+
         for route in [
             "/alice/missing",
             "/Alice/example",
@@ -757,6 +802,13 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     assert_eq!(anonymous.status, 200);
     assert_repository_navigation(&anonymous, "alice", "example");
     assert!(anonymous.text().contains("This repository has no issues."));
+    assert!(
+        anonymous
+            .text()
+            .contains("<section class=\"collection-panel\" aria-label=\"Issues\">")
+    );
+    assert!(anonymous.text().contains("<form class=\"filter-form\""));
+    assert!(anonymous.text().contains("class=\"collection-action\""));
     assert!(!anonymous.text().contains("Create an issue</h2>"));
 
     let cookie = format!("tit-session={token}; tit-csrf={csrf}");
@@ -778,6 +830,17 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     );
     assert_eq!(created.status, 303);
     assert_eq!(created.header("location"), "/alice/example/issues/1");
+
+    let issue_index = request(
+        server.address(),
+        "GET",
+        "/alice/example/issues",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    );
+    let issue_index_text = issue_index.text();
+    assert!(issue_index_text.contains("<ol class=\"issue-list\">"));
+    assert!(issue_index_text.contains("<span class=\"issue-meta\">open · opened by alice"));
 
     let detail = request(
         server.address(),
@@ -890,6 +953,16 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
         opened_pull_request.header("location"),
         "/alice/example/pulls/1"
     );
+    let pull_request_index = request(
+        server.address(),
+        "GET",
+        "/alice/example/pulls",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    );
+    let pull_request_index_text = pull_request_index.text();
+    assert!(pull_request_index_text.contains("<ol class=\"issue-list\">"));
+    assert!(pull_request_index_text.contains("<span class=\"issue-meta\">open · opened by alice"));
     let pull_request_page = request(server.address(), "GET", "/alice/example/pulls/1", &[], &[]);
     assert_eq!(pull_request_page.status, 200);
     assert!(pull_request_page.text().contains("#1 Review the feature"));
@@ -1521,7 +1594,16 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
         &[("Cookie", cookie.as_str())],
         &[],
     );
-    assert!(archived_home.text().contains("alice/renamed · archived"));
+    assert!(
+        archived_home
+            .text()
+            .contains("<strong>alice/renamed</strong>")
+    );
+    assert!(
+        archived_home
+            .text()
+            .contains("<span class=\"repository-meta\">archived</span>")
+    );
     assert!(archived_home.text().contains("Unarchive repository"));
     let denied_unarchive = form(&[("csrf", reader_csrf.as_str()), ("confirm", "yes")]);
     assert_eq!(
@@ -1678,6 +1760,13 @@ impl Fixture {
             .expect("write the percent-encoded path");
         fs::write(worktree.join("malformed.txt"), b"start \xff needle\n")
             .expect("write malformed UTF-8 content");
+        for index in 0..=50 {
+            fs::write(
+                worktree.join(format!("summary-overflow-{index:02}.txt")),
+                b"summary entry\n",
+            )
+            .expect("write a summary-limit file");
+        }
         commit_all(&worktree, "first commit");
         let parent = rev_parse(&worktree, "HEAD");
         for index in 1..=100 {
@@ -1880,6 +1969,9 @@ fn assert_html_policy(response: &HttpResponse) {
 
 fn assert_repository_navigation(response: &HttpResponse, owner: &str, repository: &str) {
     let text = response.text();
+    assert!(text.contains(&format!(
+        "<h1><a href=\"/{owner}\">{owner}</a>/<a href=\"/{owner}/{repository}\">{repository}</a></h1>"
+    )));
     for suffix in [
         "", "/refs", "/issues", "/pulls", "/watch", "/rss.xml", "/search",
     ] {

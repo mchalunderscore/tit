@@ -2,7 +2,7 @@
 {% block title %}Watch · {{ owner }}/{{ repository }} · tit{% endblock %}
 {% block content %}
   <header class="repository-header">
-    <h1><a href="/{{ owner }}/{{ repository }}">{{ owner }}/{{ repository }}</a></h1>
+    <h1><a href="/{{ owner }}">{{ owner }}</a>/<a href="/{{ owner }}/{{ repository }}">{{ repository }}</a></h1>
 {% include "repository-nav.html" %}
   </header>
 

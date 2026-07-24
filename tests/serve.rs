@@ -231,9 +231,14 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     assert!(signed_in_home.contains("<h1>alice</h1>"));
     assert!(signed_in_home.contains("<h2>Your repositories</h2>"));
     assert!(signed_in_home.contains("<h2>Recently updated public repositories</h2>"));
+    assert!(signed_in_home.contains("<div class=\"two-column\">"));
     assert!(
         signed_in_home
-            .contains("</section>\n  <section>\n  <h2>Recently updated public repositories</h2>")
+            .find("<h2>Your repositories</h2>")
+            .expect("find the owned repository section")
+            < signed_in_home
+                .find("<h2>Recently updated public repositories</h2>")
+                .expect("find the recent repository section")
     );
     assert_eq!(signed_in_home.matches(">alice/example</a>").count(), 2);
     assert!(signed_in_home.contains("<a href=\"/account\">Account</a>"));

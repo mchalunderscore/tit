@@ -80,6 +80,21 @@ fn reads_repository_content_for_both_object_formats() {
                 b"src".as_slice()
             ]
         );
+        let (root_prefix, truncated) = service
+            .tree_prefix(fixture.second, b"", 2, &cancellation)
+            .expect("read a root-tree prefix");
+        assert_eq!(root_prefix.len(), 2);
+        assert!(truncated);
+        let metadata = service
+            .commit_metadata(&[fixture.first, fixture.second], &cancellation)
+            .expect("read commit metadata");
+        assert_eq!(
+            metadata
+                .into_iter()
+                .map(|commit| commit.expect("find a commit").id)
+                .collect::<Vec<_>>(),
+            [fixture.first, fixture.second]
+        );
         let source = service
             .tree(fixture.second, b"src", &cancellation)
             .expect("read a nested tree");

@@ -1,54 +1,91 @@
 {% extends "base.html" %}
 {% block title %}{% if signed_in %}{{ username }}{% else %}Repositories{% endif %} · tit{% endblock %}
 {% block content %}
-{% if signed_in %}
   <div class="two-column">
+{% if signed_in %}
   <section>
-  <h1>{{ username }}</h1>
-  <p><a href="/account">Open your account profile</a>.</p>
-  <h2>Your repositories</h2>
+    <h1>{{ username }}</h1>
+    <p><a href="/account">Open your account profile</a>.</p>
+    <h2>Your repositories</h2>
 {% if repositories.is_empty() %}
-  <p>You do not own a repository.</p>
+    <p>You do not own a repository.</p>
 {% else %}
-  <ul>
+    <ul class="home-repository-list">
   {% for item in repositories %}
 {% if item.state == "archived" %}
-    <li>
-      {{ item.owner }}/{{ item.slug }} · archived
-      <form class="inline-form" method="post" action="/{{ item.owner }}/{{ item.slug }}/settings/unarchive">
-        <input type="hidden" name="csrf" value="{{ csrf }}">
-        <input type="hidden" name="confirm" value="yes">
-        <button type="submit">Unarchive repository</button>
-      </form>
-    </li>
+      <li>
+        <strong>{{ item.owner }}/{{ item.slug }}</strong>
+        <span class="repository-meta">archived</span>
+        <form class="inline-form" method="post" action="/{{ item.owner }}/{{ item.slug }}/settings/unarchive">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="confirm" value="yes">
+          <button type="submit">Unarchive repository</button>
+        </form>
+      </li>
 {% else %}
-    <li><a href="/{{ item.owner }}/{{ item.slug }}">{{ item.owner }}/{{ item.slug }}</a> · {{ item.visibility }} · updated <time datetime="{{ item.updated_at }}">{{ item.updated_at|human_time }}</time>{% if item.description.is_empty() %}{% else %}<br>{{ item.description }}{% endif %}</li>
+      <li>
+        <a class="repository-name" href="/{{ item.owner }}/{{ item.slug }}">{{ item.owner }}/{{ item.slug }}</a>
+        <span class="repository-meta">{{ item.visibility }} · updated <time datetime="{{ item.updated_at }}">{{ item.updated_at|human_time }}</time></span>
+{% if item.description.is_empty() %}{% else %}
+        <p>{{ item.description }}</p>
+{% endif %}
+      </li>
 {% endif %}
   {% endfor %}
-  </ul>
+    </ul>
 {% endif %}
   </section>
-  <section>
-  <h2>Recently updated public repositories</h2>
 {% else %}
-  <section>
-  <h1>Recently updated public repositories</h1>
+  <section class="home-intro">
+    <h1>A small Git CDE</h1>
+    <p>tit provides self-hosted Git repositories, issues, pull requests, and code review in one server.</p>
+    <nav class="home-actions" aria-label="Get started">
+      <a href="/signup">Create account</a>
+      <a href="/login">Log in</a>
+      <a href="/search">Search repositories</a>
+    </nav>
+  </section>
 {% endif %}
+  <section>
+    <h2>Recently updated public repositories</h2>
 {% if recent_repositories.is_empty() %}
 {% if signed_in %}
-  <p>No public repositories are available.</p>
+    <p>No public repositories are available.</p>
 {% else %}
-  <p>No repositories are available.</p>
+    <p>No repositories are available.</p>
 {% endif %}
 {% else %}
-  <ul>
+    <ul class="home-repository-list">
   {% for item in recent_repositories %}
-    <li><a href="/{{ item.owner }}/{{ item.slug }}">{{ item.owner }}/{{ item.slug }}</a> · updated <time datetime="{{ item.updated_at }}">{{ item.updated_at|human_time }}</time>{% if item.description.is_empty() %}{% else %}<br>{{ item.description }}{% endif %}</li>
+      <li>
+        <a class="repository-name" href="/{{ item.owner }}/{{ item.slug }}">{{ item.owner }}/{{ item.slug }}</a>
+        <span class="repository-meta">updated <time datetime="{{ item.updated_at }}">{{ item.updated_at|human_time }}</time></span>
+{% if item.description.is_empty() %}{% else %}
+        <p>{{ item.description }}</p>
+{% endif %}
+      </li>
   {% endfor %}
-  </ul>
+    </ul>
 {% endif %}
   </section>
-{% if signed_in %}
   </div>
+{% if !signed_in %}
+  <section class="home-workflow" aria-labelledby="home-workflow-heading">
+    <h2 id="home-workflow-heading">Start with tit</h2>
+    <ol>
+      <li>
+        <strong>Create an account</strong>
+        <p>Create an account and add an SSH key.</p>
+      </li>
+      <li>
+        <strong>Create a repository</strong>
+        <p>Use the account page or the <code>repo create</code> SSH command.</p>
+      </li>
+      <li>
+        <strong>Collaborate</strong>
+        <p>Push branches, create issues, open pull requests, and follow updates with RSS.</p>
+      </li>
+    </ol>
+  </section>
 {% endif %}
 {% endblock %}
