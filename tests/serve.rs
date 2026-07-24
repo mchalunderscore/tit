@@ -228,7 +228,8 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     let signed_in_home = http_get_with_headers(http, "/", &[("Cookie", &cookies)]);
     assert!(signed_in_home.contains("<h1>alice</h1>"));
     assert!(signed_in_home.contains("<h2>Your repositories</h2>"));
-    assert!(signed_in_home.contains(">alice/example</a>"));
+    assert!(signed_in_home.contains("<h2>Recently updated public repositories</h2>"));
+    assert_eq!(signed_in_home.matches(">alice/example</a>").count(), 2);
     assert!(signed_in_home.contains("<a href=\"/account\">Account</a>"));
     assert!(signed_in_home.contains("<a href=\"/logout\">Log out</a>"));
     assert!(!signed_in_home.contains("<a href=\"/signup\">Create account</a>"));

@@ -603,15 +603,21 @@ async fn home(
                 username: &username,
                 csrf: &csrf,
                 repositories: &[],
+                recent_repositories: &[],
             },
         );
     }
     let result = repository_job(state, move |repositories| {
-        repositories.home(actor.0.as_deref())
+        let owned = match actor.0.as_deref() {
+            Some(owner) => repositories.home(Some(owner))?,
+            None => Vec::new(),
+        };
+        let recent = repositories.home(None)?;
+        Ok((owned, recent))
     })
     .await;
     match result {
-        Ok(repositories) => render_home(
+        Ok((repositories, recent_repositories)) => render_home(
             StatusCode::OK,
             &request_id.0,
             HomePage {
@@ -622,6 +628,7 @@ async fn home(
                 username: &username,
                 csrf: &csrf,
                 repositories: &repositories,
+                recent_repositories: &recent_repositories,
             },
         ),
         Err(_) => render_error(
@@ -677,6 +684,7 @@ async fn go_to_repository(
                 username: actor.0.as_deref().unwrap_or_default(),
                 csrf: "",
                 repositories: &[],
+                recent_repositories: &[],
             },
         ),
     }
@@ -2282,6 +2290,18 @@ fn render_home(status: StatusCode, request_id: &str, page: HomePage<'_>) -> Resp
                     updated_at: repository.updated_at,
                 })
                 .collect(),
+            recent_repositories: page
+                .recent_repositories
+                .iter()
+                .map(|repository| HomeRepositoryView {
+                    owner: &repository.owner,
+                    slug: &repository.slug,
+                    visibility: &repository.visibility,
+                    state: &repository.state,
+                    description: &repository.description,
+                    updated_at: repository.updated_at,
+                })
+                .collect(),
         },
     )
 }
@@ -2294,6 +2314,7 @@ struct HomePage<'a> {
     username: &'a str,
     csrf: &'a str,
     repositories: &'a [crate::store::HomeRepositoryRecord],
+    recent_repositories: &'a [crate::store::HomeRepositoryRecord],
 }
 
 fn render_error(status: StatusCode, request_id: &str, heading: &str, message: &str) -> Response {
@@ -2401,6 +2422,7 @@ struct HomeTemplate<'a> {
     username: &'a str,
     csrf: &'a str,
     repositories: Vec<HomeRepositoryView<'a>>,
+    recent_repositories: Vec<HomeRepositoryView<'a>>,
 }
 
 struct HomeRepositoryView<'a> {

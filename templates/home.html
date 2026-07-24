@@ -7,11 +7,8 @@
   <h1>{{ username }}</h1>
   <p><a href="/account">Open your account profile</a>.</p>
   <h2>Your repositories</h2>
-{% else %}
-  <h1>Recently updated public repositories</h1>
-{% endif %}
 {% if repositories.is_empty() %}
-  <p>No repositories are available.</p>
+  <p>You do not own a repository.</p>
 {% else %}
   <ul>
   {% for item in repositories %}
@@ -27,6 +24,23 @@
 {% else %}
     <li><a href="/{{ item.owner }}/{{ item.slug }}">{{ item.owner }}/{{ item.slug }}</a> · {{ item.visibility }} · updated <time datetime="{{ item.updated_at }}">{{ item.updated_at|human_time }}</time>{% if item.description.is_empty() %}{% else %}<br>{{ item.description }}{% endif %}</li>
 {% endif %}
+  {% endfor %}
+  </ul>
+{% endif %}
+  <h2>Recently updated public repositories</h2>
+{% else %}
+  <h1>Recently updated public repositories</h1>
+{% endif %}
+{% if recent_repositories.is_empty() %}
+{% if signed_in %}
+  <p>No public repositories are available.</p>
+{% else %}
+  <p>No repositories are available.</p>
+{% endif %}
+{% else %}
+  <ul>
+  {% for item in recent_repositories %}
+    <li><a href="/{{ item.owner }}/{{ item.slug }}">{{ item.owner }}/{{ item.slug }}</a> · updated <time datetime="{{ item.updated_at }}">{{ item.updated_at|human_time }}</time>{% if item.description.is_empty() %}{% else %}<br>{{ item.description }}{% endif %}</li>
   {% endfor %}
   </ul>
 {% endif %}
