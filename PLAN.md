@@ -331,7 +331,7 @@ Work proceeds through milestone gates. Do not start a milestone before the
 preceding gate passes. If a feasibility gate fails, change the design before
 you continue the feature work.
 
-**Current milestone:** Milestone 6.6 complete.
+**Current milestone:** Milestone 7.1 — Priority 0 security remediation.
 Update this marker only after the current milestone gate passes.
 
 ### Architecture
@@ -777,6 +777,67 @@ Gate: a new operator can use only the supplied documentation to install,
 configure, make a backup, restore, upgrade, and remove `tit`. The operator can
 also cause damage to a disposable copy and restore it. All security and recovery
 tests use the release artifact, not a debug build.
+
+#### Milestone 7 — adversarial review remediation
+
+Goal: correct the security, resource, and operational integrity findings from
+the adversarial review of commit
+`a58aa376e7e435198caa3618242b2ceffa7d27ab` before public deployment.
+
+##### M7.1 — Priority 0 security remediation
+
+- Return `private, no-store` for an archive from a private repository. Add a
+  shared cache test that proves that an anonymous user cannot receive a cached
+  private archive.
+- Make `gix-pack` enforce the 64 MiB object limit during pack indexing and
+  object decoding. Upgrade or patch the crate if its current API cannot enforce
+  this limit before memory allocation. Test an oversized compressed object with
+  a strict memory limit.
+- Limit and remove duplicate upload-pack `want` and `have` lines. Use a
+  `HashSet` for missing root lookup. Stream the generated pack without multiple
+  full in-memory copies. Add cooperative cancellation and concurrency tests.
+- Add connection and global limits for SSH Git channels. Add inactivity,
+  wall-clock, and total byte limits for each channel. Acquire maintenance locks
+  only during final validation and promotion.
+
+Gate: all Priority 0 regression tests pass. Resource tests prove the configured
+memory, concurrency, time, and byte limits. Do not start M7.2 before this gate
+passes.
+
+##### M7.2 — Priority 1 security and abuse resistance
+
+- Revoke all active feed tokens during account recovery and suspension that is
+  related to account compromise.
+- Apply rate limits to signup and recovery. Aggregate or sample repeated
+  anonymous audit failures. Specify audit retention and monitoring behavior.
+- Replace recursive receive-pack delta depth calculation with an iterative,
+  bounded walk. Apply one deadline to indexing, validation, policy checks, and
+  promotion.
+- Replace recursive archive traversal with an explicit stack. Enforce a maximum
+  tree depth.
+- Apply a streaming 64 KiB route limit to `/login/verify-file`. Limit the
+  multipart form field count, each field size, and the total decoded size.
+- Implement trusted `Forwarded` or `X-Forwarded-For` handling, or remove the
+  unused trusted-proxy configuration. Add tests for spoofed headers and multiple
+  trusted proxies.
+
+Gate: all Priority 1 regression and black-box tests pass. Recovery and
+suspension leave no active feed token. Signup, recovery, receive-pack, archive,
+multipart form, and proxy inputs stop at their specified limits. Do not start
+M7.3 before this gate passes.
+
+##### M7.3 — Priority 2 operational integrity
+
+- Add a cleanup guard after the final repository import rename. The guard must
+  remove an unmanaged final directory if a later import operation fails. Add a
+  fault-injection test for each failure point after the rename.
+
+Gate: all Milestone 7 regression tests pass. Run resource tests with constrained
+memory, disk space, and file descriptor limits. Run
+`cargo fmt --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`cargo test --locked --all-targets --all-features`, and
+`cargo deny check advisories licenses sources`.
 
 ### Test strategy
 

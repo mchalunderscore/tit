@@ -72,8 +72,9 @@ Use the technical nouns in this list:
   code, command, configuration, database, executable, feed, and file.
 - framework, instance, interface, key, log, module, package, repository,
   role, route, server, session, token, username, Web UI, and workflow.
-- connection, constraint, index, parameter, query, query plan, row, schema,
-  statement, and table.
+- channel, connection, constraint, deadline, file descriptor, index, multipart
+  form, parameter, query, query plan, rate limit, resource, row, schema, shared
+  cache, statement, and table.
 - behavior, boundary, build, compatibility, content, crate, dependency,
   environment, feature, host, identity, implementation, and invariant.
 - license, metadata, milestone, model, owner, permission, platform, portability,
