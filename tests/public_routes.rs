@@ -115,6 +115,16 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         assert!(summary_text.contains("https://tit.example/alice/example"));
         assert!(summary_text.contains("ssh://tit.example:2222/alice/example"));
         assert!(summary_text.contains(&fixture.head));
+        assert!(summary_text.contains("<div class=\"repository-summary-layout\">"));
+        assert!(summary_text.contains("<strong>main</strong>"));
+        assert!(summary_text.contains(&format!(
+            "href=\"/alice/example/blob/{}/README.md\"",
+            fixture.head
+        )));
+        assert!(summary_text.contains(&format!(
+            "href=\"/alice/example/tree/{}/nested\"",
+            fixture.head
+        )));
         assert!(summary_text.contains("README.md"));
         assert!(summary_text.contains("<h1>tit fixture</h1>"));
         assert!(summary_text.contains("<strong>safe</strong>"));

@@ -436,20 +436,25 @@ async fn summary(
                     .iter()
                     .find(|reference| reference.name == default_branch.as_bytes())
                     .map(|reference| reference.target);
-                let (history, readme) = match head {
+                let (history, readme, entries) = match head {
                     Some(head) => (
                         service.history(head, &cancellation)?,
                         service.readme(head, &cancellation)?,
+                        service.tree(head, &[], &cancellation)?,
                     ),
-                    None => (Vec::new(), None),
+                    None => (Vec::new(), None, Vec::new()),
                 };
                 Ok(RepositoryPage::summary(
                     record,
-                    description,
-                    clone_urls,
-                    head,
-                    history,
-                    readme.map(|readme| (readme.path, readme.blob.data)),
+                    RepositorySummary {
+                        description,
+                        clone_urls,
+                        default_branch,
+                        head,
+                        history,
+                        readme: readme.map(|readme| (readme.path, readme.blob.data)),
+                        entries,
+                    },
                 ))
             },
         )
@@ -1381,6 +1386,7 @@ struct RepositoryPage {
     encoded_path: String,
     http_clone_url: String,
     ssh_clone_url: String,
+    default_branch: String,
     has_head: bool,
     has_readme: bool,
     readme_path: String,
@@ -1408,6 +1414,16 @@ struct RepositoryPage {
     next_page: usize,
 }
 
+struct RepositorySummary {
+    description: String,
+    clone_urls: (String, String),
+    default_branch: String,
+    head: Option<ObjectId>,
+    history: Vec<CommitInfo>,
+    readme: Option<(Vec<u8>, Vec<u8>)>,
+    entries: Vec<TreeEntryInfo>,
+}
+
 impl RepositoryPage {
     fn base(record: RepositoryRecord, page_kind: &'static str, title: String) -> Self {
         Self {
@@ -1425,6 +1441,7 @@ impl RepositoryPage {
             encoded_path: String::new(),
             http_clone_url: String::new(),
             ssh_clone_url: String::new(),
+            default_branch: String::new(),
             has_head: false,
             has_readme: false,
             readme_path: String::new(),
@@ -1453,27 +1470,33 @@ impl RepositoryPage {
         }
     }
 
-    fn summary(
-        record: RepositoryRecord,
-        description: String,
-        clone_urls: (String, String),
-        head: Option<ObjectId>,
-        history: Vec<CommitInfo>,
-        readme: Option<(Vec<u8>, Vec<u8>)>,
-    ) -> Self {
+    fn summary(record: RepositoryRecord, summary: RepositorySummary) -> Self {
         let title = format!("{}/{}", record.owner, record.slug);
         let mut page = Self::base(record, "summary", title);
-        page.description = description;
-        page.http_clone_url = clone_urls.0;
-        page.ssh_clone_url = clone_urls.1;
-        page.has_head = head.is_some();
-        page.commit_id = head.map(|id| id.to_string()).unwrap_or_default();
-        page.history = history
+        page.description = summary.description;
+        page.http_clone_url = summary.clone_urls.0;
+        page.ssh_clone_url = summary.clone_urls.1;
+        page.default_branch = summary
+            .default_branch
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&summary.default_branch)
+            .to_owned();
+        page.has_head = summary.head.is_some();
+        page.commit_id = summary.head.map(|id| id.to_string()).unwrap_or_default();
+        page.history = summary
+            .history
             .into_iter()
             .take(MAX_SUMMARY_COMMITS)
             .map(CommitView::from)
             .collect();
-        if let Some((path, data)) = readme {
+        if let Some(head) = summary.head {
+            page.entries = summary
+                .entries
+                .into_iter()
+                .map(|entry| TreeView::new(head, &[], entry))
+                .collect();
+        }
+        if let Some((path, data)) = summary.readme {
             page.has_readme = true;
             page.readme_path = display_bytes(&path);
             if let Ok(content) = std::str::from_utf8(&data)

@@ -6,23 +6,37 @@
 {% include "repository-nav.html" %}
   </header>
 
-{% if has_head %}
+{% if has_head && page_kind != "summary" %}
   <p><a href="/{{ owner }}/{{ repository }}/tree/{{ commit_id }}">Browse tree</a> · <a href="/{{ owner }}/{{ repository }}/commit/{{ commit_id }}">Show commit</a> · <a href="/{{ owner }}/{{ repository }}/archive/{{ commit_id }}.tar">Download archive</a></p>
 {% endif %}
 
 {% if page_kind == "summary" %}
-{% if description != "" %}
-  <p class="repository-description">{{ description }}</p>
-{% endif %}
-  <section aria-labelledby="clone-heading">
-    <h2 id="clone-heading">Clone</h2>
-    <dl>
-      <dt>HTTP</dt><dd><code>{{ http_clone_url }}</code></dd>
-      <dt>SSH</dt><dd><code>{{ ssh_clone_url }}</code></dd>
-      <dt>Created</dt><dd><time datetime="{{ created_at }}">{{ created_at|human_time }}</time></dd>
-    </dl>
-  </section>
 {% if has_head %}
+  <nav class="repository-toolbar" aria-label="Repository files">
+    <strong>{{ default_branch }}</strong>
+    <a href="/{{ owner }}/{{ repository }}/tree/{{ commit_id }}">Browse files</a>
+    <a href="/{{ owner }}/{{ repository }}/commit/{{ commit_id }}"><code title="{{ commit_id }}">{{ commit_id|short_id }}</code></a>
+    <a href="/{{ owner }}/{{ repository }}/archive/{{ commit_id }}.tar">Download archive</a>
+  </nav>
+{% endif %}
+  <div class="repository-summary-layout">
+  <div class="repository-summary-main">
+{% if has_head %}
+  <section aria-labelledby="files-heading">
+    <h2 id="files-heading">Files</h2>
+    <div class="table-scroll"><table class="repository-file-list">
+      <thead><tr><th scope="col">Name</th><th scope="col">Type</th><th scope="col">Object</th></tr></thead>
+      <tbody>
+{% for item in entries %}
+        <tr>
+          <th scope="row"><a href="/{{ owner }}/{{ repository }}/{{ item.href }}">{{ item.name }}</a></th>
+          <td>{{ item.kind }}</td>
+          <td><code title="{{ item.id }}">{{ item.id|short_id }}</code></td>
+        </tr>
+{% endfor %}
+      </tbody>
+    </table></div>
+  </section>
   <section aria-labelledby="history-heading">
     <h2 id="history-heading">Recent commits</h2>
     <ol class="commit-list">
@@ -45,6 +59,26 @@
 {% else %}
   <p>This repository has no commits.</p>
 {% endif %}
+  </div>
+  <aside class="repository-sidebar" aria-label="Repository information">
+  <section aria-labelledby="about-heading">
+    <h2 id="about-heading">About</h2>
+{% if description != "" %}
+    <p class="repository-description">{{ description }}</p>
+{% else %}
+    <p>No description is available.</p>
+{% endif %}
+    <p>Created <time datetime="{{ created_at }}">{{ created_at|human_time }}</time></p>
+  </section>
+  <section aria-labelledby="clone-heading">
+    <h2 id="clone-heading">Clone</h2>
+    <dl>
+      <dt>HTTP</dt><dd><code>{{ http_clone_url }}</code></dd>
+      <dt>SSH</dt><dd><code>{{ ssh_clone_url }}</code></dd>
+    </dl>
+  </section>
+  </aside>
+  </div>
 {% endif %}
 
 {% if page_kind == "commits" %}

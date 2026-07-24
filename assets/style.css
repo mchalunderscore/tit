@@ -60,6 +60,43 @@ summary {
   margin-block: 0.5rem;
 }
 
+.repository-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  margin-block: 1.5rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid GrayText;
+  border-radius: 0.25rem;
+}
+
+.repository-summary-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(14rem, 1fr);
+  gap: 2rem;
+  align-items: start;
+}
+
+.repository-summary-main > section,
+.repository-sidebar > section {
+  margin-bottom: 2rem;
+}
+
+.repository-sidebar > section {
+  padding: 1rem;
+  border: 1px solid GrayText;
+  border-radius: 0.25rem;
+}
+
+.repository-sidebar h2 {
+  margin-top: 0;
+}
+
+.repository-file-list th:first-child {
+  width: 100%;
+}
+
 .site-header nav,
 .repository-header nav {
   display: flex;
@@ -208,7 +245,8 @@ a {
 }
 
 @media (max-width: 44rem) {
-  .two-column {
+  .two-column,
+  .repository-summary-layout {
     grid-template-columns: 1fr;
   }
 }
