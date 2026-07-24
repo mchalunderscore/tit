@@ -55,9 +55,21 @@ summary {
   font-weight: 700;
 }
 
-.repository-header nav,
+.repository-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem 2rem;
+}
+
 .repository-header h1 {
   margin-block: 0.5rem;
+}
+
+.repository-header nav {
+  justify-content: flex-end;
+  font-size: 0.875rem;
 }
 
 .repository-toolbar {
@@ -73,7 +85,7 @@ summary {
 
 .repository-summary-layout {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(14rem, 1fr);
+  grid-template-columns: minmax(0, 1.7fr) minmax(23rem, 1fr);
   gap: 2rem;
   align-items: start;
 }
@@ -83,18 +95,56 @@ summary {
   margin-bottom: 2rem;
 }
 
-.repository-sidebar > section {
+.repository-panel {
   padding: 1rem;
   border: 1px solid GrayText;
   border-radius: 0.25rem;
 }
 
-.repository-sidebar h2 {
+.repository-panel > h2:first-child {
   margin-top: 0;
+}
+
+.repository-file-panel {
+  padding: 0;
+  overflow: hidden;
+}
+
+.repository-file-panel > h2 {
+  margin: 0;
+  padding: 1rem;
+  border-bottom: 1px solid GrayText;
+}
+
+.repository-file-panel th,
+.repository-file-panel td {
+  padding: 0.6rem 1rem;
+}
+
+.repository-file-panel tbody tr:last-child > * {
+  border-bottom: 0;
 }
 
 .repository-file-list th:first-child {
   width: 100%;
+}
+
+.repository-sidebar dd {
+  overflow-x: auto;
+  overflow-wrap: normal;
+  white-space: nowrap;
+}
+
+.repository-recent-list {
+  padding-left: 1.5rem;
+}
+
+.repository-recent-list li {
+  margin-block: 0.5rem;
+}
+
+.repository-readme {
+  margin-block: 2rem;
 }
 
 .site-header nav,

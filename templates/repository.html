@@ -22,7 +22,7 @@
   <div class="repository-summary-layout">
   <div class="repository-summary-main">
 {% if has_head %}
-  <section aria-labelledby="files-heading">
+  <section class="repository-panel repository-file-panel" aria-labelledby="files-heading">
     <h2 id="files-heading">Files</h2>
     <div class="table-scroll"><table class="repository-file-list">
       <thead><tr><th scope="col">Name</th><th scope="col">Type</th><th scope="col">Object</th></tr></thead>
@@ -37,31 +37,12 @@
       </tbody>
     </table></div>
   </section>
-  <section aria-labelledby="history-heading">
-    <h2 id="history-heading">Recent commits</h2>
-    <ol class="commit-list">
-{% for item in history %}
-      <li><a href="/{{ owner }}/{{ repository }}/commit/{{ item.id }}" aria-label="Commit {{ item.id }}"><code title="{{ item.id }}">{{ item.id|short_id }}</code></a> {{ item.summary }} — {{ item.author_name }}</li>
-{% endfor %}
-    </ol>
-    <p><a href="/{{ owner }}/{{ repository }}/commits">View all commits</a></p>
-  </section>
-{% if has_readme %}
-  <section aria-labelledby="readme-heading">
-    <h2 id="readme-heading">{{ readme_path }}</h2>
-{% if readme_binary %}
-    <p>Binary README content cannot be shown.</p>
-{% else %}
-    <div class="markdown">{{ readme_html|safe }}</div>
-{% endif %}
-  </section>
-{% endif %}
 {% else %}
   <p>This repository has no commits.</p>
 {% endif %}
   </div>
   <aside class="repository-sidebar" aria-label="Repository information">
-  <section aria-labelledby="about-heading">
+  <section class="repository-panel" aria-labelledby="about-heading">
     <h2 id="about-heading">About</h2>
 {% if description != "" %}
     <p class="repository-description">{{ description }}</p>
@@ -70,15 +51,50 @@
 {% endif %}
     <p>Created <time datetime="{{ created_at }}">{{ created_at|human_time }}</time></p>
   </section>
-  <section aria-labelledby="clone-heading">
+  <section class="repository-panel" aria-labelledby="clone-heading">
     <h2 id="clone-heading">Clone</h2>
     <dl>
       <dt>HTTP</dt><dd><code>{{ http_clone_url }}</code></dd>
       <dt>SSH</dt><dd><code>{{ ssh_clone_url }}</code></dd>
     </dl>
   </section>
+  <section class="repository-panel" aria-labelledby="recent-heading">
+    <h2 id="recent-heading">Recent</h2>
+    <h3>Commits</h3>
+{% if history.is_empty() %}
+    <p>No commits are available.</p>
+{% else %}
+    <ol class="repository-recent-list">
+{% for item in history %}
+      <li><a href="/{{ owner }}/{{ repository }}/commit/{{ item.id }}" aria-label="Commit {{ item.id }}"><code title="{{ item.id }}">{{ item.id|short_id }}</code></a> {{ item.summary }}</li>
+{% endfor %}
+    </ol>
+    <p><a href="/{{ owner }}/{{ repository }}/commits">View all commits</a></p>
+{% endif %}
+    <h3>Tags</h3>
+{% if tags.is_empty() %}
+    <p>No tags are available.</p>
+{% else %}
+    <ul class="repository-recent-list">
+{% for tag in tags %}
+      <li><a href="/{{ owner }}/{{ repository }}/commit/{{ tag.id }}">{{ tag.name }}</a> · <time datetime="{{ tag.committed_at }}">{{ tag.committed_at|human_time }}</time></li>
+{% endfor %}
+    </ul>
+    <p><a href="/{{ owner }}/{{ repository }}/refs">View all refs</a></p>
+{% endif %}
+  </section>
   </aside>
   </div>
+{% if has_readme %}
+  <section class="repository-panel repository-readme" aria-labelledby="readme-heading">
+    <h2 id="readme-heading">{{ readme_path }}</h2>
+{% if readme_binary %}
+    <p>Binary README content cannot be shown.</p>
+{% else %}
+    <div class="markdown">{{ readme_html|safe }}</div>
+{% endif %}
+  </section>
+{% endif %}
 {% endif %}
 
 {% if page_kind == "commits" %}

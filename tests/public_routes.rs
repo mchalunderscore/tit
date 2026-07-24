@@ -116,6 +116,9 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         assert!(summary_text.contains("ssh://tit.example:2222/alice/example"));
         assert!(summary_text.contains(&fixture.head));
         assert!(summary_text.contains("<div class=\"repository-summary-layout\">"));
+        assert!(summary_text.contains(
+            "</aside>\n  </div>\n\n  <section class=\"repository-panel repository-readme\""
+        ));
         assert!(summary_text.contains("<strong>main</strong>"));
         assert!(summary_text.contains(&format!(
             "href=\"/alice/example/blob/{}/README.md\"",
@@ -146,12 +149,11 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         assert!(summary_text.contains("/alice/example/rss.xml"));
         assert!(summary_text.contains("/alice/example/search"));
         assert!(summary_text.contains("/alice/example/commits\">View all commits</a>"));
-        assert_eq!(
-            summary_text
-                .matches("<li><a href=\"/alice/example/commit/")
-                .count(),
-            10
-        );
+        assert!(summary_text.contains(">v0.4</a>"));
+        assert!(summary_text.contains(">v0.3</a>"));
+        assert!(summary_text.contains(">v0.2</a>"));
+        assert!(!summary_text.contains(">v0.1</a>"));
+        assert_eq!(summary_text.matches("aria-label=\"Commit ").count(), 3);
         assert!(!summary_text.contains("Object format"));
 
         let commits = request(server.address(), "GET", "/alice/example/commits", &[], &[]);
@@ -1688,6 +1690,20 @@ impl Fixture {
         .expect("update the text file");
         commit_all(&worktree, "<script>alert(3)</script>");
         let head = rev_parse(&worktree, "HEAD");
+        for (tag, target) in [
+            ("v0.1", parent.as_str()),
+            ("v0.2", "HEAD~2"),
+            ("v0.3", "HEAD~1"),
+            ("v0.4", "HEAD"),
+        ] {
+            run(Command::new("git").arg("-C").arg(&worktree).args([
+                "-c",
+                "tag.gpgSign=false",
+                "tag",
+                tag,
+                target,
+            ]));
+        }
         run(Command::new("git")
             .arg("-C")
             .arg(&worktree)
@@ -1710,6 +1726,12 @@ impl Fixture {
             .args(["push", "-q"])
             .arg(&bare)
             .args(["main", "feature"]));
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["push", "-q"])
+            .arg(&bare)
+            .arg("--tags"));
 
         let database = instance.path().join(store::DATABASE_FILE);
         let mut store = Store::open(&database).expect("open the fixture database");
