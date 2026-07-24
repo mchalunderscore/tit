@@ -4,6 +4,8 @@ set -eu
 project_dir=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
 binary=${1:-"$project_dir/target/release/tit"}
 output_dir=${2:-"$project_dir/dist"}
+target=${3:-}
+release_runner=${TIT_RELEASE_RUNNER:-}
 
 case "$binary" in
     /*) ;;
@@ -15,7 +17,11 @@ if [ ! -x "$binary" ]; then
     exit 1
 fi
 
-set -- $("$binary" --version)
+if [ -n "$release_runner" ]; then
+    set -- $("$release_runner" "$binary" --version)
+else
+    set -- $("$binary" --version)
+fi
 if [ "$#" -ne 2 ] || [ "$1" != "tit" ]; then
     echo "tit: the release executable has invalid version output" >&2
     exit 1
@@ -25,9 +31,11 @@ case "$version" in
     *[!0-9A-Za-z.-]* | "") echo "tit: the release version is not valid" >&2; exit 1 ;;
 esac
 
-target=$(rustc -vV | awk '/^host: / { print $2 }')
+if [ -z "$target" ]; then
+    target=$(rustc -vV | awk '/^host: / { print $2 }')
+fi
 case "$target" in
-    *[!0-9A-Za-z_.-]* | "") echo "tit: the Rust host target is not valid" >&2; exit 1 ;;
+    *[!0-9A-Za-z_.-]* | "") echo "tit: the Rust target is not valid" >&2; exit 1 ;;
 esac
 
 mkdir -p "$output_dir"

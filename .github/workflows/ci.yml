@@ -23,23 +23,36 @@ jobs:
       - run: cargo build --locked --release
 
   release:
+    name: release (${{ matrix.platform.target }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        platform:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.platform.runner }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
       - run: cargo --version
+      - name: Verify the Rust host target
+        run: |
+          test "$(rustc -vV | awk '/^host: / { print $2 }')" = \
+            "${{ matrix.platform.target }}"
       - run: cargo test --locked --all-targets --all-features
       - run: cargo test --locked --release --lib
       - run: cargo test --locked --release --lib git_reads_tests::measures_bounded_search_without_an_index -- --ignored --nocapture
       - run: "cargo test --locked --release --lib sqlite_workload_tests:: -- --ignored --nocapture"
       - run: cargo build --locked --release
       - run: wc -c target/release/tit
-      - run: ./scripts/package-release target/release/tit dist
+      - run: ./scripts/package-release target/release/tit dist ${{ matrix.platform.target }}
       - name: Verify the release artifact
         run: |
           set -- dist/*.tar.gz
@@ -51,7 +64,52 @@ jobs:
       - name: Store the release artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: tit-${{ runner.os }}-${{ runner.arch }}
+          name: tit-${{ matrix.platform.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  linux-armv7:
+    name: release (armv7-unknown-linux-gnueabihf)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUNNER: scripts/run-linux-armv7
+      QEMU_LD_PREFIX: /usr/arm-linux-gnueabihf
+      TARGET: armv7-unknown-linux-gnueabihf
+      TIT_RELEASE_RUNNER: ${{ github.workspace }}/scripts/run-linux-armv7
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install the ARMv7 tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            gcc-arm-linux-gnueabihf \
+            libc6-dev-armhf-cross \
+            qemu-user-binfmt
+          sudo update-binfmts --enable qemu-arm
+          rustup target add "$TARGET"
+      - run: cargo --version
+      - run: cargo test --locked --all-targets --all-features --target "$TARGET"
+      - run: cargo test --locked --release --lib --target "$TARGET"
+      - run: cargo build --locked --release --target "$TARGET"
+      - run: wc -c "target/$TARGET/release/tit"
+      - run: ./scripts/package-release "target/$TARGET/release/tit" dist "$TARGET"
+      - name: Verify the release artifact
+        run: |
+          set -- dist/*.tar.gz
+          ./scripts/verify-release-artifact "$1" "$1.sha256"
+          mkdir release-test
+          tar -xzf "$1" -C release-test
+          set -- release-test/tit-*/bin/tit
+          TIT_RELEASE_BINARY="$(pwd)/$1" \
+            cargo test --locked --release --target "$TARGET" --test serve
+      - name: Store the release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tit-armv7-unknown-linux-gnueabihf
           path: dist/*
           if-no-files-found: error
 
@@ -67,16 +125,19 @@ jobs:
           - name: FreeBSD 15.1
             os: freebsd
             version: '15.1'
+            target: x86_64-unknown-freebsd
             install: sudo pkg install -y git rust
             experimental: false
           - name: OpenBSD 7.9
             os: openbsd
             version: '7.9'
+            target: x86_64-unknown-openbsd
             install: sudo pkg_add git rust
             experimental: true
           - name: NetBSD 10.1
             os: netbsd
             version: '10.1'
+            target: x86_64-unknown-netbsd
             install: sudo pkgin -y install git-base rust
             experimental: false
     env:
@@ -99,10 +160,14 @@ jobs:
       - name: Install build and test tools
         run: ${{ matrix.platform.install }}
       - run: cargo --version
+      - name: Verify the Rust host target
+        run: |
+          test "$(rustc -vV | awk '/^host: / { print $2 }')" = \
+            "${{ matrix.platform.target }}"
       - run: cargo test --locked --release --all-targets --all-features
       - run: cargo build --locked --release
       - run: wc -c target/release/tit
-      - run: ./scripts/package-release target/release/tit dist
+      - run: ./scripts/package-release target/release/tit dist ${{ matrix.platform.target }}
       - name: Verify the release artifact
         run: |
           set -- dist/*.tar.gz
@@ -110,13 +175,13 @@ jobs:
       - name: Store the release artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: tit-${{ matrix.platform.os }}-X64
+          name: tit-${{ matrix.platform.target }}
           path: dist/*
           if-no-files-found: error
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [quality, release, bsd]
+    needs: [quality, release, linux-armv7, bsd]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -129,7 +194,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -- release-artifacts/tit-Linux-*/*.tar.gz
+          set -- release-artifacts/tit-x86_64-unknown-linux-gnu/*.tar.gz
           case "$(basename "$1")" in
             "tit-${GITHUB_REF_NAME#v}-"*) ;;
             *) echo "The tag does not match the package version." >&2; exit 1 ;;

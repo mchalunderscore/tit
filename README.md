@@ -250,6 +250,19 @@ The package contains the executable, example service files, shell
 completions, the manual page, the example configuration, this README, and the
 license.
 
+The release workflow publishes packages for these Rust targets:
+
+- `x86_64-unknown-linux-gnu`;
+- `aarch64-unknown-linux-gnu`;
+- `armv7-unknown-linux-gnueabihf`;
+- `x86_64-apple-darwin`;
+- `aarch64-apple-darwin`;
+- `x86_64-unknown-freebsd`;
+- `x86_64-unknown-netbsd`.
+
+The workflow also builds an experimental package for
+`x86_64-unknown-openbsd`.
+
 ## Development
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before you change code. Run the quality

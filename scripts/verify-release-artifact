@@ -8,6 +8,7 @@ fi
 
 archive=$1
 checksum=$2
+release_runner=${TIT_RELEASE_RUNNER:-}
 archive_dir=$(CDPATH= cd "$(dirname "$archive")" && pwd)
 archive_name=$(basename "$archive")
 checksum_name=$(basename "$checksum")
@@ -53,6 +54,15 @@ tar -xzf "$archive" -C "$work"
 package="$work/$root"
 binary="$package/bin/tit"
 
+run_binary()
+{
+    if [ -n "$release_runner" ]; then
+        "$release_runner" "$binary" "$@"
+    else
+        "$binary" "$@"
+    fi
+}
+
 for required in \
     "$binary" \
     "$package/LICENSE" \
@@ -96,15 +106,30 @@ public_port = $ssh_port
 EOF
 chmod 600 "$config"
 
+run_clean_binary()
+{
+    if [ -n "$release_runner" ]; then
+        env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
+            "$release_runner" "$binary" "$@"
+    else
+        env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
+            "$binary" "$@"
+    fi
+}
+
 key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJgOfb9397gwZRfsz2A6DN/VVw/+bdjMdVsJ89JDLAC0 tit-release-verification'
 setup_output="$work/setup.out"
-env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
-    "$binary" --config "$config" setup admin release-test "$key" >"$setup_output"
+run_clean_binary --config "$config" setup admin release-test "$key" >"$setup_output"
 grep -q '^Recovery code: tit-recovery-v1:' "$setup_output"
 
 server_log="$work/server.log"
-env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
-    "$binary" --config "$config" serve 2>"$server_log" &
+if [ -n "$release_runner" ]; then
+    env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
+        "$release_runner" "$binary" --config "$config" serve 2>"$server_log" &
+else
+    env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
+        "$binary" --config "$config" serve 2>"$server_log" &
+fi
 server_pid=$!
 sleep 1
 if ! kill -0 "$server_pid" 2>/dev/null; then
@@ -116,26 +141,20 @@ fi
 kill -TERM "$server_pid"
 wait "$server_pid"
 
-env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
-    "$binary" --config "$config" doctor
+run_clean_binary --config "$config" doctor
 backup="$work/tit-backup.tar"
-env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
-    "$binary" --config "$config" backup "$backup"
-env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
-    "$binary" --config "$config" doctor --backup "$backup"
+run_clean_binary --config "$config" backup "$backup"
+run_clean_binary --config "$config" doctor --backup "$backup"
 
 : >"$instance/tit.sqlite3"
-if env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
-    "$binary" --config "$config" doctor >/dev/null 2>&1
+if run_clean_binary --config "$config" doctor >/dev/null 2>&1
 then
     echo "tit: doctor accepted the damaged disposable instance" >&2
     exit 1
 fi
 
-env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
-    "$binary" restore "$backup" "$restored"
-env -i PATH="$empty_path" HOME="$home" TMPDIR="$work" \
-    "$binary" --config "$restored/config.toml" doctor
+run_clean_binary restore "$backup" "$restored"
+run_clean_binary --config "$restored/config.toml" doctor
 
 recovery=$(sed -n 's/^Recovery code: //p' "$setup_output")
 if grep -F "$recovery" "$server_log" >/dev/null; then
@@ -143,5 +162,5 @@ if grep -F "$recovery" "$server_log" >/dev/null; then
     exit 1
 fi
 
-version=$("$binary" --version)
+version=$(run_binary --version)
 printf 'verified %s from %s without commands in PATH\n' "$version" "$archive_name"
