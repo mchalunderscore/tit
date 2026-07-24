@@ -747,6 +747,7 @@ fn imports_bare_repositories_and_rejects_unsafe_sources() {
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "requires debug assertions")]
 fn removes_an_import_after_each_post_rename_failure() {
     for point in [
         "after-rename",
