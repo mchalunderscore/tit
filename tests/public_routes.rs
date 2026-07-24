@@ -119,7 +119,14 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         assert!(summary_text.contains("<h1>tit fixture</h1>"));
         assert!(summary_text.contains("<strong>safe</strong>"));
         assert!(summary_text.contains("<code>&lt;safe&gt;</code>"));
-        assert!(summary_text.contains("href=\"docs/guide.md\""));
+        assert!(summary_text.contains(&format!(
+            "href=\"/alice/example/blob/{}/docs/guide.md\"",
+            fixture.head
+        )));
+        assert!(summary_text.contains(&format!(
+            "href=\"/alice/example/blob/{}/LICENSE\"",
+            fixture.head
+        )));
         assert!(!summary_text.contains("<script"));
         assert!(!summary_text.contains("javascript:"));
         assert!(!summary_text.contains("<img"));
@@ -1636,9 +1643,10 @@ impl Fixture {
         ]));
         fs::write(
             worktree.join("README.md"),
-            b"# tit fixture\n\n**safe** and `<safe>`\n\n[guide](docs/guide.md) [bad](javascript:alert(1))\n\n![tracker](https://tracker.example/pixel)\n\n<script>alert(2)</script>\n",
+            b"# tit fixture\n\n**safe** and `<safe>`\n\n[guide](docs/guide.md) [license](LICENSE) [bad](javascript:alert(1))\n\n![tracker](https://tracker.example/pixel)\n\n<script>alert(2)</script>\n",
         )
         .expect("write the README");
+        fs::write(worktree.join("LICENSE"), b"fixture license\n").expect("write the license");
         fs::create_dir(worktree.join("nested")).expect("create a nested directory");
         fs::write(worktree.join("nested/file.txt"), b"first line\n").expect("write the text file");
         fs::write(worktree.join("binary.dat"), b"binary\0content").expect("write the binary file");

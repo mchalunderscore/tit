@@ -19,14 +19,45 @@ impl fmt::Display for RenderedMarkdown {
 }
 
 pub fn render(source: &str) -> RenderedMarkdown {
+    render_with_base(source, None)
+}
+
+pub fn render_repository(source: &str, base: &str) -> RenderedMarkdown {
+    render_with_base(source, Some(base))
+}
+
+fn render_with_base(source: &str, base: Option<&str>) -> RenderedMarkdown {
     if source.len() > MAX_MARKDOWN_BYTES {
         return RenderedMarkdown(LIMIT_MESSAGE.to_owned());
     }
     let mut skipped_link = false;
     let events = Parser::new(source).filter_map(|event| match event {
-        Event::Start(Tag::Link { ref dest_url, .. }) if !safe_link(dest_url) => {
-            skipped_link = true;
-            None
+        Event::Start(Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => {
+            if !safe_link(&dest_url) {
+                skipped_link = true;
+                return None;
+            }
+            let destination = match base {
+                Some(base) => resolve_repository_link(&dest_url, base),
+                None => Some(dest_url.to_string()),
+            };
+            match destination {
+                Some(destination) => Some(Event::Start(Tag::Link {
+                    link_type,
+                    dest_url: destination.into(),
+                    title,
+                    id,
+                })),
+                None => {
+                    skipped_link = true;
+                    None
+                }
+            }
         }
         Event::End(TagEnd::Link) if skipped_link => {
             skipped_link = false;
@@ -98,9 +129,37 @@ fn safe_link(destination: &str) -> bool {
     }
 }
 
+fn resolve_repository_link(destination: &str, base: &str) -> Option<String> {
+    if Url::parse(destination).is_ok()
+        || destination.starts_with('/')
+        || destination.starts_with('#')
+        || destination.starts_with('?')
+    {
+        return Some(destination.to_owned());
+    }
+
+    let origin = Url::parse("https://tit.invalid/").expect("the Markdown origin is valid");
+    let base = origin.join(base).ok()?;
+    let resolved = base.join(destination).ok()?;
+    if !resolved.path().starts_with(base.path()) {
+        return None;
+    }
+
+    let mut link = resolved.path().to_owned();
+    if let Some(query) = resolved.query() {
+        link.push('?');
+        link.push_str(query);
+    }
+    if let Some(fragment) = resolved.fragment() {
+        link.push('#');
+        link.push_str(fragment);
+    }
+    Some(link)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::render;
+    use super::{render, render_repository};
 
     #[test]
     fn renders_the_documented_subset() {
@@ -147,6 +206,22 @@ mod tests {
 
         assert!(output.contains("Text &amp; markup."));
         assert!(!output.contains("href="));
+    }
+
+    #[test]
+    fn resolves_repository_links_inside_the_current_revision() {
+        let output = render_repository(
+            "[license](LICENSE) [guide](docs/guide.md#start) [anchor](#usage) \
+             [site](/help) [outside](../secret)",
+            "/alice/example/blob/abc123/",
+        )
+        .to_string();
+
+        assert!(output.contains("href=\"/alice/example/blob/abc123/LICENSE\""));
+        assert!(output.contains("href=\"/alice/example/blob/abc123/docs/guide.md#start\""));
+        assert!(output.contains("href=\"#usage\""));
+        assert!(output.contains("href=\"/help\""));
+        assert!(!output.contains("href=\"../secret\""));
     }
 
     #[test]

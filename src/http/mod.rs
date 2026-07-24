@@ -16,7 +16,7 @@ use askama::Template;
 use axum::Router;
 use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{
-    ConnectInfo, DefaultBodyLimit, Extension, OriginalUri, Path, Query, RawQuery, Request, State,
+    ConnectInfo, DefaultBodyLimit, Extension, OriginalUri, Path, Query, Request, State,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -30,7 +30,6 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::account::{AccountError, AccountKeyRequest, AccountService};
 use crate::auth::validate_username;
-use crate::domain::repository::validate_slug;
 use crate::feed_token::FeedTokenService;
 use crate::issue::IssueService;
 use crate::maintenance::MaintenanceGate;
@@ -46,7 +45,6 @@ use crate::watch::WatchService;
 use self::public::PublicWeb;
 
 const STYLE: &str = include_str!("../../assets/style.css");
-const MAX_LOCATION_QUERY_BYTES: usize = 512;
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 const MAX_BLOCKING_WEB_JOBS: usize = 8;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -390,7 +388,6 @@ fn router_with_state(state: WebState) -> Router {
         .route("/", get(home))
         .route("/healthz", get(health))
         .route("/metrics", get(metrics))
-        .route("/go", get(go_to_repository))
         .route(
             "/signup",
             get(signup_form)
@@ -596,9 +593,6 @@ async fn home(
             StatusCode::OK,
             &request_id.0,
             HomePage {
-                owner: "",
-                repository: "",
-                error: "",
                 signed_in,
                 username: &username,
                 csrf: &csrf,
@@ -621,9 +615,6 @@ async fn home(
             StatusCode::OK,
             &request_id.0,
             HomePage {
-                owner: "",
-                repository: "",
-                error: "",
                 signed_in,
                 username: &username,
                 csrf: &csrf,
@@ -656,38 +647,6 @@ async fn health(State(state): State<WebState>) -> Response {
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Body::from(body))
         .expect("the readiness response is valid")
-}
-
-async fn go_to_repository(
-    Extension(request_id): Extension<RequestId>,
-    Extension(actor): Extension<RequestActor>,
-    RawQuery(query): RawQuery,
-) -> Response {
-    match parse_location_query(query.as_deref()) {
-        Ok((owner, repository)) => {
-            let location = format!("/{owner}/{repository}");
-            Response::builder()
-                .status(StatusCode::FOUND)
-                .header(header::LOCATION, location)
-                .header(header::CACHE_CONTROL, "no-store")
-                .body(Body::empty())
-                .expect("the repository redirect is valid")
-        }
-        Err(LocationQueryError { owner, repository }) => render_home(
-            StatusCode::BAD_REQUEST,
-            &request_id.0,
-            HomePage {
-                owner: &owner,
-                repository: &repository,
-                error: "Enter a valid lowercase owner and repository.",
-                signed_in: actor.0.is_some(),
-                username: actor.0.as_deref().unwrap_or_default(),
-                csrf: "",
-                repositories: &[],
-                recent_repositories: &[],
-            },
-        ),
-    }
 }
 
 async fn signup_form(
@@ -2271,10 +2230,6 @@ fn render_home(status: StatusCode, request_id: &str, page: HomePage<'_>) -> Resp
         status,
         &HomeTemplate {
             request_id,
-            owner: page.owner,
-            repository: page.repository,
-            error: page.error,
-            has_error: !page.error.is_empty(),
             signed_in: page.signed_in,
             username: page.username,
             csrf: page.csrf,
@@ -2307,9 +2262,6 @@ fn render_home(status: StatusCode, request_id: &str, page: HomePage<'_>) -> Resp
 }
 
 struct HomePage<'a> {
-    owner: &'a str,
-    repository: &'a str,
-    error: &'a str,
     signed_in: bool,
     username: &'a str,
     csrf: &'a str,
@@ -2356,28 +2308,6 @@ fn render(status: StatusCode, template: &impl Template) -> Response {
     }
 }
 
-fn parse_location_query(query: Option<&str>) -> Result<(String, String), LocationQueryError> {
-    let query = query.ok_or_else(LocationQueryError::default)?;
-    if query.len() > MAX_LOCATION_QUERY_BYTES || !valid_percent_encoding(query.as_bytes()) {
-        return Err(LocationQueryError::default());
-    }
-    let mut owner = None;
-    let mut repository = None;
-    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        match name.as_ref() {
-            "owner" if owner.is_none() => owner = Some(value.into_owned()),
-            "repository" if repository.is_none() => repository = Some(value.into_owned()),
-            _ => return Err(LocationQueryError::default()),
-        }
-    }
-    let owner = owner.unwrap_or_default();
-    let repository = repository.unwrap_or_default();
-    if validate_username(&owner).is_err() || validate_slug(&repository).is_err() {
-        return Err(LocationQueryError { owner, repository });
-    }
-    Ok((owner, repository))
-}
-
 fn valid_percent_encoding(input: &[u8]) -> bool {
     let mut index = 0;
     while index < input.len() {
@@ -2399,12 +2329,6 @@ fn valid_percent_encoding(input: &[u8]) -> bool {
 #[derive(Clone)]
 struct RequestId(String);
 
-#[derive(Default)]
-struct LocationQueryError {
-    owner: String,
-    repository: String,
-}
-
 #[derive(Default, serde::Deserialize)]
 struct ProfileQuery {
     page: Option<usize>,
@@ -2414,10 +2338,6 @@ struct ProfileQuery {
 #[template(path = "home.html")]
 struct HomeTemplate<'a> {
     request_id: &'a str,
-    owner: &'a str,
-    repository: &'a str,
-    error: &'a str,
-    has_error: bool,
     signed_in: bool,
     username: &'a str,
     csrf: &'a str,

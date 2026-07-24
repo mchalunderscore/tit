@@ -179,6 +179,22 @@ a {
   border-bottom: 1px solid GrayText;
 }
 
+.key-list {
+  padding: 0;
+  list-style: none;
+}
+
+.key-card {
+  margin-block: 1rem;
+  padding: 1rem;
+  border: 1px solid GrayText;
+  border-radius: 0.25rem;
+}
+
+.key-card > h3 {
+  margin-top: 0;
+}
+
 .two-column {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr);

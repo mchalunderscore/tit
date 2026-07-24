@@ -1479,7 +1479,11 @@ impl RepositoryPage {
             if let Ok(content) = std::str::from_utf8(&data)
                 && !data.contains(&0)
             {
-                page.readme_html = markdown::render(content);
+                let base = format!(
+                    "/{}/{}/blob/{}/",
+                    page.owner, page.repository, page.commit_id
+                );
+                page.readme_html = markdown::render_repository(content, &base);
             } else {
                 page.readme_binary = true;
             }

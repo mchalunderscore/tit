@@ -85,9 +85,8 @@ async fn serves_the_semantic_shell_without_javascript() {
     assert!(home.body.contains("<nav aria-label=\"Primary\">"));
     assert!(home.body.contains("<main id=\"main\">"));
     assert!(home.body.contains("<footer>"));
-    assert!(home.body.contains("<form action=\"/go\" method=\"get\">"));
-    assert!(home.body.contains("name=\"owner\""));
-    assert!(home.body.contains("name=\"repository\""));
+    assert!(!home.body.contains("Open a repository"));
+    assert!(!home.body.contains("<form action=\"/go\""));
     assert!(!home.body.to_ascii_lowercase().contains("<script"));
     assert_security_policy(&home);
     assert_snapshot(&home, include_str!("snapshots/web/home.html"));
@@ -95,6 +94,15 @@ async fn serves_the_semantic_shell_without_javascript() {
     let request_id = home.header("x-request-id");
     assert_request_id(request_id);
     assert!(home.body.contains(&format!("<code>{request_id}</code>")));
+
+    let removed_repository_form = request(
+        server.address(),
+        "GET",
+        "/go?owner=alice&repository=example",
+        &[],
+    );
+    assert_eq!(removed_repository_form.status, 404);
+    assert_security_policy(&removed_repository_form);
 
     let head = request(server.address(), "HEAD", "/", &[]);
     assert_eq!(head.status, 200);
@@ -139,62 +147,6 @@ async fn serves_the_semantic_shell_without_javascript() {
     let wrong_signup_method = request(server.address(), "PUT", "/signup", &[]);
     assert_eq!(wrong_signup_method.status, 405);
     assert_eq!(wrong_signup_method.header("allow"), "GET, HEAD, POST");
-
-    server.shutdown().await.expect("stop the Web server");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn submits_the_repository_form_with_plain_http() {
-    let server = start().await;
-
-    let redirect = request(
-        server.address(),
-        "GET",
-        "/go?owner=alice&repository=example",
-        &[],
-    );
-    assert_eq!(redirect.status, 302);
-    assert_eq!(redirect.header("location"), "/alice/example");
-    assert_eq!(redirect.header("cache-control"), "no-store");
-    assert!(redirect.body.is_empty());
-    assert_security_policy(&redirect);
-
-    for path in [
-        "/go",
-        "/go?owner=Alice&repository=example",
-        "/go?owner=alice&repository=../example",
-        "/go?owner=alice&owner=bob&repository=example",
-        "/go?owner=alice&repository=example&extra=value",
-        "/go?owner=alice&repository=%",
-    ] {
-        let response = request(server.address(), "GET", path, &[]);
-        assert_eq!(response.status, 400, "unexpected status for {path}");
-        assert!(response.body.contains("role=\"alert\""));
-        assert!(
-            response
-                .body
-                .contains("Enter a valid lowercase owner and repository.")
-        );
-        assert_security_policy(&response);
-    }
-
-    let injection = request(
-        server.address(),
-        "GET",
-        "/go?owner=%3Cscript%3E&repository=example",
-        &[],
-    );
-    assert_eq!(injection.status, 400);
-    assert!(injection.body.contains("value=\"&#60;script&#62;\""));
-    assert!(!injection.body.contains("value=\"<script>\""));
-    assert!(!injection.body.to_ascii_lowercase().contains("<script"));
-    assert_snapshot(&injection, include_str!("snapshots/web/bad-request.html"));
-
-    let oversized = format!("/go?owner={}&repository=example", "a".repeat(512));
-    assert_eq!(
-        request(server.address(), "GET", &oversized, &[]).status,
-        400
-    );
 
     server.shutdown().await.expect("stop the Web server");
 }

@@ -11,7 +11,6 @@
   <div class="two-column">
   <section>
   <h2>Public profile</h2>
-  <p><a href="/{{ username }}">View your public profile</a></p>
   <form action="/account/profile" method="post">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <div class="field">
@@ -24,6 +23,7 @@
     </div>
     <button type="submit">Save profile</button>
   </form>
+  <p><a href="/{{ username }}">View your public profile</a></p>
   </section>
   <section>
   <h2>Create repository</h2>
@@ -39,50 +39,35 @@
   <p><a href="/feeds">Manage private feed tokens</a></p>
   <h2>Sessions</h2>
   <p><a href="/logout">Log out all sessions</a></p>
-  </section>
-  </div>
-  <section>
   <h2>SSH keys</h2>
-  <div class="table-scroll">
-  <table>
-    <thead>
-      <tr>
-        <th>Label</th>
-        <th>Fingerprint</th>
-        <th>Created</th>
-        <th>Last used</th>
-        <th>State</th>
-        <th>Action</th>
-      </tr>
-    </thead>
-    <tbody>
+  <ul class="key-list">
     {% for key in keys %}
-      <tr>
-        <td>{{ key.label }}</td>
-        <td><code>{{ key.fingerprint }}</code></td>
-        <td>{{ key.created_at }}</td>
-        <td>{{ key.last_used_at }}</td>
-        <td>{% if key.active %}Active{% else %}Revoked{% endif %}</td>
-        <td>
+    <li class="key-card">
+      <h3>{{ key.label }}</h3>
+      <dl>
+        <dt>Fingerprint</dt>
+        <dd><code>{{ key.fingerprint }}</code></dd>
+        <dt>Created</dt>
+        <dd>{{ key.created_at }}</dd>
+        <dt>Last used</dt>
+        <dd>{{ key.last_used_at }}</dd>
+        <dt>State</dt>
+        <dd>{% if key.active %}Active{% else %}Revoked{% endif %}</dd>
+      </dl>
         {% if key.active %}
           {% if active_key_count > 1 %}
-          <form action="/account/keys/revoke" method="post">
-            <input type="hidden" name="csrf" value="{{ csrf }}">
-            <input type="hidden" name="fingerprint" value="{{ key.fingerprint }}">
-            <button type="submit">Revoke</button>
-          </form>
+      <form action="/account/keys/revoke" method="post">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="fingerprint" value="{{ key.fingerprint }}">
+        <button type="submit">Revoke</button>
+      </form>
           {% else %}
-          Final active key
+      <p>This is your final active key.</p>
           {% endif %}
-        {% else %}
-          —
         {% endif %}
-        </td>
-      </tr>
+    </li>
     {% endfor %}
-    </tbody>
-  </table>
-  </div>
+  </ul>
   <h3>Add SSH key</h3>
   <form action="/account/keys/add" method="post">
     <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -97,4 +82,5 @@
     <button type="submit">Add key</button>
   </form>
   </section>
+  </div>
 {% endblock %}

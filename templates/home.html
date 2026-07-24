@@ -1,9 +1,9 @@
 {% extends "base.html" %}
 {% block title %}{% if signed_in %}{{ username }}{% else %}Repositories{% endif %} · tit{% endblock %}
 {% block content %}
+{% if signed_in %}
   <div class="two-column">
   <section>
-{% if signed_in %}
   <h1>{{ username }}</h1>
   <p><a href="/account">Open your account profile</a>.</p>
   <h2>Your repositories</h2>
@@ -27,8 +27,11 @@
   {% endfor %}
   </ul>
 {% endif %}
+  </section>
+  <section>
   <h2>Recently updated public repositories</h2>
 {% else %}
+  <section>
   <h1>Recently updated public repositories</h1>
 {% endif %}
 {% if recent_repositories.is_empty() %}
@@ -45,23 +48,7 @@
   </ul>
 {% endif %}
   </section>
-  <section>
-  <h2>Open a repository</h2>
-  <p>Enter an owner and a repository to open its public page.</p>
-{% if has_error %}
-  <p class="error" role="alert">{{ error }}</p>
-{% endif %}
-  <form action="/go" method="get">
-    <div class="field">
-      <label for="owner">Owner</label>
-      <input id="owner" name="owner" value="{{ owner }}" required autocomplete="off" autocapitalize="none" spellcheck="false">
-    </div>
-    <div class="field">
-      <label for="repository">Repository</label>
-      <input id="repository" name="repository" value="{{ repository }}" required autocomplete="off" autocapitalize="none" spellcheck="false">
-    </div>
-    <button type="submit">Open repository</button>
-  </form>
-  </section>
+{% if signed_in %}
   </div>
+{% endif %}
 {% endblock %}
