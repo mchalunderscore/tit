@@ -29,6 +29,7 @@ use crate::telemetry::Telemetry;
 
 const VERSION_COMMAND: &[u8] = b"tit --version";
 const HELP_COMMAND: &[u8] = b"help";
+const LOGIN_COMMAND_PREFIX: &[u8] = b"login ";
 const GIT_PROTOCOL_VARIABLE: &str = "GIT_PROTOCOL";
 const MAX_RECEIVE_PACK_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_REPOSITORY_COMMAND_BYTES: usize = 512;
@@ -46,6 +47,7 @@ const HELP_TEXT: &str = "\
 Available tit SSH commands:
   help
   tit --version
+  login ONE-TIME-SECRET
   repo create NAME [--output human|json]
   issue list OWNER/REPOSITORY [--output human|json]
   issue create OWNER/REPOSITORY [--output human|json]
@@ -54,6 +56,27 @@ Available tit SSH commands:
 Git clients can also use git-upload-pack and git-receive-pack.
 ";
 const HELP_GUIDANCE: &str = "Use 'help' to list the available commands.";
+
+pub(crate) type LoginApprover =
+    Arc<dyn Fn(&str, &str, &str) -> Result<(String, String), ()> + Send + Sync>;
+
+struct SshRuntime {
+    max_connections: usize,
+    telemetry: Telemetry,
+    login: Option<LoginApprover>,
+}
+
+fn parse_login_command(command: &[u8]) -> Option<String> {
+    let secret = command.strip_prefix(LOGIN_COMMAND_PREFIX)?;
+    if secret.len() != 64
+        || !secret
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return None;
+    }
+    String::from_utf8(secret.to_vec()).ok()
+}
 
 pub(crate) struct RunningSshServer {
     address: SocketAddr,
@@ -164,6 +187,7 @@ impl RunningSshServer {
         host_key: PrivateKey,
         max_connections: usize,
         telemetry: Telemetry,
+        login: LoginApprover,
     ) -> Result<Self, SshServerError> {
         recover_pushes(&repositories).await?;
         Self::start_inner_with_keys(
@@ -172,8 +196,11 @@ impl RunningSshServer {
             &[],
             Some(repositories),
             host_key,
-            max_connections,
-            telemetry,
+            SshRuntime {
+                max_connections,
+                telemetry,
+                login: Some(login),
+            },
         )
         .await
     }
@@ -209,8 +236,11 @@ impl RunningSshServer {
             writable_keys,
             repositories,
             host_key,
-            1024,
-            Telemetry::default(),
+            SshRuntime {
+                max_connections: 1024,
+                telemetry: Telemetry::default(),
+                login: None,
+            },
         )
         .await
     }
@@ -221,8 +251,7 @@ impl RunningSshServer {
         writable_keys: &[SshPublicKey],
         repositories: Option<GitRepositories>,
         host_key: PrivateKey,
-        max_connections: usize,
-        telemetry: Telemetry,
+        runtime: SshRuntime,
     ) -> Result<Self, SshServerError> {
         let listener = TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
@@ -259,13 +288,14 @@ impl RunningSshServer {
             writable_keys,
             audit: Arc::clone(&audit),
             repositories: repositories.map(Arc::new),
-            connections: Arc::new(Semaphore::new(max_connections)),
+            login: runtime.login,
+            connections: Arc::new(Semaphore::new(runtime.max_connections)),
             attempts: AttemptLimiter::new(
                 SSH_ATTEMPTS_PER_MINUTE,
                 Duration::from_secs(60),
                 MAX_SSH_CLIENTS,
             ),
-            telemetry,
+            telemetry: runtime.telemetry,
         };
         let (handle_sender, handle_receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -349,6 +379,7 @@ struct SshServer {
     writable_keys: Arc<HashSet<PublicKey>>,
     audit: Arc<RequestAudit>,
     repositories: Option<Arc<GitRepositories>>,
+    login: Option<LoginApprover>,
     connections: Arc<Semaphore>,
     attempts: AttemptLimiter<IpAddr>,
     telemetry: Telemetry,
@@ -365,6 +396,7 @@ impl Server for SshServer {
             writable_keys: Arc::clone(&self.writable_keys),
             audit: Arc::clone(&self.audit),
             repositories: self.repositories.clone(),
+            login: self.login.clone(),
             protocol: ProtocolVersion::V0,
             exec_channels: HashMap::new(),
             authenticated_identity: None,
@@ -386,6 +418,7 @@ struct SshSession {
     writable_keys: Arc<HashSet<PublicKey>>,
     audit: Arc<RequestAudit>,
     repositories: Option<Arc<GitRepositories>>,
+    login: Option<LoginApprover>,
     protocol: ProtocolVersion,
     exec_channels: HashMap<ChannelId, ExecChannel>,
     authenticated_identity: Option<SshIdentity>,
@@ -597,6 +630,48 @@ impl Handler for SshSession {
             session.channel_success(channel)?;
             session.data(channel, HELP_TEXT.as_bytes())?;
             finish_git_channel(channel, 0, session)?;
+        } else if command.starts_with(LOGIN_COMMAND_PREFIX) {
+            self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
+            session.channel_success(channel)?;
+            let result = match (
+                parse_login_command(command),
+                self.active_identity(),
+                self.login.clone(),
+            ) {
+                (Some(secret), Some(identity), Some(login)) => {
+                    let username = identity.username;
+                    let fingerprint = identity.fingerprint;
+                    tokio::task::spawn_blocking(move || login(&secret, &username, &fingerprint))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                }
+                _ => None,
+            };
+            match result {
+                Some((origin, username)) => {
+                    session.data(
+                        channel,
+                        format!(
+                            "Browser login approved.\nOrigin: {}\nAccount: {}\nReturn to your browser and select Continue.\n",
+                            origin, username
+                        )
+                        .into_bytes(),
+                    )?;
+                    finish_git_channel(channel, 0, session)?;
+                }
+                None => {
+                    session.extended_data(
+                        channel,
+                        1,
+                        format!(
+                            "tit: The login approval is invalid or expired.\n{HELP_GUIDANCE}\n"
+                        )
+                        .into_bytes(),
+                    )?;
+                    finish_git_channel(channel, 1, session)?;
+                }
+            }
         } else if is_repository_command(command) {
             self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
             session.channel_success(channel)?;

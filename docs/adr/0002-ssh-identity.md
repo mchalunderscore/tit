@@ -31,7 +31,7 @@ independently reject a custom client that uses RSA-SHA1. Do not accept RSA keys
 until this boundary can enforce RSA-SHA2. A stock OpenSSH client that is forced
 to use `ssh-rsa` cannot authenticate to the M1B server.
 
-Use this canonical login challenge:
+The first feasibility gate uses this canonical login challenge:
 
 ```text
 tit-auth-v1
@@ -53,8 +53,9 @@ Keep only the SHA-256 hash and expiry of each active login nonce. Keep a maximum
 of 1,024 active challenges and remove expired entries when a new challenge is
 issued. Consume the hash under one lock only after all context and signature
 checks pass. A process restart invalidates all challenges in this feasibility
-implementation. Milestone 3 must put nonce hashes in SQLite before Web login is
-available.
+implementation. Milestone 3 puts nonce hashes in SQLite. Milestone 6.7 replaces
+the Web fallback challenge with `tit-auth-v2`. That format removes the
+fingerprint field because the SSHSIG envelope contains the signing key.
 
 The SSH server accepts public-key authentication only. It ignores the SSH
 username. It accepts session channels and the exact `tit --version` command.

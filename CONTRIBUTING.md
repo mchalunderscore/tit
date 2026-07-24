@@ -92,7 +92,8 @@ Use the technical nouns in this list:
 - Cargo, Git, OpenSSH, Rust, SQLite, and the exact names of crates, commands,
   types, files, paths, and configuration fields.
 - acceptance gate, audit event, collaborator role, domain event, feed token,
-  invite code, login nonce, recovery credential, and security boundary.
+  invite code, login approval, login nonce, recovery credential, and security
+  boundary.
 - architectural decision record, built-in SSH server, canonical URL,
   client-side router, progressive enhancement, recoverable runtime failure,
   server-rendered HTML, server-side validation, symbolic logo, and tit bird.

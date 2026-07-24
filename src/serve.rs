@@ -19,7 +19,8 @@ use crate::instance::{InstanceError, InstanceLock, prepare_database, prepare_rep
 use crate::maintenance::MaintenanceGate;
 use crate::policy::PolicyError;
 use crate::pull_request::{PullRequestError, PullRequestService};
-use crate::ssh::{AuthorizedSshKeys, RunningSshServer, SshServerError};
+use crate::session::{SessionError, WebLoginService};
+use crate::ssh::{AuthorizedSshKeys, LoginApprover, RunningSshServer, SshServerError};
 use crate::store::{Store, StoreError};
 use crate::telemetry::Telemetry;
 
@@ -43,7 +44,7 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
     )?;
     drop(store);
 
-    let accounts = AccountService::new(database);
+    let accounts = AccountService::new(database.clone());
     let backup = OnlineBackupService::new(
         config.instance_dir.clone(),
         config.config_path.clone(),
@@ -55,6 +56,14 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
     let readiness = ListenerReadiness::default();
 
     let (http_clone_base, ssh_clone_base) = clone_bases(config)?;
+    let login = WebLoginService::new(database, &config.public_url)?;
+    let login_approver: LoginApprover =
+        std::sync::Arc::new(move |secret, username, fingerprint| {
+            login
+                .approve(secret, username, fingerprint)
+                .map(|approved| (approved.origin, approved.username))
+                .map_err(|_| ())
+        });
     let host_key = load_or_create_host_key(&config.instance_dir)?;
     let reload_keys = {
         let authorized_keys = authorized_keys.clone();
@@ -89,6 +98,7 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
         host_key,
         usize::try_from(config.max_connections).map_err(|_| ServeError::ConnectionLimit)?,
         telemetry.clone(),
+        login_approver,
     )
     .await
     {
@@ -285,6 +295,8 @@ pub(crate) enum ServeError {
     Web(#[from] WebError),
     #[error(transparent)]
     Ssh(#[from] SshServerError),
+    #[error(transparent)]
+    Session(#[from] SessionError),
     #[error(transparent)]
     Control(#[from] ControlError),
     #[error("cannot wait for a shutdown signal: {0}")]

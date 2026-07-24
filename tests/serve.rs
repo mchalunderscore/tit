@@ -177,46 +177,29 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     assert!(anonymous_home.contains("<a href=\"/login\">Log in</a>"));
     assert!(!anonymous_home.contains("<a href=\"/account\">Account</a>"));
 
-    let login_challenge = http_form(
-        http,
-        "/login",
-        &[("username", "alice"), ("public-key", public_key.trim())],
-    );
-    assert!(login_challenge.starts_with("HTTP/1.1 200"));
-    let challenge = between(
-        &login_challenge,
-        "<textarea id=\"challenge-display\" readonly rows=\"10\">",
-        "</textarea>",
-    );
-    let signature = sign_challenge(instance.path(), &private_key, challenge);
-    let browser_challenge = challenge.replace('\n', "\r\n");
-    let browser_signature = signature.replace('\n', "\r\n");
-    let login_csrf_cookies = response_cookies(&login_challenge);
+    let login_approval = http_form(http, "/login/ssh", &[]);
+    assert!(login_approval.starts_with("HTTP/1.1 200"));
+    let secret = between(&login_approval, "name=\"secret\" value=\"", "\">");
+    let login_csrf_cookies = response_cookies(&login_approval);
     let login_csrf = cookie_value(&login_csrf_cookies, "tit-login-csrf");
+    let ssh_approval = ssh_exec(ssh, &private_key, &["login", secret]);
+    assert!(ssh_approval.status.success());
+    let ssh_approval_output =
+        String::from_utf8(ssh_approval.stdout).expect("read SSH approval output");
+    assert!(ssh_approval_output.contains(&format!("Origin: http://{http}")));
+    assert!(ssh_approval_output.contains("Account: alice"));
     let rejected_login = http_form_with_headers(
         http,
-        "/login/verify",
-        &[
-            ("username", "alice"),
-            ("public-key", public_key.trim()),
-            ("challenge", &browser_challenge),
-            ("signature", &browser_signature),
-            ("login-csrf", &"0".repeat(64)),
-        ],
+        "/login/ssh/complete",
+        &[("secret", secret), ("login-csrf", &"0".repeat(64))],
         &[("Cookie", &login_csrf_cookies)],
     );
     assert!(rejected_login.starts_with("HTTP/1.1 400"));
     let rejected_login_id = response_header(&rejected_login, "x-request-id").to_owned();
     let login = http_form_with_headers(
         http,
-        "/login/verify",
-        &[
-            ("username", "alice"),
-            ("public-key", public_key.trim()),
-            ("challenge", &browser_challenge),
-            ("signature", &browser_signature),
-            ("login-csrf", login_csrf),
-        ],
+        "/login/ssh/complete",
+        &[("secret", secret), ("login-csrf", login_csrf)],
         &[("Cookie", &login_csrf_cookies)],
     );
     assert!(login.starts_with("HTTP/1.1 303"), "{login}");
@@ -306,11 +289,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     let ended = http_get_with_headers(http, "/account", &[("Cookie", &cookies)]);
     assert!(ended.starts_with("HTTP/1.1 303"));
 
-    let upload_challenge_page = http_form(
-        http,
-        "/login",
-        &[("username", "alice"), ("public-key", public_key.trim())],
-    );
+    let upload_challenge_page = http_form(http, "/login", &[("username", "alice")]);
     let upload_challenge = between(
         &upload_challenge_page,
         "<textarea id=\"challenge-display\" readonly rows=\"10\">",
@@ -320,6 +299,24 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     let browser_upload_challenge = upload_challenge.replace('\n', "\r\n");
     let upload_csrf_cookies = response_cookies(&upload_challenge_page);
     let upload_csrf = cookie_value(&upload_csrf_cookies, "tit-login-csrf");
+    let downloaded_challenge = http_form_with_headers(
+        http,
+        "/login/challenge.txt",
+        &[
+            ("username", "alice"),
+            ("challenge", &browser_upload_challenge),
+            ("login-csrf", upload_csrf),
+        ],
+        &[("Cookie", &upload_csrf_cookies)],
+    );
+    assert!(downloaded_challenge.starts_with("HTTP/1.1 200"));
+    assert_eq!(
+        downloaded_challenge
+            .split_once("\r\n\r\n")
+            .expect("split the challenge response")
+            .1,
+        upload_challenge
+    );
     let wrong_upload_type = http_form_with_headers(
         http,
         "/login/verify-file",
@@ -335,12 +332,24 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         &[("Cookie", &upload_csrf_cookies)],
     );
     assert!(malformed_upload.starts_with("HTTP/1.1 400"));
+    let invalid_signature = http_form_with_headers(
+        http,
+        "/login/verify",
+        &[
+            ("username", "alice"),
+            ("challenge", &browser_upload_challenge),
+            ("signature", "not an SSHSIG envelope"),
+            ("login-csrf", upload_csrf),
+        ],
+        &[("Cookie", &upload_csrf_cookies)],
+    );
+    assert!(invalid_signature.starts_with("HTTP/1.1 400"));
+    assert!(invalid_signature.contains("The signature is not valid"));
     let uploaded = http_multipart(
         http,
         "/login/verify-file",
         &[
             ("username", "alice"),
-            ("public-key", public_key.trim()),
             ("challenge", &browser_upload_challenge),
             ("signature-file", &upload_signature),
             ("login-csrf", upload_csrf),
@@ -349,6 +358,27 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     );
     assert!(uploaded.starts_with("HTTP/1.1 303"), "{uploaded}");
     let private_cookies = response_cookies(&uploaded);
+    let paste_challenge_page = http_form(http, "/login", &[("username", "alice")]);
+    let paste_challenge = between(
+        &paste_challenge_page,
+        "<textarea id=\"challenge-display\" readonly rows=\"10\">",
+        "</textarea>",
+    );
+    let paste_signature = sign_challenge(instance.path(), &private_key, paste_challenge);
+    let paste_cookies = response_cookies(&paste_challenge_page);
+    let paste_csrf = cookie_value(&paste_cookies, "tit-login-csrf");
+    let pasted = http_form_with_headers(
+        http,
+        "/login/verify",
+        &[
+            ("username", "alice"),
+            ("challenge", &paste_challenge.replace('\n', "\r\n")),
+            ("signature", &paste_signature.replace('\n', "\r\n")),
+            ("login-csrf", paste_csrf),
+        ],
+        &[("Cookie", &paste_cookies)],
+    );
+    assert!(pasted.starts_with("HTTP/1.1 303"), "{pasted}");
     let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
         .expect("open the repository database");
     database
@@ -504,8 +534,11 @@ fn serves_an_imported_repository_through_http_and_ssh() {
             event.0, event.1, event.2, event.3, event.4
         );
         assert!(!visible.contains(recovery));
-        assert!(!visible.contains(challenge));
-        assert!(!visible.contains(&signature));
+        assert!(!visible.contains(secret));
+        assert!(!visible.contains(upload_challenge));
+        assert!(!visible.contains(&upload_signature));
+        assert!(!visible.contains(paste_challenge));
+        assert!(!visible.contains(&paste_signature));
     }
     drop(statement);
     drop(database);
@@ -577,11 +610,13 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     assert!(!logs.contains(feed_secret));
     for secret in [
         recovery,
-        challenge,
-        signature.as_str(),
+        secret,
+        upload_challenge,
+        paste_challenge,
         invitation.trim(),
         private_cookies.as_str(),
         upload_signature.as_str(),
+        paste_signature.as_str(),
     ] {
         assert!(!logs.contains(secret));
     }

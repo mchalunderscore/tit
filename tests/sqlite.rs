@@ -104,6 +104,20 @@ const V16_FIXTURE: &str = concat!(
     include_str!("../src/store/migrations/016_pull_request_reviews.sql"),
     "PRAGMA user_version = 16;\n",
 );
+const V17_FIXTURE: &str = concat!(
+    include_str!("fixtures/sqlite/v7.sql"),
+    include_str!("../src/store/migrations/008_web_sessions.sql"),
+    include_str!("../src/store/migrations/009_repository_authorization.sql"),
+    include_str!("../src/store/migrations/010_audit_history.sql"),
+    include_str!("../src/store/migrations/011_domain_events.sql"),
+    include_str!("../src/store/migrations/012_issues.sql"),
+    include_str!("../src/store/migrations/013_watches.sql"),
+    include_str!("../src/store/migrations/014_feed_tokens.sql"),
+    include_str!("../src/store/migrations/015_pull_requests.sql"),
+    include_str!("../src/store/migrations/016_pull_request_reviews.sql"),
+    include_str!("../src/store/migrations/017_pull_request_merges.sql"),
+    "PRAGMA user_version = 17;\n",
+);
 
 fn database(directory: &TempDir, name: &str) -> std::path::PathBuf {
     directory.path().join(name)
@@ -221,7 +235,7 @@ fn configures_connections_and_creates_the_current_schema() {
     let directory = TempDir::new().expect("create a temporary directory");
     let store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
 
-    assert_eq!(store.schema_version().expect("read the schema version"), 17);
+    assert_eq!(store.schema_version().expect("read the schema version"), 18);
     assert_eq!(
         store
             .connection()
@@ -1586,13 +1600,14 @@ fn migrates_each_committed_historical_fixture() {
         (V14_FIXTURE, 14),
         (V15_FIXTURE, 15),
         (V16_FIXTURE, 16),
+        (V17_FIXTURE, 17),
     ] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "tit.sqlite3");
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
-        assert_eq!(store.schema_version().expect("read the schema version"), 17);
+        assert_eq!(store.schema_version().expect("read the schema version"), 18);
         store.integrity_check().expect("check migrated integrity");
         let state: String = store
             .connection()
@@ -1665,7 +1680,7 @@ fn backfills_repository_events_when_version_five_is_migrated() {
 
 #[test]
 fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
-    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 17)] {
+    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 18)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "fixture.sqlite");
         create_fixture(&path, V1_FIXTURE);

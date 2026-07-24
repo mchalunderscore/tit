@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Approve login · tit{% endblock %}
+{% block content %}
+  <h1>Approve login with SSH</h1>
+  <p>Run this command in a terminal. Use an SSH key that is active on your account.</p>
+  <pre><code>{{ command }}</code></pre>
+  <p>The SSH response shows the site origin and account. Check both values before you continue.</p>
+{% if has_error %}
+  <p class="error" role="alert">{{ error }}</p>
+{% endif %}
+  <form action="/login/ssh/complete" method="post">
+    <input type="hidden" name="secret" value="{{ secret }}">
+    <input type="hidden" name="login-csrf" value="{{ login_csrf }}">
+    <button type="submit">Continue</button>
+  </form>
+  <p><a href="/login">Cancel</a></p>
+{% endblock %}

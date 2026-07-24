@@ -7,10 +7,11 @@ use thiserror::Error;
 use url::Url;
 
 use crate::auth::{
-    AuthError, SshPublicKey, format_login_challenge, login_origin, verify_login_challenge,
+    AuthError, format_keyless_login_challenge, login_origin, verify_keyless_login_challenge,
 };
 use crate::store::{
-    NewAuditEvent, NewLoginNonce, NewWebSession, Store, StoreError, WebSessionRecord,
+    ApproveLogin, NewApprovedWebSession, NewAuditEvent, NewLoginApproval, NewLoginNonce,
+    NewWebSession, Store, StoreError, WebSessionRecord,
 };
 
 const CHALLENGE_LIFETIME_SECONDS: u64 = 5 * 60;
@@ -31,12 +32,8 @@ impl WebLoginService {
         })
     }
 
-    pub(crate) fn issue(
-        &self,
-        username: &str,
-        public_key: &str,
-    ) -> Result<IssuedChallenge, SessionError> {
-        let key = SshPublicKey::parse(public_key)?;
+    pub(crate) fn issue(&self, username: &str) -> Result<IssuedChallenge, SessionError> {
+        crate::auth::validate_username(username)?;
         let created_at = now()?;
         let issued_at = u64::try_from(created_at).map_err(|_| SessionError::Clock)?;
         let expires_at = issued_at
@@ -48,28 +45,90 @@ impl WebLoginService {
             nonce_hash: &hash(&nonce),
             csrf_hash: &hash(login_csrf.as_bytes()),
             username,
-            fingerprint: key.fingerprint(),
             created_at,
             expires_at: i64::try_from(expires_at).map_err(|_| SessionError::Clock)?,
         })?;
         Ok(IssuedChallenge {
-            challenge: format_login_challenge(
+            challenge: format_keyless_login_challenge(
                 &self.origin,
                 username,
-                &key,
                 &nonce,
                 issued_at,
                 expires_at,
             ),
-            public_key: key.canonical().to_owned(),
             login_csrf,
+        })
+    }
+
+    pub(crate) fn issue_approval(&self) -> Result<IssuedLoginApproval, SessionError> {
+        let created_at = now()?;
+        let expires_at = created_at
+            .checked_add(
+                i64::try_from(CHALLENGE_LIFETIME_SECONDS).map_err(|_| SessionError::Clock)?,
+            )
+            .ok_or(SessionError::Clock)?;
+        let secret = encode_hex(&random_bytes()?);
+        let login_csrf = encode_hex(&random_bytes()?);
+        Store::open(&self.database)?.create_login_approval(&NewLoginApproval {
+            secret_hash: &hash(secret.as_bytes()),
+            csrf_hash: &hash(login_csrf.as_bytes()),
+            created_at,
+            expires_at,
+        })?;
+        Ok(IssuedLoginApproval { secret, login_csrf })
+    }
+
+    pub(crate) fn approve(
+        &self,
+        secret: &str,
+        username: &str,
+        fingerprint: &str,
+    ) -> Result<ApprovedLogin, SessionError> {
+        validate_token(secret)?;
+        Store::open(&self.database)?.approve_login(&ApproveLogin {
+            secret_hash: &hash(secret.as_bytes()),
+            username,
+            fingerprint,
+            approved_at: now()?,
+        })?;
+        Ok(ApprovedLogin {
+            origin: self.origin.clone(),
+            username: username.to_owned(),
+        })
+    }
+
+    pub(crate) fn complete_approval(
+        &self,
+        secret: &str,
+        login_csrf: &str,
+        correlation_id: &str,
+    ) -> Result<NewSession, SessionError> {
+        validate_token(secret)?;
+        validate_token(login_csrf)?;
+        let created_at = now()?;
+        let session = encode_hex(&random_bytes()?);
+        let csrf = encode_hex(&random_bytes()?);
+        let expires_at = created_at
+            .checked_add(SESSION_LIFETIME_SECONDS)
+            .ok_or(SessionError::Clock)?;
+        Store::open(&self.database)?.consume_login_approval(&NewApprovedWebSession {
+            secret_hash: &hash(secret.as_bytes()),
+            login_csrf_hash: &hash(login_csrf.as_bytes()),
+            session_hash: &hash(session.as_bytes()),
+            csrf_hash: &hash(csrf.as_bytes()),
+            created_at,
+            expires_at,
+            correlation_id,
+        })?;
+        Ok(NewSession {
+            token: session,
+            csrf,
         })
     }
 
     pub(crate) fn verify(
         &self,
         username: &str,
-        public_key: &str,
         challenge: &str,
         signature: &str,
         login_csrf: &str,
@@ -78,13 +137,11 @@ impl WebLoginService {
         let created_at = now()?;
         let result = (|| {
             validate_token(login_csrf)?;
-            let key = SshPublicKey::parse(public_key)?;
-            let verified = verify_login_challenge(
+            let verified = verify_keyless_login_challenge(
                 &self.origin,
                 challenge,
                 signature,
                 username,
-                &key,
                 u64::try_from(created_at).map_err(|_| SessionError::Clock)?,
             )?;
             let session = encode_hex(&random_bytes()?);
@@ -177,8 +234,17 @@ fn audit_account(username: &str) -> &str {
 
 pub(crate) struct IssuedChallenge {
     pub(crate) challenge: String,
-    pub(crate) public_key: String,
     pub(crate) login_csrf: String,
+}
+
+pub(crate) struct IssuedLoginApproval {
+    pub(crate) secret: String,
+    pub(crate) login_csrf: String,
+}
+
+pub(crate) struct ApprovedLogin {
+    pub(crate) origin: String,
+    pub(crate) username: String,
 }
 
 pub(crate) struct NewSession {

@@ -109,6 +109,7 @@ struct WebState {
     telemetry: Telemetry,
     key_reloader: Option<AccountKeyReloader>,
     login: Option<WebLoginService>,
+    ssh_login_target: Option<SshLoginTarget>,
     repositories: Option<RepositoryService>,
     issues: Option<IssueService>,
     pull_requests: Option<PullRequestService>,
@@ -117,6 +118,23 @@ struct WebState {
     watches: Option<WatchService>,
     readiness: Option<ListenerReadiness>,
     secure_cookies: bool,
+}
+
+#[derive(Clone)]
+struct SshLoginTarget {
+    host: String,
+    port: u16,
+}
+
+impl SshLoginTarget {
+    fn command(&self, secret: &str) -> String {
+        format!(
+            "ssh -p {} {} login {}",
+            self.port,
+            shell_word(&self.host),
+            secret
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -175,6 +193,7 @@ impl RunningWebServer {
                 telemetry: Telemetry::default(),
                 key_reloader: None,
                 login: None,
+                ssh_login_target: None,
                 repositories: None,
                 issues: None,
                 pull_requests: None,
@@ -225,6 +244,7 @@ impl RunningWebServer {
         let jobs = Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS));
         let requests = Arc::new(Semaphore::new(config.max_connections));
         let max_request_bytes = config.max_request_bytes;
+        let ssh_login_target = parse_ssh_login_target(&config.ssh_clone_base)?;
         let database = config.instance_dir.join(crate::store::DATABASE_FILE);
         let accounts = AccountService::new(database.clone());
         let public_url = url::Url::parse(&format!("{}/", config.http_clone_base))
@@ -260,6 +280,7 @@ impl RunningWebServer {
                 telemetry,
                 key_reloader,
                 login: Some(login),
+                ssh_login_target: Some(ssh_login_target),
                 repositories: Some(repositories),
                 issues: Some(issues),
                 pull_requests: Some(pull_requests),
@@ -331,6 +352,7 @@ pub(crate) fn router() -> Router {
         telemetry: Telemetry::default(),
         key_reloader: None,
         login: None,
+        ssh_login_target: None,
         repositories: None,
         issues: None,
         pull_requests: None,
@@ -373,12 +395,24 @@ fn router_with_state(state: WebState) -> Router {
                 .layer(DefaultBodyLimit::max(32 * 1024)),
         )
         .route(
+            "/login/ssh",
+            axum::routing::post(login_ssh).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route(
+            "/login/ssh/complete",
+            axum::routing::post(login_ssh_complete).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route(
             "/login/verify",
             axum::routing::post(login_verify).layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route(
             "/login/verify-file",
             axum::routing::post(login_verify_file).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/login/challenge.txt",
+            axum::routing::post(login_challenge_download).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/account", get(account_page))
         .route(
@@ -421,6 +455,31 @@ fn login_attempt_limiter() -> AttemptLimiter<IpAddr> {
         Duration::from_secs(60),
         MAX_LOGIN_CLIENTS,
     )
+}
+
+fn parse_ssh_login_target(value: &str) -> Result<SshLoginTarget, WebError> {
+    let url = url::Url::parse(value).map_err(WebError::CanonicalUrl)?;
+    let host = url.host_str().ok_or_else(|| {
+        WebError::PublicConfig("the SSH clone URL does not have a host".to_owned())
+    })?;
+    Ok(SshLoginTarget {
+        host: if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_owned()
+        },
+        port: url.port().unwrap_or(22),
+    })
+}
+
+fn shell_word(value: &str) -> String {
+    if value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'[' | b']' | b':')
+    }) {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 async fn request_guard(
@@ -694,15 +753,14 @@ async fn login_challenge(
             "Login attempt limit exceeded.\n",
         );
     }
-    let fields = match parse_named_form(&headers, &body, &["username", "public-key"]) {
+    let fields = match parse_named_form(&headers, &body, &["username"]) {
         Ok(fields) => fields,
         Err(()) => return login_error(&request_id.0, "", "The login request is not valid."),
     };
     let username = fields[0].clone();
     let display_username = username.clone();
-    let public_key = fields[1].clone();
     let secure = state.secure_cookies;
-    let result = login_job(state, move |login| login.issue(&username, &public_key)).await;
+    let result = login_job(state, move |login| login.issue(&username)).await;
     match result {
         Ok(challenge) => {
             let mut response = render(
@@ -710,9 +768,10 @@ async fn login_challenge(
                 &LoginChallengeTemplate {
                     request_id: &request_id.0,
                     username: &display_username,
-                    public_key: &challenge.public_key,
                     challenge: &challenge.challenge,
                     login_csrf: &challenge.login_csrf,
+                    error: "",
+                    has_error: false,
                     signed_in: false,
                 },
             );
@@ -729,7 +788,124 @@ async fn login_challenge(
         Err(_) => login_error(
             &request_id.0,
             &display_username,
-            "The username or SSH public key is not valid.",
+            "The username is not valid or the account is not active.",
+        ),
+    }
+}
+
+async fn login_ssh(
+    State(state): State<WebState>,
+    Extension(peer): Extension<ClientAddress>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    if !allow_login_attempt(&state, peer) {
+        return limit_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Login attempt limit exceeded.\n",
+        );
+    }
+    let Some(target) = state.ssh_login_target.clone() else {
+        return login_error(
+            &request_id.0,
+            "",
+            "SSH login is not available on this instance.",
+        );
+    };
+    let secure = state.secure_cookies;
+    match login_job(state, |login| login.issue_approval()).await {
+        Ok(approval) => {
+            let command = target.command(&approval.secret);
+            let mut response = render(
+                StatusCode::OK,
+                &LoginSshTemplate {
+                    request_id: &request_id.0,
+                    command: &command,
+                    secret: &approval.secret,
+                    login_csrf: &approval.login_csrf,
+                    error: "",
+                    has_error: false,
+                    signed_in: false,
+                },
+            );
+            append_cookie(
+                response.headers_mut(),
+                LOGIN_CSRF_COOKIE,
+                &approval.login_csrf,
+                true,
+                secure,
+                5 * 60,
+            );
+            response
+        }
+        Err(_) => login_error(
+            &request_id.0,
+            "",
+            "The SSH login request could not be created.",
+        ),
+    }
+}
+
+async fn login_ssh_complete(
+    State(state): State<WebState>,
+    Extension(peer): Extension<ClientAddress>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !allow_login_attempt(&state, peer) {
+        return limit_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Login attempt limit exceeded.\n",
+        );
+    }
+    let fields = match parse_named_form(&headers, &body, &["secret", "login-csrf"]) {
+        Ok(fields) => fields,
+        Err(()) => {
+            return rejected_login(state, &request_id.0, "", "The login response is not valid.")
+                .await;
+        }
+    };
+    let secret = fields[0].clone();
+    let login_csrf = fields[1].clone();
+    if cookie(&headers, LOGIN_CSRF_COOKIE).as_deref() != Some(login_csrf.as_str()) {
+        return rejected_login(state, &request_id.0, "", "The login response is not valid.").await;
+    }
+    let secure = state.secure_cookies;
+    let correlation_id = request_id.0.clone();
+    let result = login_job(state.clone(), {
+        let secret = secret.clone();
+        let login_csrf = login_csrf.clone();
+        move |login| login.complete_approval(&secret, &login_csrf, &correlation_id)
+    })
+    .await;
+    match result {
+        Ok(session) => login_success(session, secure),
+        Err(SessionError::Store(StoreError::LoginApprovalPending)) => {
+            let Some(target) = state.ssh_login_target else {
+                return login_error(
+                    &request_id.0,
+                    "",
+                    "SSH login is not available on this instance.",
+                );
+            };
+            let command = target.command(&secret);
+            render(
+                StatusCode::CONFLICT,
+                &LoginSshTemplate {
+                    request_id: &request_id.0,
+                    command: &command,
+                    secret: &secret,
+                    login_csrf: &login_csrf,
+                    error: "Authenticate with SSH before you continue.",
+                    has_error: true,
+                    signed_in: false,
+                },
+            )
+        }
+        Err(_) => login_error(
+            &request_id.0,
+            "",
+            "The SSH login request is invalid or has expired.",
         ),
     }
 }
@@ -750,13 +926,7 @@ async fn login_verify(
     let fields = match parse_named_form(
         &headers,
         &body,
-        &[
-            "username",
-            "public-key",
-            "challenge",
-            "signature",
-            "login-csrf",
-        ],
+        &["username", "challenge", "signature", "login-csrf"],
     ) {
         Ok(fields) => fields,
         Err(()) => {
@@ -765,10 +935,9 @@ async fn login_verify(
         }
     };
     let username = fields[0].clone();
-    let public_key = fields[1].clone();
-    let challenge = fields[2].clone();
-    let signature = fields[3].clone();
-    let login_csrf = fields[4].clone();
+    let challenge = fields[1].clone();
+    let signature = fields[2].clone();
+    let login_csrf = fields[3].clone();
     if cookie(&headers, LOGIN_CSRF_COOKIE).as_deref() != Some(login_csrf.as_str()) {
         return rejected_login(
             state,
@@ -782,12 +951,31 @@ async fn login_verify(
         state,
         &request_id.0,
         username,
-        public_key,
         challenge,
         signature,
         login_csrf,
     )
     .await
+}
+
+async fn login_challenge_download(headers: HeaderMap, body: Bytes) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["username", "challenge", "login-csrf"]) {
+        Ok(fields) => fields,
+        Err(()) => return limit_response(StatusCode::BAD_REQUEST, "The request is not valid.\n"),
+    };
+    if cookie(&headers, LOGIN_CSRF_COOKIE).as_deref() != Some(fields[2].as_str()) {
+        return limit_response(StatusCode::FORBIDDEN, "The request is not authorized.\n");
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"tit-login-challenge.txt\"",
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(normalize_browser_newlines(fields[1].clone())))
+        .expect("the login challenge download is valid")
 }
 
 async fn login_verify_file(
@@ -814,7 +1002,6 @@ async fn login_verify_file(
     };
     let mut multipart = multra::Multipart::new(body.into_data_stream(), boundary);
     let mut username = None;
-    let mut public_key = None;
     let mut challenge = None;
     let mut signature = None;
     let mut login_csrf = None;
@@ -834,7 +1021,6 @@ async fn login_verify_file(
         };
         match field.name() {
             Some("username") if username.is_none() => username = field.text().await.ok(),
-            Some("public-key") if public_key.is_none() => public_key = field.text().await.ok(),
             Some("challenge") if challenge.is_none() => challenge = field.text().await.ok(),
             Some("signature-file") if signature.is_none() => signature = field.text().await.ok(),
             Some("login-csrf") if login_csrf.is_none() => login_csrf = field.text().await.ok(),
@@ -849,8 +1035,8 @@ async fn login_verify_file(
             }
         }
     }
-    let (Some(username), Some(public_key), Some(challenge), Some(signature), Some(login_csrf)) =
-        (username, public_key, challenge, signature, login_csrf)
+    let (Some(username), Some(challenge), Some(signature), Some(login_csrf)) =
+        (username, challenge, signature, login_csrf)
     else {
         return rejected_login(state, &request_id.0, "", "The login response is not valid.").await;
     };
@@ -867,7 +1053,6 @@ async fn login_verify_file(
         state,
         &request_id.0,
         username,
-        public_key,
         challenge,
         signature,
         login_csrf,
@@ -879,19 +1064,19 @@ async fn complete_login(
     state: WebState,
     request_id: &str,
     username: String,
-    public_key: String,
     challenge: String,
     signature: String,
     login_csrf: String,
 ) -> Response {
     let display_username = username.clone();
     let challenge = normalize_browser_newlines(challenge);
+    let display_challenge = challenge.clone();
+    let display_login_csrf = login_csrf.clone();
     let secure = state.secure_cookies;
     let correlation_id = request_id.to_owned();
     let result = login_job(state, move |login| {
         login.verify(
             &username,
-            &public_key,
             &challenge,
             &signature,
             &login_csrf,
@@ -900,45 +1085,54 @@ async fn complete_login(
     })
     .await;
     match result {
-        Ok(session) => {
-            let mut response = Response::builder()
-                .status(StatusCode::SEE_OTHER)
-                .header(header::LOCATION, "/account")
-                .header(header::CACHE_CONTROL, "no-store")
-                .body(Body::empty())
-                .expect("the login redirect is valid");
-            append_cookie(
-                response.headers_mut(),
-                SESSION_COOKIE,
-                &session.token,
-                true,
-                secure,
-                SESSION_COOKIE_MAX_AGE,
-            );
-            append_cookie(
-                response.headers_mut(),
-                LOGIN_CSRF_COOKIE,
-                "",
-                true,
-                secure,
-                0,
-            );
-            append_cookie(
-                response.headers_mut(),
-                CSRF_COOKIE,
-                &session.csrf,
-                false,
-                secure,
-                SESSION_COOKIE_MAX_AGE,
-            );
-            response
-        }
-        Err(_) => login_error(
-            request_id,
-            &display_username,
-            "The signature is not valid or the challenge has expired.",
+        Ok(session) => login_success(session, secure),
+        Err(_) => render(
+            StatusCode::BAD_REQUEST,
+            &LoginChallengeTemplate {
+                request_id,
+                username: &display_username,
+                challenge: &display_challenge,
+                login_csrf: &display_login_csrf,
+                error: "The signature is not valid or the challenge has expired.",
+                has_error: true,
+                signed_in: false,
+            },
         ),
     }
+}
+
+fn login_success(session: crate::session::NewSession, secure: bool) -> Response {
+    let mut response = Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(header::LOCATION, "/account")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::empty())
+        .expect("the login redirect is valid");
+    append_cookie(
+        response.headers_mut(),
+        SESSION_COOKIE,
+        &session.token,
+        true,
+        secure,
+        SESSION_COOKIE_MAX_AGE,
+    );
+    append_cookie(
+        response.headers_mut(),
+        LOGIN_CSRF_COOKIE,
+        "",
+        true,
+        secure,
+        0,
+    );
+    append_cookie(
+        response.headers_mut(),
+        CSRF_COOKIE,
+        &session.csrf,
+        false,
+        secure,
+        SESSION_COOKIE_MAX_AGE,
+    );
+    response
 }
 
 fn normalize_browser_newlines(value: String) -> String {
@@ -1786,9 +1980,22 @@ struct LoginTemplate<'a> {
 struct LoginChallengeTemplate<'a> {
     request_id: &'a str,
     username: &'a str,
-    public_key: &'a str,
     challenge: &'a str,
     login_csrf: &'a str,
+    error: &'a str,
+    has_error: bool,
+    signed_in: bool,
+}
+
+#[derive(Template)]
+#[template(path = "login-ssh.html")]
+struct LoginSshTemplate<'a> {
+    request_id: &'a str,
+    command: &'a str,
+    secret: &'a str,
+    login_csrf: &'a str,
+    error: &'a str,
+    has_error: bool,
     signed_in: bool,
 }
 
@@ -1818,6 +2025,8 @@ pub(crate) enum WebError {
     Public(#[from] public::PublicWebError),
     #[error("canonical URL error: {0}")]
     CanonicalUrl(url::ParseError),
+    #[error("public Web configuration error: {0}")]
+    PublicConfig(String),
     #[error(transparent)]
     Session(#[from] SessionError),
     #[error("HTTP server task failed")]

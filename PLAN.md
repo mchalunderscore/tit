@@ -142,14 +142,16 @@ tit setup admin <username> "<ssh-public-key>"
 The command is valid only for an uninitialized instance, creates exactly one
 administrator, and prints its recovery code once.
 
-Web login uses the standard SSH signature envelope rather than a custom
-cryptographic format. The login page presents a challenge and an exact command
-with `ssh-keygen -Y sign` and the dedicated `tit-auth` namespace. The
-challenge contains these minimum items:
+Web login uses the built-in SSH service as the primary approval path. The
+browser creates a one-time approval, and an authenticated `ssh` command binds
+the approval to the account and active key. The fallback uses the standard SSH
+signature envelope rather than a custom cryptographic format. It presents a
+challenge and an exact command with `ssh-keygen -Y sign` and the dedicated
+`tit-auth` namespace. The challenge contains these minimum items:
 
 - protocol version and purpose.
 - canonical CDE origin.
-- normalized username and selected key fingerprint.
+- normalized username.
 - cryptographically random nonce.
 - issue and expiry times.
 
@@ -777,6 +779,46 @@ Gate: a new operator can use only the supplied documentation to install,
 configure, make a backup, restore, upgrade, and remove `tit`. The operator can
 also cause damage to a disposable copy and restore it. All security and recovery
 tests use the release artifact, not a debug build.
+
+##### M6.7 — Streamlined Web login
+
+Status: Complete.
+
+- Make browser login through the built-in SSH server the primary login
+  workflow. The browser creates a short-lived, one-time secret and supplies an
+  exact `ssh` command. The SSH connection identifies the account from its key
+  and approves only that browser login request.
+- Bind each login approval to the browser login CSRF cookie. Store only secret
+  hashes. Show the canonical origin and authenticated username in SSH output.
+  Atomically consume the approval when the server creates the Web session.
+- Keep the SSHSIG workflow as a fallback. Ask for a username, but do not ask the
+  user to paste a public key. Read the signing key from the SSHSIG envelope and
+  require an active key for the account.
+- Supply the fallback challenge as a downloadable file and show an exact
+  `ssh-keygen -Y sign` command. Make signature-file upload the primary fallback
+  response. Keep signature text input as a secondary response.
+- After an invalid fallback signature, show the same challenge and error while
+  the login nonce remains valid. Do not make the user create a new challenge
+  unless it expires or is consumed.
+- Keep both workflows complete without JavaScript. Apply the existing login
+  rate limit, audit behavior, redaction rules, session rules, and generic
+  authentication errors.
+
+Gate: stock OpenSSH approves a browser login through the built-in SSH server,
+and stock `ssh-keygen` completes the fallback workflow. Black-box tests cover
+approval replay, expiry, a different browser cookie, a changed secret, a
+revoked key, a suspended account, restart, and concurrent approval. Fallback
+tests cover an unknown key, an invalid signature, retry with the same challenge,
+challenge download bytes, upload, paste, replay, and expiry. Both workflows
+create the same session type and operate without JavaScript. Do not start M7.1
+before this gate passes.
+
+Gate evidence: `./scripts/check-m3-2` passes with stock OpenSSH and
+`ssh-keygen` on 2026-07-24. The production-process test covers SSH approval,
+fallback download, upload, paste, retry, session creation, and secret
+redaction. Session tests cover approval restart, expiry, replay, changed
+secrets, browser binding, revoked keys, suspended accounts, unknown signing
+keys, and concurrent completion.
 
 #### Milestone 7 — adversarial review remediation
 

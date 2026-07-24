@@ -8,6 +8,7 @@ use thiserror::Error;
 use url::Url;
 
 const CHALLENGE_HEADER: &str = "tit-auth-v1";
+const KEYLESS_CHALLENGE_HEADER: &str = "tit-auth-v2";
 const CHALLENGE_PURPOSE: &str = "web-login";
 const SIGNATURE_NAMESPACE: &str = "tit-auth";
 const MAX_KEY_BYTES: usize = 16 * 1024;
@@ -31,7 +32,11 @@ impl SshPublicKey {
             return Err(AuthError::InputTooLarge("SSH public key"));
         }
 
-        let mut key = PublicKey::from_openssh(input).map_err(AuthError::PublicKey)?;
+        let key = PublicKey::from_openssh(input).map_err(AuthError::PublicKey)?;
+        Self::from_public_key(key)
+    }
+
+    fn from_public_key(mut key: PublicKey) -> Result<Self, AuthError> {
         validate_key_algorithm(&key)?;
         key.set_comment("");
         let canonical = key.to_openssh().map_err(AuthError::PublicKey)?;
@@ -54,6 +59,62 @@ impl SshPublicKey {
     pub(crate) fn public_key(&self) -> &PublicKey {
         &self.key
     }
+}
+
+pub(crate) fn format_keyless_login_challenge(
+    origin: &str,
+    username: &str,
+    nonce: &[u8; NONCE_BYTES],
+    issued_at: u64,
+    expires_at: u64,
+) -> String {
+    format!(
+        "{KEYLESS_CHALLENGE_HEADER}\npurpose={CHALLENGE_PURPOSE}\norigin={origin}\nusername={username}\nnonce={}\nissued-at={issued_at}\nexpires-at={expires_at}\n",
+        encode_hex(nonce)
+    )
+}
+
+pub(crate) fn verify_keyless_login_challenge(
+    origin: &str,
+    challenge: &str,
+    signature: &str,
+    expected_username: &str,
+    now: u64,
+) -> Result<PersistentVerifiedLogin, AuthError> {
+    if challenge.len() > MAX_CHALLENGE_BYTES {
+        return Err(AuthError::InputTooLarge("login challenge"));
+    }
+    if signature.len() > MAX_SIGNATURE_BYTES {
+        return Err(AuthError::InputTooLarge("SSHSIG envelope"));
+    }
+    validate_username(expected_username)?;
+    let fields = KeylessChallengeFields::parse(challenge)?;
+    if fields.origin != origin {
+        return Err(AuthError::WrongOrigin);
+    }
+    if fields.username != expected_username {
+        return Err(AuthError::WrongUsername);
+    }
+    if fields.expires_at <= fields.issued_at
+        || fields.expires_at - fields.issued_at > MAX_CHALLENGE_LIFETIME_SECONDS
+    {
+        return Err(AuthError::InvalidLifetime);
+    }
+    if now < fields.issued_at || now > fields.expires_at {
+        return Err(AuthError::ExpiredChallenge);
+    }
+    let sshsig = SshSig::from_pem(signature).map_err(AuthError::SignatureEnvelope)?;
+    let key = SshPublicKey::from_public_key(PublicKey::new(sshsig.public_key().clone(), ""))?;
+    validate_signature_algorithm(key.public_key(), &sshsig)?;
+    key.public_key()
+        .verify(SIGNATURE_NAMESPACE, challenge.as_bytes(), &sshsig)
+        .map_err(AuthError::SignatureVerification)?;
+    Ok(PersistentVerifiedLogin {
+        username: fields.username.to_owned(),
+        fingerprint: key.fingerprint().to_owned(),
+        nonce_hash: hash_nonce(&fields.nonce),
+        expires_at: fields.expires_at,
+    })
 }
 
 #[derive(Debug)]
@@ -284,6 +345,44 @@ struct ChallengeFields<'a> {
     nonce: [u8; NONCE_BYTES],
     issued_at: u64,
     expires_at: u64,
+}
+
+struct KeylessChallengeFields<'a> {
+    origin: &'a str,
+    username: &'a str,
+    nonce: [u8; NONCE_BYTES],
+    issued_at: u64,
+    expires_at: u64,
+}
+
+impl<'a> KeylessChallengeFields<'a> {
+    fn parse(challenge: &'a str) -> Result<Self, AuthError> {
+        let body = challenge
+            .strip_suffix('\n')
+            .ok_or(AuthError::MalformedChallenge)?;
+        let mut lines = body.split('\n');
+        if lines.next() != Some(KEYLESS_CHALLENGE_HEADER)
+            || lines.next() != Some("purpose=web-login")
+        {
+            return Err(AuthError::MalformedChallenge);
+        }
+        let origin = field(lines.next(), "origin=")?;
+        let username = field(lines.next(), "username=")?;
+        validate_username(username)?;
+        let nonce = decode_hex(field(lines.next(), "nonce=")?)?;
+        let issued_at = parse_time(field(lines.next(), "issued-at=")?)?;
+        let expires_at = parse_time(field(lines.next(), "expires-at=")?)?;
+        if lines.next().is_some() || origin.is_empty() || origin.contains(['\r', '\n']) {
+            return Err(AuthError::MalformedChallenge);
+        }
+        Ok(Self {
+            origin,
+            username,
+            nonce,
+            issued_at,
+            expires_at,
+        })
+    }
 }
 
 impl<'a> ChallengeFields<'a> {

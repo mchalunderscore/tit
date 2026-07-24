@@ -2,26 +2,22 @@
 {% block title %}Sign login challenge · tit{% endblock %}
 {% block content %}
   <h1>Sign the login challenge</h1>
-  <p>Save the exact challenge text to a file. Sign it with <code>ssh-keygen -Y sign -n tit-auth -f KEY_FILE CHALLENGE_FILE</code>. Paste the complete SSH signature below.</p>
+  <p>Download the challenge. Sign it with <code>ssh-keygen -Y sign -n tit-auth -f KEY_FILE tit-login-challenge.txt</code>.</p>
+{% if has_error %}
+  <p class="error" role="alert">{{ error }}</p>
+{% endif %}
+  <form action="/login/challenge.txt" method="post">
+    <input type="hidden" name="username" value="{{ username }}">
+    <input type="hidden" name="challenge" value="{{ challenge }}">
+    <input type="hidden" name="login-csrf" value="{{ login_csrf }}">
+    <button type="submit">Download challenge</button>
+  </form>
   <div class="field">
     <label for="challenge-display">Challenge</label>
     <textarea id="challenge-display" readonly rows="10">{{ challenge }}</textarea>
   </div>
-  <form action="/login/verify" method="post">
-    <input type="hidden" name="username" value="{{ username }}">
-    <input type="hidden" name="public-key" value="{{ public_key }}">
-    <input type="hidden" name="challenge" value="{{ challenge }}">
-    <input type="hidden" name="login-csrf" value="{{ login_csrf }}">
-    <div class="field">
-      <label for="signature">SSH signature</label>
-      <textarea id="signature" name="signature" required rows="10" autocomplete="off" autocapitalize="none" spellcheck="false"></textarea>
-    </div>
-    <button type="submit">Log in</button>
-  </form>
-  <h2>Upload a signature</h2>
   <form action="/login/verify-file" method="post" enctype="multipart/form-data">
     <input type="hidden" name="username" value="{{ username }}">
-    <input type="hidden" name="public-key" value="{{ public_key }}">
     <input type="hidden" name="challenge" value="{{ challenge }}">
     <input type="hidden" name="login-csrf" value="{{ login_csrf }}">
     <div class="field">
@@ -30,4 +26,17 @@
     </div>
     <button type="submit">Upload and log in</button>
   </form>
+  <details>
+    <summary>Paste the signature instead</summary>
+    <form action="/login/verify" method="post">
+      <input type="hidden" name="username" value="{{ username }}">
+      <input type="hidden" name="challenge" value="{{ challenge }}">
+      <input type="hidden" name="login-csrf" value="{{ login_csrf }}">
+      <div class="field">
+        <label for="signature">SSH signature</label>
+        <textarea id="signature" name="signature" required rows="10" autocomplete="off" autocapitalize="none" spellcheck="false"></textarea>
+      </div>
+      <button type="submit">Log in</button>
+    </form>
+  </details>
 {% endblock %}

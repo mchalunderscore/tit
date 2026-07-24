@@ -14,7 +14,7 @@ mod event;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
 const MAX_ACTIVE_FEED_TOKENS: i64 = 32;
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -24,7 +24,7 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 17] = [
+const MIGRATIONS: [&str; 18] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
@@ -42,6 +42,7 @@ const MIGRATIONS: [&str; 17] = [
     include_str!("migrations/015_pull_requests.sql"),
     include_str!("migrations/016_pull_request_reviews.sql"),
     include_str!("migrations/017_pull_request_merges.sql"),
+    include_str!("migrations/018_streamlined_login.sql"),
 ];
 
 #[allow(
@@ -96,6 +97,10 @@ pub(crate) enum StoreError {
     LoginNonceLimit,
     #[error("login challenge is invalid, expired, or already used")]
     InvalidLoginChallenge,
+    #[error("SSH login approval is invalid, expired, or already used")]
+    InvalidLoginApproval,
+    #[error("SSH login approval is waiting for SSH authentication")]
+    LoginApprovalPending,
     #[error("Web session is invalid or expired")]
     InvalidSession,
     #[error("repository does not exist: {0}/{1}")]
@@ -951,16 +956,12 @@ impl Store {
         if active >= 1_024 {
             return Err(StoreError::LoginNonceLimit);
         }
-        let key = transaction
+        let account_id = transaction
             .query_row(
-                "SELECT account.id, ssh_public_key.id
-                 FROM account
-                 JOIN ssh_public_key ON ssh_public_key.account_id = account.id
-                 WHERE account.username = ?1 AND account.state = 'active'
-                   AND ssh_public_key.fingerprint = ?2
-                   AND ssh_public_key.revoked_at IS NULL",
-                rusqlite::params![nonce.username, nonce.fingerprint],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                "SELECT id FROM account
+                 WHERE username = ?1 AND state = 'active'",
+                [nonce.username],
+                |row| row.get::<_, i64>(0),
             )
             .optional()?
             .ok_or(StoreError::LoginIdentity)?;
@@ -968,12 +969,11 @@ impl Store {
             "INSERT INTO login_nonce
              (nonce_hash, csrf_hash, account_id, ssh_public_key_id,
               created_at, expires_at, consumed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, NULL)",
             rusqlite::params![
                 nonce.nonce_hash,
                 nonce.csrf_hash,
-                key.0,
-                key.1,
+                account_id,
                 nonce.created_at,
                 nonce.expires_at,
             ],
@@ -998,11 +998,13 @@ impl Store {
                 "SELECT login_nonce.account_id
                  FROM login_nonce
                  JOIN account ON account.id = login_nonce.account_id
-                 JOIN ssh_public_key ON ssh_public_key.id = login_nonce.ssh_public_key_id
+                 JOIN ssh_public_key ON ssh_public_key.account_id = login_nonce.account_id
                  WHERE login_nonce.nonce_hash = ?1
                    AND login_nonce.consumed_at IS NULL AND login_nonce.expires_at >= ?2
                    AND account.username = ?3 AND account.state = 'active'
                    AND ssh_public_key.fingerprint = ?4 AND ssh_public_key.revoked_at IS NULL
+                   AND (login_nonce.ssh_public_key_id IS NULL
+                        OR login_nonce.ssh_public_key_id = ssh_public_key.id)
                    AND login_nonce.csrf_hash = ?5",
                 rusqlite::params![
                     login.nonce_hash,
@@ -1048,6 +1050,146 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn create_login_approval(
+        &mut self,
+        approval: &NewLoginApproval<'_>,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM ssh_login_approval
+             WHERE expires_at < ?1 OR consumed_at IS NOT NULL",
+            [approval.created_at],
+        )?;
+        let active: i64 =
+            transaction.query_row("SELECT count(*) FROM ssh_login_approval", [], |row| {
+                row.get(0)
+            })?;
+        if active >= 1_024 {
+            return Err(StoreError::LoginNonceLimit);
+        }
+        transaction.execute(
+            "INSERT INTO ssh_login_approval
+             (secret_hash, csrf_hash, account_id, ssh_public_key_id,
+              created_at, expires_at, approved_at, consumed_at)
+             VALUES (?1, ?2, NULL, NULL, ?3, ?4, NULL, NULL)",
+            rusqlite::params![
+                approval.secret_hash,
+                approval.csrf_hash,
+                approval.created_at,
+                approval.expires_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn approve_login(&mut self, approval: &ApproveLogin<'_>) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (account_id, key_id) = transaction
+            .query_row(
+                "SELECT account.id, ssh_public_key.id
+                 FROM account
+                 JOIN ssh_public_key ON ssh_public_key.account_id = account.id
+                 WHERE account.username = ?1 AND account.state = 'active'
+                   AND ssh_public_key.fingerprint = ?2
+                   AND ssh_public_key.revoked_at IS NULL",
+                rusqlite::params![approval.username, approval.fingerprint],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::LoginIdentity)?;
+        let changed = transaction.execute(
+            "UPDATE ssh_login_approval
+             SET account_id = ?2, ssh_public_key_id = ?3, approved_at = ?4
+             WHERE secret_hash = ?1 AND account_id IS NULL
+               AND approved_at IS NULL AND consumed_at IS NULL AND expires_at >= ?4",
+            rusqlite::params![
+                approval.secret_hash,
+                account_id,
+                key_id,
+                approval.approved_at,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidLoginApproval);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn consume_login_approval(
+        &mut self,
+        login: &NewApprovedWebSession<'_>,
+    ) -> Result<String, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let approval = transaction
+            .query_row(
+                "SELECT account.id, account.username, ssh_login_approval.approved_at
+                 FROM ssh_login_approval
+                 LEFT JOIN account ON account.id = ssh_login_approval.account_id
+                 LEFT JOIN ssh_public_key
+                   ON ssh_public_key.id = ssh_login_approval.ssh_public_key_id
+                 WHERE ssh_login_approval.secret_hash = ?1
+                   AND ssh_login_approval.csrf_hash = ?2
+                   AND ssh_login_approval.consumed_at IS NULL
+                   AND ssh_login_approval.expires_at >= ?3
+                   AND (ssh_login_approval.account_id IS NULL
+                        OR (account.state = 'active' AND ssh_public_key.revoked_at IS NULL))",
+                rusqlite::params![login.secret_hash, login.login_csrf_hash, login.created_at,],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::InvalidLoginApproval)?;
+        let (Some(account_id), Some(username), Some(_)) = approval else {
+            return Err(StoreError::LoginApprovalPending);
+        };
+        let changed = transaction.execute(
+            "UPDATE ssh_login_approval SET consumed_at = ?2
+             WHERE secret_hash = ?1 AND consumed_at IS NULL",
+            rusqlite::params![login.secret_hash, login.created_at],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidLoginApproval);
+        }
+        transaction.execute(
+            "INSERT INTO web_session
+             (session_hash, csrf_hash, account_id, created_at, expires_at, ended_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+            rusqlite::params![
+                login.session_hash,
+                login.csrf_hash,
+                account_id,
+                login.created_at,
+                login.expires_at,
+            ],
+        )?;
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "login",
+                actor: &username,
+                target: &username,
+                outcome: "success",
+                correlation_id: login.correlation_id,
+                created_at: login.created_at,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(username)
     }
 
     #[allow(
@@ -3356,9 +3498,32 @@ pub(crate) struct NewLoginNonce<'a> {
     pub(crate) nonce_hash: &'a [u8; 32],
     pub(crate) csrf_hash: &'a [u8; 32],
     pub(crate) username: &'a str,
-    pub(crate) fingerprint: &'a str,
     pub(crate) created_at: i64,
     pub(crate) expires_at: i64,
+}
+
+pub(crate) struct NewLoginApproval<'a> {
+    pub(crate) secret_hash: &'a [u8; 32],
+    pub(crate) csrf_hash: &'a [u8; 32],
+    pub(crate) created_at: i64,
+    pub(crate) expires_at: i64,
+}
+
+pub(crate) struct ApproveLogin<'a> {
+    pub(crate) secret_hash: &'a [u8; 32],
+    pub(crate) username: &'a str,
+    pub(crate) fingerprint: &'a str,
+    pub(crate) approved_at: i64,
+}
+
+pub(crate) struct NewApprovedWebSession<'a> {
+    pub(crate) secret_hash: &'a [u8; 32],
+    pub(crate) login_csrf_hash: &'a [u8; 32],
+    pub(crate) session_hash: &'a [u8; 32],
+    pub(crate) csrf_hash: &'a [u8; 32],
+    pub(crate) created_at: i64,
+    pub(crate) expires_at: i64,
+    pub(crate) correlation_id: &'a str,
 }
 
 #[allow(

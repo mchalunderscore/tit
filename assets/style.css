@@ -46,6 +46,15 @@ form {
   max-width: 32rem;
 }
 
+details {
+  margin-block: 1.5rem;
+}
+
+summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
 .repository-header nav,
 .repository-header h1 {
   margin-block: 0.5rem;

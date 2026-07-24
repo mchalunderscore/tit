@@ -7,7 +7,10 @@ use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use auth::{AuthError, LoginChallenges, SshPublicKey};
+use auth::{
+    AuthError, LoginChallenges, SshPublicKey, format_keyless_login_challenge,
+    verify_keyless_login_challenge,
+};
 use tempfile::TempDir;
 use url::Url;
 
@@ -97,6 +100,33 @@ fn verifies_stock_sshsig_envelopes_for_each_supported_key() {
         assert_eq!(verified.username, "alice");
         assert_eq!(verified.fingerprint, key.fingerprint());
     }
+}
+
+#[test]
+fn derives_the_key_from_a_keyless_stock_sshsig_envelope() {
+    let directory = TempDir::new().expect("create a key directory");
+    let private_key = directory.path().join("keyless");
+    generate_key(&private_key, KeyFixture::Ed25519);
+    let key = parse_public_key(&private_key).expect("parse the public key");
+    let nonce = [7_u8; 32];
+    let challenge = format_keyless_login_challenge(
+        "https://tit.example",
+        "alice",
+        &nonce,
+        ISSUED_AT,
+        ISSUED_AT + LIFETIME,
+    );
+    let signature = sign(&directory, "keyless", &private_key, "tit-auth", &challenge);
+
+    let verified = verify_keyless_login_challenge(
+        "https://tit.example",
+        &challenge,
+        &signature,
+        "alice",
+        ISSUED_AT + 1,
+    )
+    .expect("verify a keyless challenge");
+    assert_eq!(verified.fingerprint, key.fingerprint());
 }
 
 #[test]

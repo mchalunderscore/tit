@@ -348,9 +348,11 @@ Install stock OpenSSH. Then, run the Web login gate:
 ./scripts/check-m3-2
 ```
 
-Open `/login`, create a challenge, and sign its exact content with the
-`tit-auth` SSHSIG namespace. The Web UI accepts the pasted SSHSIG envelope and
-creates an opaque session. Read the
+Open `/login` and select **Log in with SSH**. Run the exact command, check the
+origin and account in its output, and continue in the browser. If the SSH
+service is not available, create a fallback challenge and sign its exact
+content with the `tit-auth` SSHSIG namespace. The Web UI accepts the signature
+file and creates an opaque session. Read the
 [Web login architectural decision record](docs/adr/0011-web-login-sessions.md)
 for the session and CSRF behavior.
 

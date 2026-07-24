@@ -102,6 +102,7 @@ async fn reports_available_commands_and_explains_invalid_commands() {
     );
     let help_text = String::from_utf8(help.stdout).expect("read the help output");
     assert!(help_text.contains("Available tit SSH commands:"));
+    assert!(help_text.contains("login ONE-TIME-SECRET"));
     assert!(help_text.contains("repo create NAME"));
     assert!(!help_text.contains("object-format"));
     assert!(help_text.contains("issue list OWNER/REPOSITORY"));
