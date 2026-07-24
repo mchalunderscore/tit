@@ -21,6 +21,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::auth::validate_username;
+use crate::codec::encode_lower_hex;
 use crate::domain::repository::validate_slug;
 use crate::feed::{FeedPage, PAGE_SIZE, RepositoryFeedKind};
 use crate::git::packetline::MAX_REQUEST_BYTES;
@@ -476,7 +477,7 @@ async fn summary(
                         let (entries, truncated) =
                             service.tree_prefix(head, &[], MAX_SUMMARY_FILES, &cancellation)?;
                         (
-                            service.history(head, &cancellation)?,
+                            service.history_prefix(head, MAX_SUMMARY_COMMITS, &cancellation)?,
                             service.readme(head, &cancellation)?,
                             entries,
                             truncated,
@@ -1066,7 +1067,7 @@ pub(super) fn conditional_feed(
     is_public: bool,
 ) -> Response {
     let digest = Sha256::digest(body.as_bytes());
-    let etag = format!("\"{}\"", encode_hex(&digest));
+    let etag = format!("\"{}\"", encode_lower_hex(&digest));
     let modified = u64::try_from(timestamp)
         .ok()
         .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
@@ -1113,15 +1114,6 @@ fn etag_matches(value: &str, etag: &str) -> bool {
         let candidate = candidate.trim();
         candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
     })
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
-        output.push(char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 fn route_error(error: RouteError, request_id: &str) -> Response {
@@ -1535,12 +1527,7 @@ impl RepositoryPage {
             .to_owned();
         page.has_head = summary.head.is_some();
         page.commit_id = summary.head.map(|id| id.to_string()).unwrap_or_default();
-        page.history = summary
-            .history
-            .into_iter()
-            .take(MAX_SUMMARY_COMMITS)
-            .map(CommitView::from)
-            .collect();
+        page.history = summary.history.into_iter().map(CommitView::from).collect();
         page.tags = summary
             .tags
             .into_iter()

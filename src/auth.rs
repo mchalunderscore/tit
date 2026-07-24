@@ -5,6 +5,8 @@ use rand::TryRng;
 use sha2::{Digest, Sha256};
 use ssh_key::{Algorithm, EcdsaCurve, HashAlg, PublicKey, SshSig};
 use thiserror::Error;
+
+use crate::codec::{decode_lower_hex, encode_lower_hex};
 use url::Url;
 
 const CHALLENGE_HEADER: &str = "tit-auth-v1";
@@ -70,7 +72,7 @@ pub(crate) fn format_keyless_login_challenge(
 ) -> String {
     format!(
         "{KEYLESS_CHALLENGE_HEADER}\npurpose={CHALLENGE_PURPOSE}\norigin={origin}\nusername={username}\nnonce={}\nissued-at={issued_at}\nexpires-at={expires_at}\n",
-        encode_hex(nonce)
+        encode_lower_hex(nonce)
     )
 }
 
@@ -232,7 +234,7 @@ pub(crate) fn format_login_challenge(
     format!(
         "{CHALLENGE_HEADER}\npurpose={CHALLENGE_PURPOSE}\norigin={origin}\nusername={username}\nfingerprint={}\nnonce={}\nissued-at={issued_at}\nexpires-at={expires_at}\n",
         key.fingerprint(),
-        encode_hex(nonce)
+        encode_lower_hex(nonce)
     )
 }
 
@@ -489,31 +491,10 @@ fn hash_nonce(nonce: &[u8; NONCE_BYTES]) -> [u8; 32] {
     Sha256::digest(nonce).into()
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
-
 fn decode_hex(value: &str) -> Result<[u8; NONCE_BYTES], AuthError> {
-    if value.len() != NONCE_BYTES * 2 {
-        return Err(AuthError::MalformedChallenge);
-    }
-    let mut bytes = [0_u8; NONCE_BYTES];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        bytes[index] = (decode_hex_digit(pair[0])? << 4) | decode_hex_digit(pair[1])?;
-    }
-    Ok(bytes)
-}
-
-fn decode_hex_digit(value: u8) -> Result<u8, AuthError> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        _ => Err(AuthError::MalformedChallenge),
-    }
+    let decoded = decode_lower_hex(value.as_bytes()).ok_or(AuthError::MalformedChallenge)?;
+    let decoded: [u8; NONCE_BYTES] = decoded
+        .try_into()
+        .map_err(|_| AuthError::MalformedChallenge)?;
+    Ok(decoded)
 }

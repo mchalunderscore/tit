@@ -1,5 +1,4 @@
-#[path = "../src/auth.rs"]
-mod auth;
+use crate::auth;
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -71,6 +71,7 @@ impl Telemetry {
             status: Some(status),
             duration_ms: Some(duration.as_millis().min(u128::from(u64::MAX)) as u64),
             outcome: None,
+            error: None,
         });
     }
 
@@ -114,6 +115,22 @@ impl Telemetry {
             status: None,
             duration_ms: None,
             outcome: Some(outcome),
+            error: None,
+        });
+    }
+
+    pub(crate) fn failure(&self, event: &'static str, operation_id: Option<&str>, error: &str) {
+        self.write_event(&Event {
+            timestamp_ms: timestamp_ms(),
+            level: "error",
+            event,
+            request_id: None,
+            operation_id,
+            method: None,
+            status: None,
+            duration_ms: None,
+            outcome: Some("failure"),
+            error: Some(error),
         });
     }
 
@@ -147,6 +164,7 @@ impl Telemetry {
             status: None,
             duration_ms: None,
             outcome: Some(outcome),
+            error: None,
         });
     }
 
@@ -187,6 +205,8 @@ struct Event<'a> {
     duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     outcome: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
 }
 
 #[cfg(test)]

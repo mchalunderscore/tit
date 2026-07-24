@@ -1,9 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::hash::Kind;
-use rand::TryRng;
 use thiserror::Error;
 
 use crate::auth::{AuthError, validate_username};
@@ -11,9 +9,10 @@ use crate::domain::repository::{RepositoryNameError, validate_slug};
 use crate::git::repository::{GitRepository, GitRepositoryError};
 use crate::maintenance::MaintenanceGate;
 use crate::store::{
-    HomeRepositoryRecord, NewAuditEvent, NewRepository, RepositoryOrigin, RepositoryRecord,
-    RepositorySettings, Store, StoreError,
+    HomeRepositoryRecord, NewAuditEvent, NewDefaultBranchIntent, NewRepository, RepositoryOrigin,
+    RepositoryRecord, RepositorySettings, Store, StoreError,
 };
+use crate::system::{random_lower_hex, unix_timestamp};
 
 const HOME_REPOSITORY_LIMIT: usize = 20;
 pub(crate) const MAX_DESCRIPTION_BYTES: usize = 512;
@@ -104,23 +103,49 @@ impl RepositoryService {
         validate_slug(repository)?;
         validate_username(actor)?;
         let _maintenance = self.maintenance.mutation();
+        let changed_at = timestamp()?;
+        let intent_id = random_id()?;
         let mut store = Store::open(&self.database)?;
         let settings = store.repository_settings(owner, repository, actor)?;
         let git = GitRepository::open(&self.root.join(format!("{}.git", settings.repository.id)))?;
         let previous = settings.default_branch;
-        git.set_default_branch(default_branch)?;
-        let result = store.update_repository_default_branch(
-            owner,
-            repository,
-            actor,
-            default_branch,
-            timestamp()?,
-            &random_id()?,
-        );
-        if result.is_err() {
-            let _ = git.set_default_branch(&previous);
+        git.resolve_branch(default_branch)?;
+        if git.default_branch()?.as_deref() != Some(previous.as_str()) {
+            return Err(RepositoryServiceError::DefaultBranchState);
         }
-        result?;
+        store.begin_repository_default_branch(&NewDefaultBranchIntent {
+            id: &intent_id,
+            owner,
+            slug: repository,
+            actor,
+            previous_branch: &previous,
+            default_branch,
+            changed_at,
+        })?;
+        if let Err(error) = git.set_default_branch(default_branch) {
+            store.abandon_repository_default_branch(&intent_id)?;
+            return Err(error.into());
+        }
+        store.complete_repository_default_branch(&intent_id)?;
+        Ok(())
+    }
+
+    pub(crate) fn recover(&self) -> Result<(), RepositoryServiceError> {
+        let _maintenance = self.maintenance.mutation();
+        let mut store = Store::open(&self.database)?;
+        for intent in store.incomplete_repository_default_branches()? {
+            let git =
+                GitRepository::open(&self.root.join(format!("{}.git", intent.repository_id)))?;
+            match git.default_branch()?.as_deref() {
+                Some(current) if current == intent.previous_branch => {
+                    store.abandon_repository_default_branch(&intent.id)?;
+                }
+                Some(current) if current == intent.proposed_branch => {
+                    store.complete_repository_default_branch(&intent.id)?;
+                }
+                _ => return Err(RepositoryServiceError::DefaultBranchState),
+            }
+        }
         Ok(())
     }
 
@@ -356,20 +381,11 @@ impl RepositoryService {
 }
 
 fn random_id() -> Result<String, RepositoryServiceError> {
-    let mut bytes = [0_u8; 16];
-    rand::rngs::SysRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|_| RepositoryServiceError::Random)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    random_lower_hex::<16>().ok_or(RepositoryServiceError::Random)
 }
 
 fn timestamp() -> Result<i64, RepositoryServiceError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| RepositoryServiceError::Clock)?
-        .as_secs()
-        .try_into()
-        .map_err(|_| RepositoryServiceError::Clock)
+    unix_timestamp().ok_or(RepositoryServiceError::Clock)
 }
 
 fn validate_description(description: &str) -> Result<(), RepositoryServiceError> {
@@ -434,4 +450,6 @@ pub(crate) enum RepositoryServiceError {
     Clock,
     #[error("repository object format is not supported")]
     UnsupportedObjectFormat,
+    #[error("repository default-branch state is not consistent")]
+    DefaultBranchState,
 }

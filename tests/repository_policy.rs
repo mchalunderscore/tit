@@ -1,11 +1,14 @@
-#[path = "../src/policy.rs"]
-mod policy;
-#[allow(dead_code, reason = "the policy test uses only repository storage")]
-#[path = "../src/store/mod.rs"]
-mod store;
+use crate::git::repository::GitRepository;
+use crate::repository::RepositoryService;
+use crate::{policy, store};
 
+use std::fs;
+
+use gix::hash::Kind;
 use policy::{PolicyError, RefChange, RepositoryOperation, RepositoryPolicy};
-use store::{AuditContext, NewRepository, RepositoryOrigin, Store, StoreError};
+use store::{
+    AuditContext, NewDefaultBranchIntent, NewRepository, RepositoryOrigin, Store, StoreError,
+};
 use tempfile::TempDir;
 
 #[test]
@@ -252,15 +255,19 @@ fn applies_common_protected_ref_and_merge_rules() {
         )
         .expect("allow a writer topic branch");
     store
-        .update_repository_default_branch(
-            "owner",
-            "project",
-            "maintainer",
-            "refs/heads/trunk",
-            4,
-            "default-branch",
-        )
-        .expect("change the protected default branch");
+        .begin_repository_default_branch(&NewDefaultBranchIntent {
+            id: "00000000000000000000000000000004",
+            owner: "owner",
+            slug: "project",
+            actor: "maintainer",
+            previous_branch: "refs/heads/main",
+            default_branch: "refs/heads/trunk",
+            changed_at: 4,
+        })
+        .expect("begin the protected default-branch change");
+    store
+        .complete_repository_default_branch("00000000000000000000000000000004")
+        .expect("complete the protected default-branch change");
     policy
         .authorize_ref_change(
             "writer",
@@ -303,6 +310,72 @@ fn applies_common_protected_ref_and_merge_rules() {
         policy.authorize_merge("writer", "owner", "project"),
         Err(PolicyError::Denied)
     ));
+}
+
+#[test]
+fn recovers_a_default_branch_change_after_git_moves_first() {
+    let directory = TempDir::new().expect("create a recovery fixture directory");
+    let database = directory.path().join("tit.sqlite3");
+    let repositories = directory.path().join("repositories");
+    let repository_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let bare = repositories.join(format!("{repository_id}.git"));
+    fs::create_dir(&repositories).expect("create the repository directory");
+    let mut store = Store::open(&database).expect("create the recovery database");
+    store
+        .connection()
+        .execute(
+            "INSERT INTO account (id, username, is_administrator, state, created_at)
+             VALUES (1, 'owner', 0, 'active', 1)",
+            [],
+        )
+        .expect("create the repository owner");
+    store
+        .create_repository(&NewRepository {
+            id: repository_id,
+            owner: "owner",
+            slug: "project",
+            object_format: "sha1",
+            default_branch: "refs/heads/main",
+            created_at: 2,
+            origin: RepositoryOrigin::Created,
+            initial_references: &[],
+            actor: "admin-cli",
+            correlation_id: "test",
+        })
+        .expect("create the repository record");
+    GitRepository::create_bare(&bare, Kind::Sha1).expect("create the bare repository");
+    store
+        .begin_repository_default_branch(&NewDefaultBranchIntent {
+            id: "00000000000000000000000000000005",
+            owner: "owner",
+            slug: "project",
+            actor: "owner",
+            previous_branch: "refs/heads/main",
+            default_branch: "refs/heads/trunk",
+            changed_at: 3,
+        })
+        .expect("begin the default-branch change");
+    fs::write(bare.join("HEAD"), b"ref: refs/heads/trunk\n")
+        .expect("simulate the completed Git change");
+    drop(store);
+
+    RepositoryService::new(&database, &repositories)
+        .recover()
+        .expect("recover the default-branch change");
+
+    let store = Store::open(&database).expect("reopen the recovery database");
+    assert_eq!(
+        store
+            .repository_default_branch("owner", "project")
+            .expect("read the recovered default branch"),
+        "refs/heads/trunk"
+    );
+    assert!(
+        store
+            .incomplete_repository_default_branches()
+            .expect("read default-branch intents")
+            .is_empty()
+    );
 }
 
 fn operations() -> [RepositoryOperation; 4] {

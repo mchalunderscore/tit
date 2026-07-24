@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use crate::auth::SshPublicKey;
 use crate::git::packetline::{MAX_REQUEST_BYTES, Packet, decode, encode_data, first_flush_end};
 use crate::git::receive_pack::{ReceivePack, ReceivePackError};
-use crate::git::transport::{GitRepositories, GitSshService};
+use crate::git::transport::{GitRepositories, GitSshService, RepositoryPathError};
 use crate::git::upload_pack::{ProtocolVersion, UploadPack, UploadPackError};
 use crate::issue::{IssueError, IssueService, MAX_BODY_BYTES, MAX_TITLE_BYTES};
 use crate::policy::RepositoryOperation;
@@ -890,7 +890,17 @@ impl Handler for SshSession {
                 )?,
             }
         } else {
-            let service = self.open_git_service(command).await;
+            let service = match self.open_git_service(command).await {
+                Ok(service) => service,
+                Err(error) => {
+                    self.audit.rejected_exec.fetch_add(1, Ordering::Relaxed);
+                    self.telemetry
+                        .failure("ssh.git", Some(&operation_id), &error.to_string());
+                    session.channel_success(channel)?;
+                    fail_git_channel(channel, session)?;
+                    return Ok(());
+                }
+            };
             if let Some(service) = service {
                 self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
                 session.channel_success(channel)?;
@@ -959,7 +969,7 @@ impl Handler for SshSession {
                     }
                 }
             } else {
-                self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
+                self.audit.rejected_exec.fetch_add(1, Ordering::Relaxed);
                 session.channel_success(channel)?;
                 if requests_json(command) {
                     session.data(
@@ -2470,23 +2480,44 @@ impl SshSession {
         }
     }
 
-    async fn open_git_service(&mut self, command: &[u8]) -> Option<InitialGitService> {
+    async fn open_git_service(
+        &mut self,
+        command: &[u8],
+    ) -> Result<Option<InitialGitService>, GitServiceOpenError> {
         let active_channels = self
             .exec_channels
             .values()
             .filter(|channel| matches!(channel, ExecChannel::Upload(_) | ExecChannel::Receive(_)))
             .count();
-        let global_permit = reserve_git_channel(active_channels, &self.git_channels)?;
-        let repositories = self.repositories.as_ref()?;
-        let identity = self.active_identity()?;
-        let service = repositories
-            .resolve_ssh_service_for(Some(&identity.username), command)
-            .ok()?;
+        let Some(global_permit) = reserve_git_channel(active_channels, &self.git_channels) else {
+            return Ok(None);
+        };
+        let Some(repositories) = self.repositories.as_ref() else {
+            return Ok(None);
+        };
+        let Some(identity) = self.active_identity() else {
+            return Ok(None);
+        };
+        let service = match repositories.resolve_ssh_service_for(Some(&identity.username), command)
+        {
+            Ok(service) => service,
+            Err(
+                RepositoryPathError::InvalidName
+                | RepositoryPathError::InvalidCommand
+                | RepositoryPathError::Unauthorized,
+            ) => return Ok(None),
+            Err(RepositoryPathError::Repository { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
         match service {
             GitSshService::Upload { path, .. } => {
-                let permit = repositories.blocking_permit().await.ok()?;
+                let permit = repositories.blocking_permit().await?;
                 let protocol = self.protocol;
-                tokio::task::spawn_blocking(move || {
+                let service = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     let service = UploadPack::open(&path)?;
                     let advertisement = service.advertisement(protocol, false)?;
@@ -2496,9 +2527,8 @@ impl SshSession {
                         global_permit,
                     })
                 })
-                .await
-                .ok()?
-                .ok()
+                .await??;
+                Ok(Some(service))
             }
             GitSshService::Receive {
                 path,
@@ -2506,14 +2536,19 @@ impl SshSession {
                 repository,
             } => {
                 if !repositories.uses_policy() && !self.authenticated_writer {
-                    return None;
+                    return Ok(None);
                 }
-                let database = repositories.push_database()?.to_owned();
+                let database = repositories
+                    .push_database()
+                    .ok_or(GitServiceOpenError::PushDatabase)?
+                    .to_owned();
                 let actor = identity.username.clone();
-                let public_key = self.authenticated_key.clone()?;
+                let Some(public_key) = self.authenticated_key.clone() else {
+                    return Ok(None);
+                };
                 let uses_policy = repositories.uses_policy();
-                let permit = repositories.blocking_permit().await.ok()?;
-                tokio::task::spawn_blocking(move || {
+                let permit = repositories.blocking_permit().await?;
+                let service = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     let service = if uses_policy {
                         ReceivePack::open_authorized(
@@ -2539,9 +2574,8 @@ impl SshSession {
                         },
                     )))
                 })
-                .await
-                .ok()?
-                .ok()
+                .await??;
+                Ok(Some(service))
             }
         }
     }
@@ -2552,6 +2586,22 @@ impl SshSession {
         let current = self.authorized_keys.identity(public_key)?;
         (current == *authenticated).then_some(current)
     }
+}
+
+#[derive(Debug, Error)]
+enum GitServiceOpenError {
+    #[error(transparent)]
+    Repository(#[from] RepositoryPathError),
+    #[error(transparent)]
+    Upload(#[from] UploadPackError),
+    #[error(transparent)]
+    Receive(#[from] ReceivePackError),
+    #[error("the Git worker stopped")]
+    Join(#[from] tokio::task::JoinError),
+    #[error("the Git work queue is closed")]
+    WorkQueue(#[from] tokio::sync::AcquireError),
+    #[error("the push database is unavailable")]
+    PushDatabase,
 }
 
 enum InitialGitService {

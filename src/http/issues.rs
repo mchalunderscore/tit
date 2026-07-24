@@ -62,6 +62,9 @@ async fn issue_list(
     let authenticated = actor.0.is_some();
     let state_filter = query.state.unwrap_or_else(|| "open".to_owned());
     let page_number = query.page.unwrap_or(1);
+    if page_number == 0 {
+        return issue_bad_request(&request_id.0);
+    }
     let state_for_job = state_filter.clone();
     let result = issue_job(state, move || {
         service.list_page(
@@ -132,6 +135,9 @@ async fn issue_detail(
     let number = path.number;
     let comments_page = query.comments_page.unwrap_or(1);
     let timeline_page = query.timeline_page.unwrap_or(1);
+    if comments_page == 0 || timeline_page == 0 {
+        return issue_bad_request(&request_id.0);
+    }
     let result = issue_job(state, move || {
         service.get_page(
             &owner,

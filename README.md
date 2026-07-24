@@ -266,12 +266,13 @@ cargo build --locked --release
 The ignored workload tests are explicit performance checks:
 
 ```text
-cargo test --locked --release --test git_reads \
-  measures_bounded_search_without_an_index -- --ignored --nocapture
-cargo test --locked --release --test metadata_search \
-  measures_bounded_repository_name_search_without_an_index \
+cargo test --locked --release --lib \
+  git_reads_tests::measures_bounded_search_without_an_index \
   -- --ignored --nocapture
-cargo test --locked --release --test sqlite_workload \
+cargo test --locked --release --lib \
+  metadata_search_tests::measures_bounded_repository_name_search_without_an_index \
+  -- --ignored --nocapture
+cargo test --locked --release --lib sqlite_workload_tests:: \
   -- --ignored --nocapture
 ```
 

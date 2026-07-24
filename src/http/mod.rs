@@ -1946,10 +1946,14 @@ async fn rejected_login(
 ) -> Response {
     let username_for_audit = username.to_owned();
     let correlation_id = request_id.to_owned();
-    let _ = login_job(state, move |login| {
+    let telemetry = state.telemetry.clone();
+    if let Err(error) = login_job(state, move |login| {
         login.record_login_failure(&username_for_audit, &correlation_id)
     })
-    .await;
+    .await
+    {
+        telemetry.failure("login.audit", Some(request_id), &error.to_string());
+    }
     login_error(request_id, username, error)
 }
 

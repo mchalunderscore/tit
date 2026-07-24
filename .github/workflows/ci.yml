@@ -34,10 +34,9 @@ jobs:
           persist-credentials: false
       - run: cargo --version
       - run: cargo test --locked --all-targets --all-features
-      - run: cargo test --locked --release --test auth --test ssh --test account_lifecycle --test web_session --test repository_policy
-      - run: cargo test --locked --release --test git_repository --test git_http --test git_ssh --test public_routes
-      - run: cargo test --locked --release --test git_reads measures_bounded_search_without_an_index -- --ignored --nocapture
-      - run: cargo test --locked --release --test sqlite_workload -- --ignored --nocapture
+      - run: cargo test --locked --release --lib
+      - run: cargo test --locked --release --lib git_reads_tests::measures_bounded_search_without_an_index -- --ignored --nocapture
+      - run: cargo test --locked --release --lib sqlite_workload_tests:: -- --ignored --nocapture
       - run: cargo build --locked --release
       - run: wc -c target/release/tit
       - run: ./scripts/package-release target/release/tit dist

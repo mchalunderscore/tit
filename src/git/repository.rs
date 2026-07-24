@@ -12,6 +12,8 @@ use gix_pack::data::Version;
 use gix_pack::data::output::{Count, Entry, bytes::FromEntriesIter};
 use thiserror::Error;
 
+pub(crate) const MAX_REFERENCES: usize = 10_000;
+const MAX_REFERENCE_NAME_BYTES: usize = 4_096;
 const MAX_OBJECTS_PER_PACK: usize = 100_000;
 const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PACK_BYTES: usize = 256 * 1024 * 1024;
@@ -80,6 +82,16 @@ impl GitRepository {
     }
 
     pub(crate) fn references(&self) -> Result<Vec<GitReference>, GitRepositoryError> {
+        self.references_with_limit(MAX_REFERENCES)
+    }
+
+    pub(crate) fn references_with_limit(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<GitReference>, GitRepositoryError> {
+        if maximum == 0 || maximum > MAX_REFERENCES {
+            return Err(GitRepositoryError::ReferenceLimit);
+        }
         let mut references = Vec::new();
         let platform = self
             .repository
@@ -90,12 +102,18 @@ impl GitRepository {
             .map_err(|error| GitRepositoryError::References(error.to_string()))?;
 
         for reference in iterator {
+            if references.len() >= maximum {
+                return Err(GitRepositoryError::ReferenceLimit);
+            }
             let reference =
                 reference.map_err(|error| GitRepositoryError::References(error.to_string()))?;
             let Some(target) = reference.try_id().map(gix::Id::detach) else {
                 continue;
             };
             let name = reference.name().as_bstr().to_vec();
+            if name.len() > MAX_REFERENCE_NAME_BYTES {
+                return Err(GitRepositoryError::ReferenceLimit);
+            }
             let peeled = if name.starts_with(b"refs/tags/") {
                 let mut candidate = reference.clone();
                 let candidate = candidate
@@ -120,6 +138,9 @@ impl GitRepository {
             .head_ref()
             .map_err(|error| GitRepositoryError::References(error.to_string()))?
         {
+            if references.len() >= maximum {
+                return Err(GitRepositoryError::ReferenceLimit);
+            }
             let target = head.id().detach();
             references.insert(
                 0,
@@ -559,6 +580,8 @@ pub(crate) enum GitRepositoryError {
     NotBare(PathBuf),
     #[error("cannot read Git references: {0}")]
     References(String),
+    #[error("Git reference count or name size exceeds the limit")]
+    ReferenceLimit,
     #[error("Git branch name is not valid")]
     InvalidBranch,
     #[error("Git reference name is not valid: {0}")]

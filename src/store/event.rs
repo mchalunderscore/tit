@@ -1,5 +1,6 @@
 use serde_json::json;
 
+use crate::codec::encode_lower_hex;
 pub(super) const PAYLOAD_VERSION: i64 = 1;
 
 #[derive(Clone, Copy)]
@@ -147,7 +148,7 @@ pub(super) fn pull_request_review(
             "revision": revision,
             "body": body,
             "commit_object_id": commit_object_id,
-            "path_hex": path.map(encode_hex),
+            "path_hex": path.map(encode_lower_hex),
             "side": side,
             "line": line,
         })
@@ -248,7 +249,7 @@ pub(super) fn reference(
         kind,
         payload: json!({
             "version": PAYLOAD_VERSION,
-            "name_hex": encode_hex(name),
+            "name_hex": encode_lower_hex(name),
             "old_target": old_target,
             "new_target": new_target,
         })
@@ -321,13 +322,4 @@ pub(super) fn issue_state(
         })
         .to_string(),
     }
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        use std::fmt::Write;
-        write!(encoded, "{byte:02x}").expect("a string write cannot fail");
-    }
-    encoded
 }

@@ -1,13 +1,4 @@
-#[allow(dead_code, reason = "the search test uses only username validation")]
-#[path = "../src/auth.rs"]
-mod auth;
-#[path = "../src/domain/mod.rs"]
-mod domain;
-#[path = "../src/search.rs"]
-mod search;
-#[allow(dead_code, reason = "the search test uses only metadata storage")]
-#[path = "../src/store/mod.rs"]
-mod store;
+use crate::{search, store};
 
 use std::time::{Duration, Instant};
 

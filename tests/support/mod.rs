@@ -36,7 +36,11 @@ impl TestInstance {
     }
 
     pub(crate) fn run(&self, arguments: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_tit"))
+        let executable = option_env!("CARGO_BIN_EXE_tit")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("CARGO_BIN_EXE_tit").map(PathBuf::from))
+            .expect("find the tit test executable");
+        Command::new(executable)
             .args(arguments)
             .output()
             .expect("run tit")

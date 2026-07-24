@@ -1,15 +1,16 @@
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::TryRng;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::auth::{AuthError, SshPublicKey, validate_username};
+use crate::codec::encode_lower_hex;
 use crate::store::{
     AccountKeyAuthorization, AccountRecovery, InvitedAccount, KeyInspection, NewAuditEvent,
     NewSshKey, PublicProfile, Store, StoreError,
 };
+use crate::system::unix_timestamp;
 
 const INVITATION_PREFIX: &str = "tit-invite-v1:";
 const RECOVERY_PREFIX: &str = "tit-recovery-v1:";
@@ -432,10 +433,7 @@ fn random_secret(prefix: &'static str) -> Result<String, AccountError> {
         .map_err(|_| AccountError::Random)?;
     let mut value = String::with_capacity(prefix.len() + SECRET_BYTES * 2);
     value.push_str(prefix);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        write!(value, "{byte:02x}").expect("writing to a string cannot fail");
-    }
+    value.push_str(&encode_lower_hex(&bytes));
     Ok(value)
 }
 
@@ -444,12 +442,7 @@ fn hash(secret: &str) -> [u8; 32] {
 }
 
 fn now() -> Result<i64, AccountError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| AccountError::Clock)?
-        .as_secs()
-        .try_into()
-        .map_err(|_| AccountError::Clock)
+    unix_timestamp().ok_or(AccountError::Clock)
 }
 
 #[derive(Debug, Error)]

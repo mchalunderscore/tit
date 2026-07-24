@@ -1,35 +1,4 @@
-#[path = "../src/git/http.rs"]
-mod http;
-#[allow(dead_code, reason = "the HTTP test does not run maintenance")]
-#[path = "../src/maintenance.rs"]
-mod maintenance;
-#[allow(
-    dead_code,
-    reason = "the HTTP test does not use each shared protocol API"
-)]
-#[path = "../src/git/packetline.rs"]
-mod packetline;
-#[allow(dead_code, reason = "the HTTP test does not use repository policy")]
-#[path = "../src/policy.rs"]
-mod policy;
-#[allow(
-    dead_code,
-    reason = "the HTTP test does not inspect repository internals"
-)]
-#[path = "../src/git/repository.rs"]
-mod repository;
-#[allow(dead_code, reason = "the HTTP test does not use the intent store")]
-#[path = "../src/store/mod.rs"]
-mod store;
-#[allow(
-    dead_code,
-    reason = "the HTTP test uses transport resolution through HTTP"
-)]
-#[path = "../src/git/transport.rs"]
-mod transport;
-#[allow(dead_code, reason = "the HTTP test uses upload-pack through HTTP")]
-#[path = "../src/git/upload_pack.rs"]
-mod upload_pack;
+use crate::git::{http, packetline, transport, upload_pack};
 
 use std::fs;
 use std::io::{Read, Write};
@@ -314,7 +283,7 @@ async fn server_process_does_not_invoke_git() {
     let output = Command::new(std::env::current_exe().expect("find the test executable"))
         .args([
             "--exact",
-            "server_process_does_not_invoke_git",
+            "git_http_tests::server_process_does_not_invoke_git",
             "--nocapture",
         ])
         .env(CHILD_VARIABLE, "1")

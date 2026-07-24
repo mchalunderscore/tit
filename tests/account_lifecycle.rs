@@ -1,17 +1,4 @@
-#[path = "../src/account.rs"]
-mod account;
-#[allow(
-    dead_code,
-    reason = "the account test uses only SSH public-key parsing"
-)]
-#[path = "../src/auth.rs"]
-mod auth;
-#[allow(
-    dead_code,
-    reason = "the account test does not use every store operation"
-)]
-#[path = "../src/store/mod.rs"]
-mod store;
+use crate::{account, auth, store};
 
 use rand::rng;
 use rusqlite::OptionalExtension;

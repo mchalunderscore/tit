@@ -1,6 +1,4 @@
-#[allow(dead_code, reason = "the storage test exercises selected store APIs")]
-#[path = "../src/store/mod.rs"]
-mod store;
+use crate::store;
 
 use std::process::{Child, Command};
 use std::sync::mpsc;
@@ -142,7 +140,12 @@ fn spawn_crash_child(
     ready_path: &std::path::Path,
 ) -> Child {
     Command::new(env::current_exe().expect("find the integration test executable"))
-        .args(["--exact", "crash_child", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "sqlite_tests::crash_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env("TIT_M1A_CHILD_MODE", mode)
         .env("TIT_M1A_DATABASE", database_path)
         .env("TIT_M1A_READY", ready_path)
@@ -235,7 +238,7 @@ fn configures_connections_and_creates_the_current_schema() {
     let directory = TempDir::new().expect("create a temporary directory");
     let store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
 
-    assert_eq!(store.schema_version().expect("read the schema version"), 23);
+    assert_eq!(store.schema_version().expect("read the schema version"), 24);
     assert_eq!(
         store
             .connection()
@@ -1631,7 +1634,7 @@ fn migrates_each_committed_historical_fixture() {
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
-        assert_eq!(store.schema_version().expect("read the schema version"), 23);
+        assert_eq!(store.schema_version().expect("read the schema version"), 24);
         store.integrity_check().expect("check migrated integrity");
         let state: String = store
             .connection()
@@ -1692,6 +1695,10 @@ fn migration_uses_an_existing_repository_symbolic_head() {
         .expect("remove the new table from the historical fixture");
     store
         .connection()
+        .execute("DROP TABLE repository_default_branch_intent", [])
+        .expect("remove the intent table from the historical fixture");
+    store
+        .connection()
         .pragma_update(None, "user_version", 22)
         .expect("set the historical schema version");
     drop(store);
@@ -1709,6 +1716,71 @@ fn migration_uses_an_existing_repository_symbolic_head() {
             .repository_default_branch("alice", "project")
             .expect("read the migrated default branch"),
         "refs/heads/trunk"
+    );
+}
+
+#[test]
+fn migration_does_not_commit_when_a_repository_head_cannot_be_read() {
+    let directory = TempDir::new().expect("create a migration directory");
+    let path = database(&directory, "tit.sqlite3");
+    let mut store = Store::open(&path).expect("create the current database");
+    store
+        .connection()
+        .execute(
+            "INSERT INTO account
+             (id, username, is_administrator, state, created_at)
+             VALUES (1, 'alice', 1, 'active', 1)",
+            [],
+        )
+        .expect("create the migration account");
+    store
+        .create_repository(&NewRepository {
+            id: "00112233445566778899aabbccddeeff",
+            owner: "alice",
+            slug: "project",
+            object_format: "sha1",
+            default_branch: "refs/heads/main",
+            created_at: 2,
+            origin: RepositoryOrigin::Created,
+            initial_references: &[],
+            actor: "alice",
+            correlation_id: "migration-default-failure",
+        })
+        .expect("create the migration repository");
+    store
+        .connection()
+        .execute("DROP TABLE repository_default_branch", [])
+        .expect("remove the new table from the historical fixture");
+    store
+        .connection()
+        .execute("DROP TABLE repository_default_branch_intent", [])
+        .expect("remove the intent table from the historical fixture");
+    store
+        .connection()
+        .pragma_update(None, "user_version", 22)
+        .expect("set the historical schema version");
+    drop(store);
+    let head = directory
+        .path()
+        .join("repositories")
+        .join("00112233445566778899aabbccddeeff.git")
+        .join("HEAD");
+    fs::create_dir_all(&head).expect("create an unreadable historical HEAD");
+
+    let error = match Store::open(&path) {
+        Ok(_) => panic!("migration unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, StoreError::MigrationFilesystem { .. }),
+        "{error}"
+    );
+    let unchanged = Store::open_unmigrated(&path).expect("open the rolled-back database");
+    assert_eq!(
+        unchanged
+            .schema_version()
+            .expect("read the rolled-back schema version"),
+        22
     );
 }
 
@@ -1758,7 +1830,7 @@ fn backfills_repository_events_when_version_five_is_migrated() {
 
 #[test]
 fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
-    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 23)] {
+    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 24)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "fixture.sqlite");
         create_fixture(&path, V1_FIXTURE);

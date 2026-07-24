@@ -4,20 +4,21 @@ use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use gix::bstr::ByteSlice;
 use gix::hash::{Kind, ObjectId};
 use gix::objs::{CommitRef, Kind as ObjectKind, TagRef, TreeRefIter};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
-use rand::TryRng;
 use thiserror::Error;
 
 use super::packetline::{Packet, PacketLineError, decode, encode_data, encode_flush};
+use super::repository::GitRepository;
 use super::upload_pack::hash_name;
 use crate::policy::{PolicyError, RefChange, RepositoryPolicy};
 use crate::store::{GitIntentRecord, GitOperationIntent, NewAuditEvent, Store};
+use crate::system::{random_lower_hex, unix_timestamp};
 
 const MAX_COMMANDS: usize = 256;
 const MAX_OBJECTS: usize = 100_000;
@@ -103,19 +104,13 @@ impl ReceivePack {
     }
 
     pub(crate) fn advertisement(&self) -> Result<Vec<u8>, ReceivePackError> {
-        let repository = open_bare(&self.repository_path)?;
-        let mut references = repository
-            .references()
-            .map_err(|error| ReceivePackError::Repository(error.to_string()))?
-            .all()
-            .map_err(|error| ReceivePackError::Repository(error.to_string()))?
-            .filter_map(|reference| reference.ok())
-            .filter_map(|reference| {
-                let id = reference.try_id()?.detach();
-                Some((reference.name().as_bstr().to_vec(), id))
-            })
+        let references = GitRepository::open(&self.repository_path)
+            .and_then(|repository| repository.references())
+            .map_err(|error| ReceivePackError::Repository(error.to_string()))?;
+        let references = references
+            .into_iter()
+            .filter(|reference| reference.name != b"HEAD")
             .collect::<Vec<_>>();
-        references.sort_by(|left, right| left.0.cmp(&right.0));
         let capabilities = format!(
             "report-status report-status-v2 delete-refs atomic ofs-delta object-format={} agent=tit/{}",
             hash_name(self.object_format),
@@ -132,14 +127,14 @@ impl ReceivePack {
                 &mut output,
             )?;
         } else {
-            for (index, (name, id)) in references.iter().enumerate() {
+            for (index, reference) in references.iter().enumerate() {
                 let suffix = if index == 0 {
-                    format!("\0{capabilities}")
+                    Some(capabilities.as_bytes())
                 } else {
-                    String::new()
+                    None
                 };
                 encode_data(
-                    format!("{id} {}{suffix}\n", String::from_utf8_lossy(name)).as_bytes(),
+                    &advertised_ref(reference.target, &reference.name, suffix),
                     &mut output,
                 )?;
             }
@@ -163,12 +158,7 @@ impl ReceivePack {
         let proposed = serialize_refs(&commands, true);
         let repository_text = path_text(&self.repository_path)?;
         let quarantine_text = path_text(&self.quarantine)?;
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| ReceivePackError::Clock)?
-            .as_secs()
-            .try_into()
-            .map_err(|_| ReceivePackError::Clock)?;
+        let created_at = unix_timestamp().ok_or(ReceivePackError::Clock)?;
         let mut store = Store::open(&self.database_path)?;
         store.begin_git_intent(&GitOperationIntent {
             id: &self.intent_id,
@@ -230,12 +220,7 @@ impl ReceivePack {
             .and_then(|name| name.to_str())
             .and_then(|name| name.strip_suffix(".git"))
             .unwrap_or("repository");
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| ReceivePackError::Clock)?
-            .as_secs()
-            .try_into()
-            .map_err(|_| ReceivePackError::Clock)?;
+        let created_at = unix_timestamp().ok_or(ReceivePackError::Clock)?;
         store.record_audit_event(&NewAuditEvent {
             action: "ref.update",
             actor: &self.actor,
@@ -265,9 +250,8 @@ impl ReceivePack {
             return Vec::new();
         }
         for command in commands {
-            let name = String::from_utf8_lossy(command.name.as_bstr());
-            let line = format!("ng {name} {}\n", error.client_reason());
-            if encode_data(line.as_bytes(), &mut output).is_err() {
+            let line = status_line(b"ng ", command.name.as_bstr(), Some(error.client_reason()));
+            if encode_data(&line, &mut output).is_err() {
                 return Vec::new();
             }
         }
@@ -958,12 +942,11 @@ fn status_response(
     let mut output = Vec::new();
     encode_data(b"unpack ok\n", &mut output)?;
     for command in commands {
-        let name = String::from_utf8_lossy(command.name.as_bstr());
         let line = match error {
-            Some(error) => format!("ng {name} {error}\n"),
-            None => format!("ok {name}\n"),
+            Some(error) => status_line(b"ng ", command.name.as_bstr(), Some(error)),
+            None => status_line(b"ok ", command.name.as_bstr(), None),
         };
-        encode_data(line.as_bytes(), &mut output)?;
+        encode_data(&line, &mut output)?;
     }
     encode_flush(&mut output);
     Ok(output)
@@ -973,13 +956,34 @@ fn serialize_refs(commands: &[RefCommand], proposed: bool) -> Vec<u8> {
     let mut output = Vec::new();
     for command in commands {
         let id = if proposed { command.new } else { command.old };
-        writeln!(
-            output,
-            "{id} {}",
-            String::from_utf8_lossy(command.name.as_bstr())
-        )
-        .expect("a vector write cannot fail");
+        write!(output, "{id} ").expect("a vector write cannot fail");
+        output.extend_from_slice(command.name.as_bstr());
+        output.push(b'\n');
     }
+    output
+}
+
+fn advertised_ref(target: ObjectId, name: &[u8], capabilities: Option<&[u8]>) -> Vec<u8> {
+    let mut output = Vec::new();
+    write!(output, "{target} ").expect("a vector write cannot fail");
+    output.extend_from_slice(name);
+    if let Some(capabilities) = capabilities {
+        output.push(0);
+        output.extend_from_slice(capabilities);
+    }
+    output.push(b'\n');
+    output
+}
+
+fn status_line(prefix: &[u8], name: &[u8], error: Option<&str>) -> Vec<u8> {
+    let mut output = Vec::new();
+    output.extend_from_slice(prefix);
+    output.extend_from_slice(name);
+    if let Some(error) = error {
+        output.push(b' ');
+        output.extend_from_slice(error.as_bytes());
+    }
+    output.push(b'\n');
     output
 }
 
@@ -993,11 +997,7 @@ fn open_bare(path: &Path) -> Result<gix::Repository, ReceivePackError> {
 }
 
 fn random_id() -> Result<String, ReceivePackError> {
-    let mut bytes = [0_u8; 16];
-    rand::rngs::SysRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|_| ReceivePackError::Random)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    random_lower_hex::<16>().ok_or(ReceivePackError::Random)
 }
 
 fn path_text(path: &Path) -> Result<&str, ReceivePackError> {

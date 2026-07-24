@@ -1,9 +1,10 @@
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::TryRng;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use crate::codec::encode_lower_hex;
 use url::Url;
 
 use crate::auth::{
@@ -13,6 +14,7 @@ use crate::store::{
     ApproveLogin, NewApprovedWebSession, NewAuditEvent, NewLoginApproval, NewLoginNonce,
     NewWebSession, Store, StoreError, WebSessionRecord,
 };
+use crate::system::unix_timestamp;
 
 const CHALLENGE_LIFETIME_SECONDS: u64 = 5 * 60;
 const SESSION_LIFETIME_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -40,7 +42,7 @@ impl WebLoginService {
             .checked_add(CHALLENGE_LIFETIME_SECONDS)
             .ok_or(SessionError::Clock)?;
         let nonce = random_bytes()?;
-        let login_csrf = encode_hex(&random_bytes()?);
+        let login_csrf = encode_lower_hex(&random_bytes()?);
         Store::open(&self.database)?.create_login_nonce(&NewLoginNonce {
             nonce_hash: &hash(&nonce),
             csrf_hash: &hash(login_csrf.as_bytes()),
@@ -67,8 +69,8 @@ impl WebLoginService {
                 i64::try_from(CHALLENGE_LIFETIME_SECONDS).map_err(|_| SessionError::Clock)?,
             )
             .ok_or(SessionError::Clock)?;
-        let secret = encode_hex(&random_bytes()?);
-        let login_csrf = encode_hex(&random_bytes()?);
+        let secret = encode_lower_hex(&random_bytes()?);
+        let login_csrf = encode_lower_hex(&random_bytes()?);
         Store::open(&self.database)?.create_login_approval(&NewLoginApproval {
             secret_hash: &hash(secret.as_bytes()),
             csrf_hash: &hash(login_csrf.as_bytes()),
@@ -97,7 +99,7 @@ impl WebLoginService {
                 i64::try_from(CHALLENGE_LIFETIME_SECONDS).map_err(|_| SessionError::Clock)?,
             )
             .ok_or(SessionError::Clock)?;
-        let secret = encode_hex(&random_bytes()?);
+        let secret = encode_lower_hex(&random_bytes()?);
         Store::open(&self.database)?.create_login_approval(&NewLoginApproval {
             secret_hash: &hash(secret.as_bytes()),
             csrf_hash: &hash(csrf.as_bytes()),
@@ -140,8 +142,8 @@ impl WebLoginService {
         validate_token(secret)?;
         validate_token(login_csrf)?;
         let created_at = now()?;
-        let session = encode_hex(&random_bytes()?);
-        let csrf = encode_hex(&random_bytes()?);
+        let session = encode_lower_hex(&random_bytes()?);
+        let csrf = encode_lower_hex(&random_bytes()?);
         let expires_at = created_at
             .checked_add(SESSION_LIFETIME_SECONDS)
             .ok_or(SessionError::Clock)?;
@@ -178,8 +180,8 @@ impl WebLoginService {
                 username,
                 u64::try_from(created_at).map_err(|_| SessionError::Clock)?,
             )?;
-            let session = encode_hex(&random_bytes()?);
-            let csrf = encode_hex(&random_bytes()?);
+            let session = encode_lower_hex(&random_bytes()?);
+            let csrf = encode_lower_hex(&random_bytes()?);
             let expires_at = created_at
                 .checked_add(SESSION_LIFETIME_SECONDS)
                 .ok_or(SessionError::Clock)?;
@@ -298,15 +300,6 @@ fn hash(value: &[u8]) -> [u8; 32] {
     Sha256::digest(value).into()
 }
 
-fn encode_hex(value: &[u8]) -> String {
-    let mut result = String::with_capacity(value.len() * 2);
-    for byte in value {
-        use std::fmt::Write as _;
-        write!(result, "{byte:02x}").expect("writing to a string cannot fail");
-    }
-    result
-}
-
 fn validate_token(token: &str) -> Result<(), SessionError> {
     if token.len() != SECRET_BYTES * 2 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(SessionError::InvalidToken);
@@ -315,12 +308,7 @@ fn validate_token(token: &str) -> Result<(), SessionError> {
 }
 
 fn now() -> Result<i64, SessionError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| SessionError::Clock)?
-        .as_secs()
-        .try_into()
-        .map_err(|_| SessionError::Clock)
+    unix_timestamp().ok_or(SessionError::Clock)
 }
 
 #[derive(Debug, Error)]

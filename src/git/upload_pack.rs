@@ -93,28 +93,18 @@ impl UploadPack {
         } else {
             for (index, reference) in references.iter().enumerate() {
                 let suffix = if index == 0 {
-                    format!("\0{capabilities}")
+                    Some(capabilities.as_bytes())
                 } else {
-                    String::new()
+                    None
                 };
                 encode_data(
-                    format!(
-                        "{} {}{suffix}\n",
-                        reference.target,
-                        String::from_utf8_lossy(&reference.name)
-                    )
-                    .as_bytes(),
+                    &advertised_ref(reference.target, &reference.name, suffix),
                     output,
                 )?;
                 if let Some(peeled) = reference.peeled {
-                    encode_data(
-                        format!(
-                            "{peeled} {}^{{}}\n",
-                            String::from_utf8_lossy(&reference.name)
-                        )
-                        .as_bytes(),
-                        output,
-                    )?;
+                    let mut name = reference.name.clone();
+                    name.extend_from_slice(b"^{}");
+                    encode_data(&advertised_ref(peeled, &name, None), output)?;
                 }
             }
         }
@@ -357,18 +347,31 @@ fn command_name(packets: &[Packet], object_format: Kind) -> Result<&[u8], Upload
 }
 
 fn format_ref(reference: &GitReference, symrefs: bool, peel: bool) -> Vec<u8> {
-    let mut output = format!(
-        "{} {}",
-        reference.target,
-        String::from_utf8_lossy(&reference.name)
-    )
-    .into_bytes();
+    let mut output = Vec::new();
+    write!(output, "{} ", reference.target).expect("a vector write cannot fail");
+    output.extend_from_slice(&reference.name);
     if symrefs && let Some(target) = &reference.symbolic_target {
         output.extend_from_slice(b" symref-target:");
         output.extend_from_slice(target);
     }
     if peel && let Some(target) = reference.peeled {
         output.extend_from_slice(format!(" peeled:{target}").as_bytes());
+    }
+    output.push(b'\n');
+    output
+}
+
+pub(crate) fn advertised_ref(
+    target: ObjectId,
+    name: &[u8],
+    capabilities: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut output = Vec::new();
+    write!(output, "{target} ").expect("a vector write cannot fail");
+    output.extend_from_slice(name);
+    if let Some(capabilities) = capabilities {
+        output.push(0);
+        output.extend_from_slice(capabilities);
     }
     output.push(b'\n');
     output

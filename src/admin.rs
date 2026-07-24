@@ -1,9 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::hash::Kind;
-use rand::TryRng;
 use thiserror::Error;
 
 use crate::auth::{AuthError, validate_username};
@@ -15,6 +13,7 @@ use crate::store::{
     AuditContext, NewRepository, NewRepositoryReference, RepositoryOrigin, RepositoryRecord, Store,
     StoreError,
 };
+use crate::system::{random_lower_hex, unix_timestamp};
 
 const ADMIN_ACTOR: &str = "admin-cli";
 
@@ -425,20 +424,11 @@ fn record_failure(
 }
 
 fn random_id() -> Result<String, AdminError> {
-    let mut bytes = [0_u8; 16];
-    rand::rngs::SysRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|_| AdminError::Random)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    random_lower_hex::<16>().ok_or(AdminError::Random)
 }
 
 fn timestamp() -> Result<i64, AdminError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| AdminError::Clock)?
-        .as_secs()
-        .try_into()
-        .map_err(|_| AdminError::Clock)
+    unix_timestamp().ok_or(AdminError::Clock)
 }
 
 fn object_format_name(kind: Kind) -> Result<&'static str, AdminError> {

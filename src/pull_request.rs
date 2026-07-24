@@ -1,10 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::hash::ObjectId;
-use rand::TryRng;
 use thiserror::Error;
 
 use crate::auth::{AuthError, validate_username};
@@ -20,6 +18,7 @@ use crate::store::{
     PullRequestDetail, PullRequestRecord, PullRequestRefIntentRecord, PullRequestRevisionRecord,
     RecordPage, RepositoryRecord, Store, StoreError,
 };
+use crate::system::{random_lower_hex, unix_timestamp};
 
 pub(crate) const MAX_TITLE_BYTES: usize = 200;
 pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024;
@@ -815,20 +814,11 @@ fn parse_optional_id(value: Option<&str>) -> Result<Option<ObjectId>, PullReques
 }
 
 fn random_id() -> Result<String, PullRequestError> {
-    let mut bytes = [0_u8; 16];
-    rand::rngs::SysRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|_| PullRequestError::Random)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    random_lower_hex::<16>().ok_or(PullRequestError::Random)
 }
 
 fn timestamp() -> Result<i64, PullRequestError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| PullRequestError::Clock)?
-        .as_secs()
-        .try_into()
-        .map_err(|_| PullRequestError::Clock)
+    unix_timestamp().ok_or(PullRequestError::Clock)
 }
 
 #[cfg(test)]

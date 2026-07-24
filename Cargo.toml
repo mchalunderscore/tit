@@ -3,12 +3,21 @@ name = "tit-cde"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
+autotests = false
 license = "MIT"
 description = "A small self-hosted collaborative development environment"
 
 [[bin]]
 name = "tit"
 path = "src/main.rs"
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+
+[[test]]
+name = "serve"
+path = "tests/serve.rs"
 
 [dependencies]
 ammonia = "4.1.4"

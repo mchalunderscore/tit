@@ -1,23 +1,7 @@
+use crate::{account, auth, session, store};
+
 #[allow(dead_code, reason = "the Web session test uses one shared test helper")]
 mod support;
-
-#[allow(
-    dead_code,
-    reason = "the Web session test uses part of account management"
-)]
-#[path = "../src/account.rs"]
-mod account;
-#[allow(dead_code, reason = "the Web session test uses part of authentication")]
-#[path = "../src/auth.rs"]
-mod auth;
-#[path = "../src/session.rs"]
-mod session;
-#[allow(
-    dead_code,
-    reason = "the Web session test does not use each store operation"
-)]
-#[path = "../src/store/mod.rs"]
-mod store;
 
 use std::fs;
 use std::path::Path;

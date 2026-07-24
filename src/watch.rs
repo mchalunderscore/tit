@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
 use crate::auth::{AuthError, validate_username};
 use crate::domain::repository::{RepositoryNameError, validate_slug};
 use crate::store::{RepositoryRecord, Store, StoreError, WatchRecord};
+use crate::system::unix_timestamp;
 
 #[derive(Clone)]
 pub(crate) struct WatchService {
@@ -57,11 +57,7 @@ fn validate(owner: &str, repository: &str, actor: &str) -> Result<(), WatchError
 }
 
 fn timestamp() -> Result<i64, WatchError> {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| WatchError::Clock)?
-        .as_secs();
-    i64::try_from(seconds).map_err(|_| WatchError::Clock)
+    unix_timestamp().ok_or(WatchError::Clock)
 }
 
 #[derive(Debug, Error)]

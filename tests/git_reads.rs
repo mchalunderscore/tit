@@ -1,11 +1,4 @@
-#[path = "../src/git/patch.rs"]
-mod patch;
-#[allow(
-    dead_code,
-    reason = "the test uses each public read contract selectively"
-)]
-#[path = "../src/git/read.rs"]
-mod read;
+use crate::git::{patch, read};
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -62,6 +55,16 @@ fn reads_repository_content_for_both_object_formats() {
         assert_eq!(
             history.iter().map(|commit| commit.id).collect::<Vec<_>>(),
             [fixture.second, fixture.first]
+        );
+        let history_prefix = service
+            .history_prefix(fixture.second, 1, &cancellation)
+            .expect("read a history prefix");
+        assert_eq!(
+            history_prefix
+                .iter()
+                .map(|commit| commit.id)
+                .collect::<Vec<_>>(),
+            [fixture.second]
         );
 
         let root = service

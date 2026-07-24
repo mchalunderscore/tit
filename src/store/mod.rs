@@ -10,12 +10,13 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::codec::encode_lower_hex;
 mod event;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
 const MAX_ACTIVE_FEED_TOKENS: i64 = 1;
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_VERSION: i64 = 24;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -23,9 +24,9 @@ const SCHEMA_VERSION: i64 = 23;
 pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
 #[allow(
     dead_code,
-    reason = "M1A proves migrations before the M2 server calls them"
+    reason = "some integration test crates import storage without migration operations"
 )]
-const MIGRATIONS: [&str; 23] = [
+const MIGRATIONS: [&str; 24] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
@@ -49,6 +50,7 @@ const MIGRATIONS: [&str; 23] = [
     include_str!("migrations/021_pull_request_lifecycle.sql"),
     include_str!("migrations/022_account_key_management.sql"),
     include_str!("migrations/023_default_branch.sql"),
+    include_str!("migrations/024_default_branch_intents.sql"),
 ];
 
 #[allow(
@@ -59,9 +61,14 @@ const MIGRATIONS: [&str; 23] = [
 pub(crate) enum StoreError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("cannot read migration path {path}: {source}")]
+    MigrationFilesystem {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[allow(
         dead_code,
-        reason = "M1A proves migrations before the M2 server calls them"
+        reason = "some integration test crates import storage without schema-version rejection"
     )]
     #[error("database schema version {0} is newer than this executable")]
     NewerSchema(i64),
@@ -121,6 +128,8 @@ pub(crate) enum StoreError {
     InvalidRepositoryVisibility,
     #[error("repository default branch is not valid")]
     InvalidDefaultBranch,
+    #[error("repository default-branch intent {0} is not in the required state")]
+    DefaultBranchIntentState(String),
     #[error("collaborator role is not valid")]
     InvalidCollaboratorRole,
     #[error("repository owner cannot be a collaborator")]
@@ -214,7 +223,7 @@ impl Store {
 
     #[allow(
         dead_code,
-        reason = "M1A proves migrations before the M2 server calls them"
+        reason = "some integration test crates import storage without opening a database"
     )]
     pub(crate) fn open(path: &Path) -> Result<Self, StoreError> {
         let mut store = Self::open_unmigrated(path)?;
@@ -228,7 +237,7 @@ impl Store {
 
     #[allow(
         dead_code,
-        reason = "M1A proves migrations before the M2 server calls them"
+        reason = "some integration test crates import storage without migration setup"
     )]
     pub(crate) fn open_unmigrated(path: &Path) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
@@ -248,7 +257,7 @@ impl Store {
 
     #[allow(
         dead_code,
-        reason = "M1A proves migrations before the M2 server calls them"
+        reason = "some integration test crates import storage without direct migration"
     )]
     pub(crate) fn migrate(&mut self) -> Result<(), StoreError> {
         self.migrate_with_hook(|_| {})
@@ -256,7 +265,7 @@ impl Store {
 
     #[allow(
         dead_code,
-        reason = "M1A proves migrations before the M2 server calls them"
+        reason = "some integration test crates import storage without migration hooks"
     )]
     pub(crate) fn migrate_with_hook(
         &mut self,
@@ -270,6 +279,23 @@ impl Store {
             return Ok(());
         }
 
+        let instance = if current < 23 {
+            let database = self.connection.path().ok_or_else(|| {
+                StoreError::Integrity("a database migration requires a filesystem path".to_owned())
+            })?;
+            Some(
+                Path::new(database)
+                    .parent()
+                    .ok_or_else(|| {
+                        StoreError::Integrity(
+                            "the database migration path has no parent".to_owned(),
+                        )
+                    })?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Exclusive)?;
@@ -278,56 +304,11 @@ impl Store {
             transaction.pragma_update(None, "user_version", version)?;
             after_migration(version);
         }
+        if let Some(instance) = instance {
+            backfill_default_branches(&transaction, &instance)?;
+        }
         transaction.commit()?;
-        if current < 23 {
-            self.backfill_default_branches();
-        }
         Ok(())
-    }
-
-    fn backfill_default_branches(&self) {
-        let Some(database) = self.connection.path() else {
-            return;
-        };
-        let Some(instance) = Path::new(database).parent() else {
-            return;
-        };
-        let Ok(mut statement) = self.connection.prepare("SELECT id FROM repository") else {
-            return;
-        };
-        let Ok(ids) = statement.query_map([], |row| row.get::<_, String>(0)) else {
-            return;
-        };
-        for id in ids.flatten() {
-            let head = instance
-                .join("repositories")
-                .join(format!("{id}.git"))
-                .join("HEAD");
-            let Ok(contents) = fs::read(head) else {
-                continue;
-            };
-            let Some(name) = contents
-                .strip_suffix(b"\n")
-                .unwrap_or(&contents)
-                .strip_prefix(b"ref: ")
-            else {
-                continue;
-            };
-            let candidate = gix::bstr::BString::from(name);
-            if !name.starts_with(b"refs/heads/")
-                || gix::refs::FullName::try_from(candidate).is_err()
-            {
-                continue;
-            }
-            let Ok(name) = std::str::from_utf8(name) else {
-                continue;
-            };
-            let _ = self.connection.execute(
-                "UPDATE repository_default_branch SET ref_name = ?2
-                 WHERE repository_id = ?1",
-                rusqlite::params![id, name],
-            );
-        }
     }
 
     pub(crate) fn schema_version(&self) -> Result<i64, StoreError> {
@@ -355,7 +336,10 @@ impl Store {
         Ok(())
     }
 
-    #[allow(dead_code, reason = "M1A proves backup before the M2 server calls it")]
+    #[allow(
+        dead_code,
+        reason = "some integration test crates import storage without backup operations"
+    )]
     pub(crate) fn backup(&self, path: &Path) -> Result<(), StoreError> {
         let mut destination = Connection::open(path)?;
         let backup = Backup::new(&self.connection, &mut destination)?;
@@ -404,7 +388,7 @@ impl Store {
 
     #[allow(
         dead_code,
-        reason = "M1A tests storage behavior through this narrow test boundary"
+        reason = "integration storage tests use this database test boundary"
     )]
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
@@ -412,7 +396,7 @@ impl Store {
 
     #[allow(
         dead_code,
-        reason = "M1A tests storage behavior through this narrow test boundary"
+        reason = "integration storage tests use this mutable database test boundary"
     )]
     pub(crate) fn connection_mut(&mut self) -> &mut Connection {
         &mut self.connection
@@ -1890,26 +1874,86 @@ impl Store {
             .ok_or_else(|| StoreError::RepositoryNotFound(owner.to_owned(), slug.to_owned()))
     }
 
-    pub(crate) fn update_repository_default_branch(
+    pub(crate) fn begin_repository_default_branch(
         &mut self,
-        owner: &str,
-        slug: &str,
-        actor: &str,
-        default_branch: &str,
-        changed_at: i64,
-        correlation_id: &str,
+        intent: &NewDefaultBranchIntent<'_>,
     ) -> Result<(), StoreError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let access = repository_issue_access(&transaction, owner, slug, Some(actor))?;
+        let access =
+            repository_issue_access(&transaction, intent.owner, intent.slug, Some(intent.actor))?;
         if !access.can_maintain() {
             return Err(StoreError::PullRequestDenied);
         }
+        let stored: String = transaction.query_row(
+            "SELECT ref_name FROM repository_default_branch WHERE repository_id = ?1",
+            [&access.repository.id],
+            |row| row.get(0),
+        )?;
+        if stored != intent.previous_branch {
+            return Err(StoreError::InvalidDefaultBranch);
+        }
+        transaction.execute(
+            "INSERT INTO repository_default_branch_intent
+             (id, repository_id, actor, previous_ref_name, proposed_ref_name, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                intent.id,
+                access.repository.id,
+                intent.actor,
+                intent.previous_branch,
+                intent.default_branch,
+                intent.changed_at
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_repository_default_branch(
+        &mut self,
+        id: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (repository_id, owner, slug, actor, default_branch, changed_at): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+        ) = transaction
+            .query_row(
+                "SELECT repository.id, account.username, repository.slug,
+                        repository_default_branch_intent.actor,
+                        repository_default_branch_intent.proposed_ref_name,
+                        repository_default_branch_intent.created_at
+                 FROM repository_default_branch_intent
+                 JOIN repository
+                   ON repository.id = repository_default_branch_intent.repository_id
+                 JOIN account ON account.id = repository.owner_account_id
+                 WHERE repository_default_branch_intent.id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::DefaultBranchIntentState(id.to_owned()))?;
         let changed = transaction.execute(
             "UPDATE repository_default_branch SET ref_name = ?2
              WHERE repository_id = ?1",
-            rusqlite::params![access.repository.id, default_branch],
+            rusqlite::params![repository_id, default_branch],
         )?;
         if changed != 1 {
             return Err(StoreError::InvalidDefaultBranch);
@@ -1919,15 +1963,58 @@ impl Store {
             &transaction,
             &NewAuditEvent {
                 action: "repository.default-branch",
-                actor,
+                actor: &actor,
                 target: &target,
                 outcome: "success",
-                correlation_id,
+                correlation_id: id,
                 created_at: changed_at,
             },
         )?;
+        let deleted = transaction.execute(
+            "DELETE FROM repository_default_branch_intent WHERE id = ?1",
+            [id],
+        )?;
+        if deleted != 1 {
+            return Err(StoreError::DefaultBranchIntentState(id.to_owned()));
+        }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn abandon_repository_default_branch(&mut self, id: &str) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "DELETE FROM repository_default_branch_intent WHERE id = ?1",
+            [id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::DefaultBranchIntentState(id.to_owned()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn incomplete_repository_default_branches(
+        &self,
+    ) -> Result<Vec<DefaultBranchIntentRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT repository_default_branch_intent.id,
+                    repository_default_branch_intent.repository_id,
+                    repository_default_branch_intent.previous_ref_name,
+                    repository_default_branch_intent.proposed_ref_name
+             FROM repository_default_branch_intent
+             ORDER BY repository_default_branch_intent.created_at,
+                      repository_default_branch_intent.id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(DefaultBranchIntentRecord {
+                    id: row.get(0)?,
+                    repository_id: row.get(1)?,
+                    previous_branch: row.get(2)?,
+                    proposed_branch: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub(crate) fn repository_description(&self, repository_id: &str) -> Result<String, StoreError> {
@@ -4894,6 +4981,23 @@ pub(crate) struct GitIntentRecord {
     pub(crate) pack_name: Option<String>,
 }
 
+pub(crate) struct DefaultBranchIntentRecord {
+    pub(crate) id: String,
+    pub(crate) repository_id: String,
+    pub(crate) previous_branch: String,
+    pub(crate) proposed_branch: String,
+}
+
+pub(crate) struct NewDefaultBranchIntent<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) owner: &'a str,
+    pub(crate) slug: &'a str,
+    pub(crate) actor: &'a str,
+    pub(crate) previous_branch: &'a str,
+    pub(crate) default_branch: &'a str,
+    pub(crate) changed_at: i64,
+}
+
 #[allow(
     dead_code,
     reason = "some integration tests compile storage without accounts"
@@ -5791,20 +5895,10 @@ fn dump_value(value: ValueRef<'_>) -> DumpValue {
         ValueRef::Real(value) => DumpValue::Real(format!("{value:.17e}")),
         ValueRef::Text(value) => match std::str::from_utf8(value) {
             Ok(value) => DumpValue::TextUtf8(value.to_owned()),
-            Err(_) => DumpValue::TextHex(hex(value)),
+            Err(_) => DumpValue::TextHex(encode_lower_hex(value)),
         },
-        ValueRef::Blob(value) => DumpValue::BlobHex(hex(value)),
+        ValueRef::Blob(value) => DumpValue::BlobHex(encode_lower_hex(value)),
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[(byte >> 4) as usize]));
-        output.push(char::from(HEX[(byte & 0x0f) as usize]));
-    }
-    output
 }
 
 fn is_unique_constraint(error: &rusqlite::Error) -> bool {
@@ -5821,6 +5915,60 @@ fn page_offset(page: usize, page_size: usize) -> Result<i64, StoreError> {
         .and_then(|page| page.checked_mul(page_size))
         .and_then(|offset| i64::try_from(offset).ok())
         .ok_or(StoreError::EventLimit)
+}
+
+fn backfill_default_branches(
+    transaction: &rusqlite::Transaction<'_>,
+    instance: &Path,
+) -> Result<(), StoreError> {
+    let ids = {
+        let mut statement = transaction.prepare("SELECT id FROM repository")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for id in ids {
+        let head = instance
+            .join("repositories")
+            .join(format!("{id}.git"))
+            .join("HEAD");
+        let contents = match fs::read(&head) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(StoreError::MigrationFilesystem { path: head, source }),
+        };
+        let name = contents
+            .strip_suffix(b"\n")
+            .unwrap_or(&contents)
+            .strip_prefix(b"ref: ")
+            .ok_or_else(|| {
+                StoreError::Integrity(format!(
+                    "repository {id} has a non-symbolic HEAD during migration"
+                ))
+            })?;
+        let candidate = gix::bstr::BString::from(name);
+        if !name.starts_with(b"refs/heads/") || gix::refs::FullName::try_from(candidate).is_err() {
+            return Err(StoreError::Integrity(format!(
+                "repository {id} has an invalid HEAD during migration"
+            )));
+        }
+        let name = std::str::from_utf8(name).map_err(|_| {
+            StoreError::Integrity(format!(
+                "repository {id} has a non-UTF-8 HEAD during migration"
+            ))
+        })?;
+        let changed = transaction.execute(
+            "UPDATE repository_default_branch SET ref_name = ?2
+             WHERE repository_id = ?1",
+            rusqlite::params![id, name],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Integrity(format!(
+                "repository {id} has no default-branch row during migration"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[allow(
@@ -5842,7 +5990,7 @@ pub(crate) fn doctor(instance_dir: &Path) -> Result<(), StoreError> {
 
 #[allow(
     dead_code,
-    reason = "M1A proves migrations before the M2 server calls them"
+    reason = "some integration test crates import storage without migration backup paths"
 )]
 fn migration_backup_path(path: &Path, version: i64) -> PathBuf {
     let mut backup = OsString::from(path.as_os_str());

@@ -1,14 +1,15 @@
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::TryRng;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::auth::{AuthError, validate_username};
+use crate::codec::encode_lower_hex;
 use crate::store::{
     ActivityCursor, ActivityPage, FeedTokenRecord, Store, StoreError, TokenFeedPage,
 };
+use crate::system::unix_timestamp;
 
 const TOKEN_BYTES: usize = 32;
 
@@ -86,7 +87,7 @@ fn random_token() -> Result<String, FeedTokenError> {
     rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .map_err(|_| FeedTokenError::Random)?;
-    Ok(encode_hex(&bytes))
+    Ok(encode_lower_hex(&bytes))
 }
 
 fn hash(token: &str) -> [u8; 32] {
@@ -107,22 +108,8 @@ fn validate_id(id: &str) -> Result<(), FeedTokenError> {
     Ok(())
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        write!(output, "{byte:02x}").expect("writing to a string cannot fail");
-    }
-    output
-}
-
 fn now() -> Result<i64, FeedTokenError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| FeedTokenError::Clock)?
-        .as_secs()
-        .try_into()
-        .map_err(|_| FeedTokenError::Clock)
+    unix_timestamp().ok_or(FeedTokenError::Clock)
 }
 
 #[derive(Debug, Error)]

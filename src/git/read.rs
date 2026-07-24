@@ -278,7 +278,13 @@ impl RepositoryReadService {
             .iter()
             .map(|id| {
                 budget.check()?;
-                Ok(self.read_commit(*id, &budget).ok())
+                match self.read_commit(*id, &budget) {
+                    Ok(commit) => Ok(Some(commit)),
+                    Err(ReadError::ObjectNotFound(_) | ReadError::WrongObjectKind { .. }) => {
+                        Ok(None)
+                    }
+                    Err(error) => Err(error),
+                }
             })
             .collect::<Result<Vec<_>, ReadError>>()?;
         budget.check()?;
@@ -291,7 +297,20 @@ impl RepositoryReadService {
         cancellation: &ReadCancellation,
     ) -> Result<Vec<CommitInfo>, ReadError> {
         let budget = self.budget(cancellation);
-        self.history_with_budget(start, &budget)
+        self.history_with_budget(start, &budget, self.limits.max_history_commits, false)
+    }
+
+    pub(crate) fn history_prefix(
+        &self,
+        start: ObjectId,
+        maximum: usize,
+        cancellation: &ReadCancellation,
+    ) -> Result<Vec<CommitInfo>, ReadError> {
+        if maximum == 0 || maximum > self.limits.max_history_commits {
+            return Err(ReadError::InvalidLimits);
+        }
+        let budget = self.budget(cancellation);
+        self.history_with_budget(start, &budget, maximum, true)
     }
 
     pub(crate) fn tree(
@@ -434,8 +453,10 @@ impl RepositoryReadService {
         cancellation: &ReadCancellation,
     ) -> Result<Comparison, ReadError> {
         let budget = self.budget(cancellation);
-        let base_history = self.history_with_budget(base_commit, &budget)?;
-        let head_history = self.history_with_budget(head_commit, &budget)?;
+        let base_history =
+            self.history_with_budget(base_commit, &budget, self.limits.max_history_commits, false)?;
+        let head_history =
+            self.history_with_budget(head_commit, &budget, self.limits.max_history_commits, false)?;
         if base_history.len().saturating_add(head_history.len()) > self.limits.max_history_commits {
             return Err(ReadError::Limit("comparison commits"));
         }
@@ -592,7 +613,8 @@ impl RepositoryReadService {
     ) -> Result<Vec<BlameHunk>, ReadError> {
         validate_path(path, false, self.limits.max_path_bytes)?;
         let budget = self.budget(cancellation);
-        let history = self.history_with_budget(commit, &budget)?;
+        let history =
+            self.history_with_budget(commit, &budget, self.limits.max_history_commits, false)?;
         let mut candidate_bytes = 0_usize;
         for candidate in &history {
             budget.check()?;
@@ -807,6 +829,8 @@ impl RepositoryReadService {
         &self,
         start: ObjectId,
         budget: &ReadBudget<'_>,
+        maximum: usize,
+        truncate: bool,
     ) -> Result<Vec<CommitInfo>, ReadError> {
         let mut pending = VecDeque::from([start]);
         let mut seen = HashSet::new();
@@ -816,7 +840,10 @@ impl RepositoryReadService {
             if !seen.insert(id) {
                 continue;
             }
-            if history.len() >= self.limits.max_history_commits {
+            if history.len() >= maximum {
+                if truncate {
+                    break;
+                }
                 return Err(ReadError::Limit("history commits"));
             }
             let commit = self.read_commit(id, budget)?;

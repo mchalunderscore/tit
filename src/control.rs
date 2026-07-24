@@ -13,6 +13,8 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::account::{AccountError, AccountService};
 use crate::backup::OnlineBackupService;
+use crate::codec::{decode_lower_hex, encode_lower_hex};
+use crate::telemetry::Telemetry;
 
 pub(crate) const CONTROL_SOCKET_FILE: &str = "control.sock";
 const REQUEST: &[u8] = b"invite-code\n";
@@ -36,21 +38,23 @@ impl RunningControlServer {
         instance_dir: &Path,
         accounts: AccountService,
     ) -> Result<Self, ControlError> {
-        Self::start_inner(instance_dir, accounts, None)
+        Self::start_inner(instance_dir, accounts, None, Telemetry::default())
     }
 
-    pub(crate) fn start_with_backup(
+    pub(crate) fn start_with_backup_and_telemetry(
         instance_dir: &Path,
         accounts: AccountService,
         backup: OnlineBackupService,
+        telemetry: Telemetry,
     ) -> Result<Self, ControlError> {
-        Self::start_inner(instance_dir, accounts, Some(backup))
+        Self::start_inner(instance_dir, accounts, Some(backup), telemetry)
     }
 
     fn start_inner(
         instance_dir: &Path,
         accounts: AccountService,
         backup: Option<OnlineBackupService>,
+        telemetry: Telemetry,
     ) -> Result<Self, ControlError> {
         let path = instance_dir.join(CONTROL_SOCKET_FILE);
         refuse_existing_path(&path)?;
@@ -100,14 +104,25 @@ impl RunningControlServer {
                         let (stream, _) = accepted.map_err(ControlError::Accept)?;
                         let service = accounts.clone();
                         let backup = backup.clone();
+                        let telemetry = telemetry.clone();
                         connections.spawn(async move {
-                            let _ = handle(stream, service, backup).await;
+                            if let Err(error) = handle(stream, service, backup).await {
+                                telemetry.failure("control.request", None, &error.to_string());
+                            }
                         });
                     },
-                    _ = connections.join_next(), if !connections.is_empty() => {}
+                    joined = connections.join_next(), if !connections.is_empty() => {
+                        if let Some(Err(error)) = joined {
+                            telemetry.failure("control.task", None, &error.to_string());
+                        }
+                    }
                 }
             }
-            while connections.join_next().await.is_some() {}
+            while let Some(joined) = connections.join_next().await {
+                if let Err(error) = joined {
+                    telemetry.failure("control.task", None, &error.to_string());
+                }
+            }
             Ok(())
         });
         Ok(Self { shutdown, task })
@@ -145,7 +160,7 @@ pub(crate) async fn request_invitation(instance_dir: &Path) -> Result<String, Co
 
 pub(crate) async fn request_backup(instance_dir: &Path, output: &Path) -> Result<(), ControlError> {
     let mut request_bytes = BACKUP_REQUEST_PREFIX.to_vec();
-    request_bytes.extend_from_slice(encode_hex(output.as_os_str().as_bytes()).as_bytes());
+    request_bytes.extend_from_slice(encode_lower_hex(output.as_os_str().as_bytes()).as_bytes());
     request_bytes.push(b'\n');
     let response = request(instance_dir, &request_bytes, BACKUP_TIMEOUT).await?;
     if response == "ok" {
@@ -229,7 +244,7 @@ async fn handle(
             stream.write_all(b"error backup-unavailable\n").await?;
             return Ok(());
         };
-        let output = match decode_hex(encoded) {
+        let output = match decode_lower_hex(encoded) {
             Some(path) => PathBuf::from(OsString::from_vec(path)),
             None => {
                 stream.write_all(b"error invalid-request\n").await?;
@@ -245,34 +260,6 @@ async fn handle(
     }
     stream.shutdown().await?;
     Ok(())
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(char::from(HEX[(byte >> 4) as usize]));
-        encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
-    }
-    encoded
-}
-
-fn decode_hex(encoded: &[u8]) -> Option<Vec<u8>> {
-    if !encoded.len().is_multiple_of(2) {
-        return None;
-    }
-    encoded
-        .chunks_exact(2)
-        .map(|pair| Some((decode_nibble(pair[0])? << 4) | decode_nibble(pair[1])?))
-        .collect()
-}
-
-fn decode_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    }
 }
 
 fn refuse_existing_path(path: &Path) -> Result<(), ControlError> {
@@ -430,10 +417,11 @@ mod tests {
         let backup_directory = TempDir::new().expect("create a backup directory");
         let output = backup_directory.path().join("instance.tar");
         let service = OnlineBackupService::new(directory.path().to_owned(), config, gate.clone());
-        let server = RunningControlServer::start_with_backup(
+        let server = RunningControlServer::start_with_backup_and_telemetry(
             directory.path(),
             AccountService::new(database),
             service,
+            Telemetry::default(),
         )
         .expect("start the control server");
 

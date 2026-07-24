@@ -1,46 +1,4 @@
-#[allow(
-    dead_code,
-    reason = "the SSH Git test does not use each authentication API"
-)]
-#[path = "../src/auth.rs"]
-mod auth;
-#[allow(dead_code, reason = "the SSH Git test does not use domain models")]
-#[path = "../src/domain/mod.rs"]
-mod domain;
-#[allow(
-    dead_code,
-    reason = "the SSH Git test does not use each Git service API"
-)]
-#[path = "../src/git/mod.rs"]
-mod git;
-#[allow(dead_code, reason = "the SSH Git test does not use issue commands")]
-#[path = "../src/issue.rs"]
-mod issue;
-#[allow(dead_code, reason = "the SSH Git test does not run maintenance")]
-#[path = "../src/maintenance.rs"]
-mod maintenance;
-#[allow(dead_code, reason = "the SSH Git test does not use repository policy")]
-#[path = "../src/policy.rs"]
-mod policy;
-#[allow(dead_code, reason = "the SSH Git test does not use pull requests")]
-#[path = "../src/pull_request.rs"]
-mod pull_request;
-#[path = "../src/rate_limit.rs"]
-mod rate_limit;
-#[allow(dead_code, reason = "the SSH Git test does not create repositories")]
-#[path = "../src/repository.rs"]
-mod repository;
-#[allow(
-    dead_code,
-    reason = "the SSH Git test does not inspect the request audit"
-)]
-#[path = "../src/ssh.rs"]
-mod ssh;
-#[allow(dead_code, reason = "the SSH Git test does not use the intent store")]
-#[path = "../src/store/mod.rs"]
-mod store;
-#[path = "../src/telemetry.rs"]
-mod telemetry;
+use crate::{auth, git, ssh};
 
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};

@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
@@ -9,6 +8,7 @@ use crate::store::{
     IssueChange, IssueDetail, IssueRecord, NewIssue, RecordPage, RepositoryRecord, Store,
     StoreError,
 };
+use crate::system::unix_timestamp;
 
 pub(crate) const MAX_TITLE_BYTES: usize = 200;
 pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024;
@@ -230,11 +230,7 @@ fn validate_body(body: &str, empty_ok: bool) -> Result<(), IssueError> {
 }
 
 fn timestamp() -> Result<i64, IssueError> {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| IssueError::Clock)?
-        .as_secs();
-    i64::try_from(seconds).map_err(|_| IssueError::Clock)
+    unix_timestamp().ok_or(IssueError::Clock)
 }
 
 #[derive(Debug, Error)]

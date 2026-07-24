@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, EntryType, Header};
 use thiserror::Error;
 
+use crate::codec::{decode_lower_hex, encode_lower_hex};
 use crate::git::repository::{GitRepository, GitRepositoryError};
 use crate::instance::{InstanceError, InstanceLock, REPOSITORY_DIRECTORY};
 use crate::maintenance::MaintenanceGate;
@@ -654,37 +655,11 @@ fn remove_directory_contents(path: &Path) -> std::io::Result<()> {
 }
 
 fn encode_hex(bytes: impl AsRef<[u8]>) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let bytes = bytes.as_ref();
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(char::from(HEX[(byte >> 4) as usize]));
-        encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
-    }
-    encoded
+    encode_lower_hex(bytes.as_ref())
 }
 
 fn decode_hex(encoded: &str) -> Result<Vec<u8>, BackupError> {
-    if !encoded.len().is_multiple_of(2) {
-        return Err(BackupError::InvalidManifest);
-    }
-    encoded
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = decode_nibble(pair[0])?;
-            let low = decode_nibble(pair[1])?;
-            Ok((high << 4) | low)
-        })
-        .collect()
-}
-
-fn decode_nibble(byte: u8) -> Result<u8, BackupError> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        _ => Err(BackupError::InvalidManifest),
-    }
+    decode_lower_hex(encoded.as_bytes()).ok_or(BackupError::InvalidManifest)
 }
 
 struct DigestWriter<'a>(&'a mut Sha256);

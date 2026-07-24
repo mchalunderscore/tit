@@ -1,6 +1,4 @@
-#[allow(dead_code, reason = "the repository test exercises selected Git APIs")]
-#[path = "../src/git/repository.rs"]
-mod repository;
+use crate::git::{repository, upload_pack};
 
 use std::fs;
 use std::io::Write;
@@ -11,6 +9,7 @@ use std::process::{Command, Stdio};
 use gix::hash::ObjectId;
 use repository::{GitRepository, GitRepositoryError};
 use tempfile::TempDir;
+use upload_pack::advertised_ref;
 
 #[test]
 fn opens_empty_sha1_and_sha256_bare_repositories() {
@@ -92,6 +91,10 @@ fn reads_sorted_refs_and_generates_complete_packs_for_both_hashes() {
         assert!(references.iter().any(|reference| {
             reference.name == b"refs/tags/v1" && reference.peeled == Some(first)
         }));
+        assert!(matches!(
+            source.references_with_limit(1),
+            Err(GitRepositoryError::ReferenceLimit)
+        ));
 
         let pack = source
             .make_pack(&[first], &[])
@@ -110,6 +113,24 @@ fn reads_sorted_refs_and_generates_complete_packs_for_both_hashes() {
         index_pack(&destination, &incremental);
         assert_object(&destination, second, "commit");
     }
+}
+
+#[test]
+fn formats_reference_names_as_git_bytes() {
+    let directory = TempDir::new().expect("create a repository directory");
+    let repository_path = directory.path().join("source");
+    let commit = make_fixture(&repository_path, "sha1");
+    let name = b"topic-\xff".to_vec();
+    let advertisement = advertised_ref(commit, &name, Some(b"agent=tit"));
+    let commit_text = commit.to_string();
+    let expected = [
+        commit_text.as_bytes(),
+        b" ",
+        name.as_slice(),
+        b"\0agent=tit\n",
+    ]
+    .concat();
+    assert_eq!(advertisement, expected);
 }
 
 #[test]

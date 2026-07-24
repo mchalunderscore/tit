@@ -1,80 +1,4 @@
-#[allow(
-    dead_code,
-    reason = "the public-route test does not use account mutations"
-)]
-#[path = "../src/account.rs"]
-mod account;
-#[allow(
-    dead_code,
-    reason = "the public-route test uses only username validation"
-)]
-#[path = "../src/auth.rs"]
-mod auth;
-#[path = "../src/domain/mod.rs"]
-mod domain;
-#[path = "../src/feed.rs"]
-mod feed;
-#[path = "../src/feed_token.rs"]
-mod feed_token;
-#[allow(
-    dead_code,
-    reason = "the public-route test does not use each shared Git API"
-)]
-#[path = "../src/git/mod.rs"]
-mod git;
-#[allow(
-    dead_code,
-    reason = "the public-route test uses the public Web server only"
-)]
-#[path = "../src/http/mod.rs"]
-mod http;
-#[allow(
-    dead_code,
-    reason = "the public-route test creates instance files directly"
-)]
-#[path = "../src/instance.rs"]
-mod instance;
-#[allow(dead_code, reason = "the public-route test does not mutate issues")]
-#[path = "../src/issue.rs"]
-mod issue;
-#[allow(dead_code, reason = "the public-route test does not run maintenance")]
-#[path = "../src/maintenance.rs"]
-mod maintenance;
-#[path = "../src/markdown.rs"]
-mod markdown;
-#[allow(dead_code, reason = "the public-route test uses anonymous policy only")]
-#[path = "../src/policy.rs"]
-mod policy;
-#[allow(
-    dead_code,
-    reason = "the public-route test does not mutate pull requests"
-)]
-#[path = "../src/pull_request.rs"]
-mod pull_request;
-#[path = "../src/rate_limit.rs"]
-mod rate_limit;
-#[allow(
-    dead_code,
-    reason = "the public route test does not create repositories through forms"
-)]
-#[path = "../src/repository.rs"]
-mod repository;
-#[path = "../src/search.rs"]
-mod search;
-#[allow(dead_code, reason = "the public-route test does not complete a login")]
-#[path = "../src/session.rs"]
-mod session;
-#[allow(
-    dead_code,
-    reason = "the public-route test does not use each store API"
-)]
-#[path = "../src/store/mod.rs"]
-mod store;
-#[path = "../src/telemetry.rs"]
-mod telemetry;
-#[allow(dead_code, reason = "the public-route test does not change watches")]
-#[path = "../src/watch.rs"]
-mod watch;
+use crate::{git, http, store};
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -810,6 +734,17 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     assert!(anonymous.text().contains("<form class=\"filter-form\""));
     assert!(anonymous.text().contains("class=\"collection-action\""));
     assert!(!anonymous.text().contains("Create an issue</h2>"));
+    assert_eq!(
+        request(
+            server.address(),
+            "GET",
+            "/alice/example/issues?page=0",
+            &[],
+            &[],
+        )
+        .status,
+        400
+    );
 
     let cookie = format!("tit-session={token}; tit-csrf={csrf}");
     let headers = [
@@ -854,6 +789,17 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     assert!(!detail.text().contains("<script>"));
     assert!(detail.text().contains("Add a comment"));
     assert!(!detail.text().contains("Organize this issue"));
+    assert_eq!(
+        request(
+            server.address(),
+            "GET",
+            "/alice/example/issues/1?comments_page=0",
+            &[],
+            &[],
+        )
+        .status,
+        400
+    );
 
     let bad_csrf = form(&[("csrf", &"33".repeat(32)), ("state", "closed")]);
     assert_eq!(
@@ -923,6 +869,17 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     let anonymous_pull_requests =
         request(server.address(), "GET", "/alice/example/pulls", &[], &[]);
     assert_eq!(anonymous_pull_requests.status, 200);
+    assert_eq!(
+        request(
+            server.address(),
+            "GET",
+            "/alice/example/pulls?page=0",
+            &[],
+            &[],
+        )
+        .status,
+        400
+    );
     assert_repository_navigation(&anonymous_pull_requests, "alice", "example");
     assert!(
         anonymous_pull_requests

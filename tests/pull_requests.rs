@@ -1,31 +1,4 @@
-#[allow(
-    dead_code,
-    reason = "the pull-request test uses only identity validation"
-)]
-#[path = "../src/auth.rs"]
-mod auth;
-#[path = "../src/domain/mod.rs"]
-mod domain;
-#[allow(
-    dead_code,
-    reason = "the pull-request test uses part of the shared Git API"
-)]
-#[path = "../src/git/mod.rs"]
-mod git;
-#[allow(dead_code, reason = "the pull-request test does not run maintenance")]
-#[path = "../src/maintenance.rs"]
-mod maintenance;
-#[allow(
-    dead_code,
-    reason = "the pull-request test uses repository policy through Git"
-)]
-#[path = "../src/policy.rs"]
-mod policy;
-#[path = "../src/pull_request.rs"]
-mod pull_request;
-#[allow(dead_code, reason = "the pull-request test uses part of the store API")]
-#[path = "../src/store/mod.rs"]
-mod store;
+use crate::{git, pull_request, store};
 
 use std::fs;
 use std::os::unix::ffi::OsStringExt;

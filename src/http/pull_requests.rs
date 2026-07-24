@@ -7,6 +7,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use serde::Deserialize;
 
+use crate::codec::{decode_ascii_hex, encode_lower_hex};
 use crate::markdown::{self, RenderedMarkdown};
 use crate::pull_request::PullRequestError;
 use crate::store::StoreError;
@@ -124,6 +125,9 @@ async fn pull_request_list(
     let actor_for_list = actor_name.clone();
     let state_filter = query.state.unwrap_or_else(|| "open".to_owned());
     let page_number = query.page.unwrap_or(1);
+    if page_number == 0 {
+        return bad_request(&request_id.0);
+    }
     let state_for_job = state_filter.clone();
     let result = job(state.clone(), move || {
         service.list_page(
@@ -139,10 +143,13 @@ async fn pull_request_list(
         Ok((record, page, can_create)) => {
             let csrf = cookie(&headers, CSRF_COOKIE).unwrap_or_default();
             let branches = match state.public.as_ref() {
-                Some(public) => public
+                Some(public) => match public
                     .branch_names(actor_name, record.owner.clone(), record.slug.clone())
                     .await
-                    .unwrap_or_default(),
+                {
+                    Ok(branches) => branches,
+                    Err(_) => return internal(&request_id.0),
+                },
                 None => Vec::new(),
             };
             let default_owner = record.owner.clone();
@@ -150,8 +157,11 @@ async fn pull_request_list(
             let default_branch = super::repository_job(state, move |repositories| {
                 repositories.default_branch(&default_owner, &default_repository)
             })
-            .await
-            .unwrap_or_else(|_| "refs/heads/main".to_owned());
+            .await;
+            let default_branch = match default_branch {
+                Ok(default_branch) => default_branch,
+                Err(_) => return internal(&request_id.0),
+            };
             render(
                 StatusCode::OK,
                 &PullRequestListTemplate {
@@ -204,6 +214,11 @@ async fn pull_request_detail(
     let owner = path.owner.clone();
     let repository = path.repository.clone();
     let signed_in = actor.0.is_some();
+    let reviews_page = query.reviews_page.unwrap_or(1);
+    let timeline_page = query.timeline_page.unwrap_or(1);
+    if reviews_page == 0 || timeline_page == 0 {
+        return bad_request(&request_id.0);
+    }
     let result = job(state, move || {
         service.compare_page(
             &owner,
@@ -211,8 +226,8 @@ async fn pull_request_detail(
             path.number,
             query.revision,
             actor.0.as_deref(),
-            query.reviews_page.unwrap_or(1),
-            query.timeline_page.unwrap_or(1),
+            reviews_page,
+            timeline_page,
         )
     })
     .await;
@@ -632,14 +647,7 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
     if value.is_empty() || !value.len().is_multiple_of(2) {
         return None;
     }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let pair = std::str::from_utf8(pair).ok()?;
-            u8::from_str_radix(pair, 16).ok()
-        })
-        .collect()
+    decode_ascii_hex(value.as_bytes())
 }
 
 fn bad_request(request_id: &str) -> Response {
@@ -847,7 +855,7 @@ impl From<&crate::git::read::Comparison> for ComparisonView {
                 .iter()
                 .map(|file| DiffView {
                     path: String::from_utf8_lossy(&file.path).into_owned(),
-                    path_hex: encode_hex(&file.path),
+                    path_hex: encode_lower_hex(&file.path),
                     binary: file.binary,
                     has_base: file.old_id.is_some(),
                     has_head: file.new_id.is_some(),
@@ -856,13 +864,4 @@ impl From<&crate::git::read::Comparison> for ComparisonView {
                 .collect(),
         }
     }
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        use std::fmt::Write;
-        write!(encoded, "{byte:02x}").expect("a string write cannot fail");
-    }
-    encoded
 }

@@ -19,6 +19,7 @@ use crate::instance::{InstanceError, InstanceLock, prepare_database, prepare_rep
 use crate::maintenance::MaintenanceGate;
 use crate::policy::PolicyError;
 use crate::pull_request::{PullRequestError, PullRequestService};
+use crate::repository::{RepositoryService, RepositoryServiceError};
 use crate::session::{SessionError, WebLoginService};
 use crate::ssh::{AuthorizedSshKeys, LoginApprover, RunningSshServer, SshServerError};
 use crate::store::{Store, StoreError};
@@ -33,6 +34,7 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
     let database = prepare_database(&config.instance_dir)?;
     let repository_root = prepare_repository_root(&config.instance_dir)?;
     let maintenance = MaintenanceGate::default();
+    RepositoryService::new_with_gate(&database, &repository_root, maintenance.clone()).recover()?;
     PullRequestService::new_with_gate(&database, &repository_root, maintenance.clone())
         .recover()?;
     let store = Store::open(&database)?;
@@ -50,8 +52,12 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
         config.config_path.clone(),
         maintenance.clone(),
     );
-    let control =
-        RunningControlServer::start_with_backup(&config.instance_dir, accounts.clone(), backup)?;
+    let control = RunningControlServer::start_with_backup_and_telemetry(
+        &config.instance_dir,
+        accounts.clone(),
+        backup,
+        telemetry.clone(),
+    )?;
     let authorized_keys = AuthorizedSshKeys::for_accounts(keys);
     let readiness = ListenerReadiness::default();
 
@@ -289,6 +295,8 @@ pub(crate) enum ServeError {
     Authentication(#[from] AuthError),
     #[error(transparent)]
     Repository(#[from] RepositoryPathError),
+    #[error(transparent)]
+    RepositoryService(#[from] RepositoryServiceError),
     #[error(transparent)]
     Configuration(#[from] ConfigError),
     #[error(transparent)]

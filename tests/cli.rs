@@ -32,7 +32,8 @@ const CURRENT_DATABASE: &str = concat!(
     include_str!("../src/store/migrations/021_pull_request_lifecycle.sql"),
     include_str!("../src/store/migrations/022_account_key_management.sql"),
     include_str!("../src/store/migrations/023_default_branch.sql"),
-    "PRAGMA user_version = 23;\n",
+    include_str!("../src/store/migrations/024_default_branch_intents.sql"),
+    "PRAGMA user_version = 24;\n",
 );
 
 #[test]
