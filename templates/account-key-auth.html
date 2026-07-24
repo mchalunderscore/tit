@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}{{ heading }} · tit{% endblock %}
+{% block content %}
+  <h1>{{ heading }}</h1>
+  <p>Run this command with an active SSH key for your account:</p>
+  <pre><code>{{ command }}</code></pre>
+  <p>Check the origin and account in the SSH response. Then continue.</p>
+  <form action="{{ action }}" method="post">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="secret" value="{{ secret }}">
+    {% if adding %}
+    <input type="hidden" name="label" value="{{ label }}">
+    <input type="hidden" name="public-key" value="{{ public_key }}">
+    {% else %}
+    <input type="hidden" name="fingerprint" value="{{ fingerprint }}">
+    {% endif %}
+    <button type="submit">Continue</button>
+    <a href="/account">Cancel</a>
+  </form>
+{% endblock %}

@@ -1,8 +1,0 @@
-#!/bin/sh
-set -eu
-
-./scripts/check
-cargo test --locked --release --test repository_policy
-cargo test --locked --release --test git_push_ssh
-cargo test --locked --release --test serve enforces_account_roles_and_ref_policy_through_the_production_ssh_server
-cargo test --locked --release --test pull_requests fast_forwards_pull_requests_with_one_durable_merge_event_for_both_hashes

@@ -1,6 +1,0 @@
-#!/bin/sh
-set -eu
-
-./scripts/check
-cargo test --locked --release --test serve enforces_account_roles_and_ref_policy_through_the_production_ssh_server
-cargo test --locked --release --test git_push_ssh

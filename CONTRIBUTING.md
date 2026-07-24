@@ -16,8 +16,7 @@ design has only necessary code.
 
 ## Scope
 
-- Read `PLAN.md` before you change code.
-- Work only on the current milestone and its specified acceptance gate.
+- Work only on the requested change and its necessary validation.
 - Do not implement subsequent features, compatibility layers, extension points,
   or configuration settings for subsequent milestones.
 - Make a small completed change. Do not make a large framework that is not
@@ -55,8 +54,8 @@ period.
 ## Documentation
 
 Write all project documentation in ASD-STE100 Simplified Technical English,
-Issue 9. This rule includes `AGENTS.md`, `CONTRIBUTING.md`, `PLAN.md`, the
-README, manuals, help text, configuration descriptions, and Rust documentation.
+Issue 9. This rule includes `AGENTS.md`, `CONTRIBUTING.md`, the README, manuals,
+help text, configuration descriptions, and Rust documentation.
 
 Use the approved STE dictionary and writing rules. Treat established Git, Rust,
 protocol, command, and project terms as technical names or technical verbs only
@@ -79,8 +78,9 @@ Use the technical nouns in this list:
   environment, feature, host, identity, implementation, and invariant.
 - license, metadata, milestone, model, owner, permission, platform, portability,
   priority, scope, state, validation, version, and visibility.
-- browser, description, design, documentation, enhancement, form, library,
-  reader, rule, sanitizer, subset, summary, user, and writer.
+- bio, browser, contact email, description, design, documentation, enhancement,
+  form, library, profile, reader, rule, sanitizer, subset, summary, user, and
+  writer.
 - agent and contributor.
 - action, admin, blob, checkout, collaboration, default, development, download,
   encoding, federation, filesystem, frontend, installation, link, organization,
@@ -91,12 +91,11 @@ Use the technical nouns in this list:
   request, push, ref, tag, and tree.
 - Cargo, Git, OpenSSH, Rust, SQLite, and the exact names of crates, commands,
   types, files, paths, and configuration fields.
-- acceptance gate, audit event, collaborator role, domain event, feed token,
-  invite code, login approval, login nonce, recovery credential, and security
-  boundary.
-- architectural decision record, built-in SSH server, canonical URL,
-  client-side router, progressive enhancement, recoverable runtime failure,
-  server-rendered HTML, server-side validation, symbolic logo, and tit bird.
+- audit event, collaborator role, domain event, feed token, invite code, login
+  approval, login nonce, recovery credential, and security boundary.
+- built-in SSH server, canonical URL, client-side router, progressive
+  enhancement, recoverable runtime failure, server-rendered HTML, server-side
+  validation, symbolic logo, and tit bird.
 - first-class feed, operating-system library, platform-specific code, read-only
   repository, self-hosted CDE, shared library, and plain-text Markdown.
 - blocking job, cgit-like interface, laziness rule, portable code, semantic
@@ -216,8 +215,7 @@ to this section before you use a new project-specific term in documentation.
   placeholder implementations, or flags that do nothing.
 - Comments explain constraints and non-obvious reasons, not what the syntax
   already says.
-- Update `PLAN.md` when a product or architectural decision changes. Do not
-  rewrite it to support an easy but incorrect method.
+- Update the README and applicable tests when a public behavior changes.
 - When two designs are correct, select the design with minimum state and
   dependencies. Also select the design with the minimum number of parts and a
   recovery process that is clear.

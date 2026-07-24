@@ -6,8 +6,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::auth::{AuthError, validate_username};
-use crate::domain::repository::{RepositoryNameError, validate_slug};
-use crate::store::{FeedTokenRecord, Store, StoreError, TokenFeedPage};
+use crate::store::{
+    ActivityCursor, ActivityPage, FeedTokenRecord, Store, StoreError, TokenFeedPage,
+};
 
 const TOKEN_BYTES: usize = 32;
 
@@ -30,31 +31,11 @@ impl FeedTokenService {
             .map_err(Into::into)
     }
 
-    pub(crate) fn issue(
-        &self,
-        actor: &str,
-        scope: &str,
-        owner: Option<&str>,
-        repository: Option<&str>,
-    ) -> Result<IssuedFeedToken, FeedTokenError> {
+    pub(crate) fn issue(&self, actor: &str) -> Result<IssuedFeedToken, FeedTokenError> {
         validate_username(actor)?;
-        let target = match (scope, owner, repository) {
-            ("repository", Some(owner), Some(repository)) => {
-                validate_username(owner)?;
-                validate_slug(repository)?;
-                Some((owner, repository))
-            }
-            ("watched" | "assignments" | "mentions", None, None) => None,
-            _ => return Err(FeedTokenError::InvalidScope),
-        };
         let token = random_token()?;
-        let record = Store::open(&self.database)?.create_feed_token(
-            actor,
-            scope,
-            target,
-            &hash(&token),
-            now()?,
-        )?;
+        let record =
+            Store::open(&self.database)?.create_feed_token(actor, &hash(&token), now()?)?;
         Ok(IssuedFeedToken { record, token })
     }
 
@@ -79,6 +60,18 @@ impl FeedTokenService {
         validate_token(token)?;
         Store::open(&self.database)?
             .token_feed_events(&hash(token), limit)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn activity(
+        &self,
+        actor: &str,
+        before: Option<&ActivityCursor>,
+        limit: usize,
+    ) -> Result<ActivityPage, FeedTokenError> {
+        validate_username(actor)?;
+        Store::open(&self.database)?
+            .watched_activity_page(actor, before, limit)
             .map_err(Into::into)
     }
 }
@@ -137,11 +130,7 @@ pub(crate) enum FeedTokenError {
     #[error(transparent)]
     Auth(#[from] AuthError),
     #[error(transparent)]
-    RepositoryName(#[from] RepositoryNameError),
-    #[error(transparent)]
     Store(#[from] StoreError),
-    #[error("feed token scope is not valid")]
-    InvalidScope,
     #[error("feed token is not valid")]
     InvalidToken,
     #[error("cannot create random feed token data")]

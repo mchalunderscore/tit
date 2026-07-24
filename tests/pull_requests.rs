@@ -73,6 +73,49 @@ fn creates_revises_and_recovers_numbered_pull_request_refs_for_both_hashes() {
         assert_eq!(comparison.comparison.commits.len(), 1);
         assert_eq!(comparison.comparison.changed_paths, [b"feature.txt"]);
         assert_eq!(comparison.comparison.files.len(), 1);
+        service
+            .edit(
+                "alice",
+                "project",
+                1,
+                "alice",
+                "Add the edited feature",
+                "Keep the edited revision context.",
+            )
+            .expect("edit a pull request");
+        service
+            .set_state("alice", "project", 1, "alice", "closed")
+            .expect("close a pull request");
+        assert!(matches!(
+            service.revise("alice", "project", 1, "alice"),
+            Err(PullRequestError::Store(StoreError::PullRequestState))
+        ));
+        service
+            .set_state("alice", "project", 1, "alice", "open")
+            .expect("reopen a pull request");
+        let lifecycle = service
+            .get("alice", "project", 1, Some("alice"))
+            .expect("read pull-request lifecycle changes");
+        assert_eq!(lifecycle.pull_request.title, "Add the edited feature");
+        assert_eq!(lifecycle.pull_request.state, "open");
+        assert!(
+            lifecycle
+                .timeline
+                .iter()
+                .any(|event| event.kind == "pull-request-edited")
+        );
+        assert!(
+            lifecycle
+                .timeline
+                .iter()
+                .any(|event| event.kind == "pull-request-closed")
+        );
+        assert!(
+            lifecycle
+                .timeline
+                .iter()
+                .any(|event| event.kind == "pull-request-reopened")
+        );
         run(
             &fixture.worktree,
             Command::new("git")
@@ -243,6 +286,9 @@ fn creates_revises_and_recovers_numbered_pull_request_refs_for_both_hashes() {
             event_kinds,
             [
                 "pull-request-created",
+                "pull-request-edited",
+                "pull-request-closed",
+                "pull-request-reopened",
                 "pull-request-revised",
                 "pull-request-created",
                 "pull-request-revised",
@@ -819,6 +865,20 @@ fn records_review_actions_and_immutable_line_anchors_for_both_hashes() {
         );
 
         let store = Store::open(&fixture.database).expect("open the review policy store");
+        let first_page = store
+            .pull_request_detail_page("alice", "project", 1, Some("bob"), 1, 1, 2)
+            .expect("read the first bounded review page");
+        assert_eq!(first_page.reviews.len(), 2);
+        assert!(first_page.reviews_has_next);
+        assert_eq!(first_page.timeline.len(), 2);
+        assert!(first_page.timeline_has_next);
+        let second_page = store
+            .pull_request_detail_page("alice", "project", 1, Some("bob"), 2, 2, 2)
+            .expect("read the second bounded review page");
+        assert_eq!(second_page.reviews_page, 2);
+        assert_eq!(second_page.reviews.len(), 2);
+        assert_eq!(second_page.timeline_page, 2);
+        assert_eq!(second_page.timeline.len(), 2);
         store
             .connection()
             .execute(

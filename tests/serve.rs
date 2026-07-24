@@ -71,6 +71,7 @@ fn serves_an_imported_repository_through_http_and_ssh() {
             source.to_str().expect("a UTF-8 source path"),
         ],
     );
+    let _settings_member_key = provision_account(instance.path(), "carol", "active", false);
     let mut server = spawn_server(&config);
     wait_for_listener(http, &mut server);
     wait_for_listener(ssh, &mut server);
@@ -176,13 +177,17 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     assert!(anonymous_home.contains("<a href=\"/recover\">Recover account</a>"));
     assert!(anonymous_home.contains("<a href=\"/login\">Log in</a>"));
     assert!(!anonymous_home.contains("<a href=\"/account\">Account</a>"));
+    assert!(http_get(http, "/alice/example").contains("trunk head"));
 
     let login_approval = http_form(http, "/login/ssh", &[]);
     assert!(login_approval.starts_with("HTTP/1.1 200"));
     let secret = between(&login_approval, "name=\"secret\" value=\"", "\">");
     let login_csrf_cookies = response_cookies(&login_approval);
     let login_csrf = cookie_value(&login_csrf_cookies, "tit-login-csrf");
-    let ssh_approval = ssh_exec(ssh, &private_key, &["login", secret]);
+    let removed_login = ssh_exec(ssh, &private_key, &["login", secret]);
+    assert!(!removed_login.status.success());
+    assert!(String::from_utf8_lossy(&removed_login.stderr).contains("help"));
+    let ssh_approval = ssh_exec(ssh, &private_key, &["auth", secret]);
     assert!(ssh_approval.status.success());
     let ssh_approval_output =
         String::from_utf8(ssh_approval.stdout).expect("read SSH approval output");
@@ -236,6 +241,208 @@ fn serves_an_imported_repository_through_http_and_ssh() {
     assert!(signed_in_missing.contains("<a href=\"/logout\">Log out</a>"));
     assert!(!signed_in_missing.contains("<a href=\"/login\">Log in</a>"));
     let csrf = cookie_value(&cookies, "tit-csrf");
+    let second_key = instance.path().join("alice-second");
+    create_ssh_key_fixture(&second_key);
+    let second_public_key =
+        fs::read_to_string(second_key.with_extension("pub")).expect("read the second public key");
+    let second_fingerprint = ssh_fingerprint(&second_key);
+    let begin_add = http_form_with_headers(
+        http,
+        "/account/keys/add",
+        &[
+            ("csrf", csrf),
+            ("label", "laptop"),
+            ("public-key", second_public_key.trim()),
+        ],
+        &[("Cookie", &cookies)],
+    );
+    assert!(begin_add.starts_with("HTTP/1.1 200"), "{begin_add}");
+    assert!(begin_add.contains("ssh -p"));
+    assert!(begin_add.contains(" auth "));
+    let add_secret = between(&begin_add, "name=\"secret\" value=\"", "\">");
+    assert!(
+        ssh_exec(ssh, &private_key, &["auth", add_secret])
+            .status
+            .success()
+    );
+    let complete_add = http_form_with_headers(
+        http,
+        "/account/keys/add/complete",
+        &[
+            ("csrf", csrf),
+            ("secret", add_secret),
+            ("label", "laptop"),
+            ("public-key", second_public_key.trim()),
+        ],
+        &[("Cookie", &cookies)],
+    );
+    assert!(complete_add.starts_with("HTTP/1.1 303"), "{complete_add}");
+    let replay_add = http_form_with_headers(
+        http,
+        "/account/keys/add/complete",
+        &[
+            ("csrf", csrf),
+            ("secret", add_secret),
+            ("label", "replay"),
+            ("public-key", second_public_key.trim()),
+        ],
+        &[("Cookie", &cookies)],
+    );
+    assert!(replay_add.starts_with("HTTP/1.1 400"));
+    assert!(ssh_exec(ssh, &second_key, &["help"]).status.success());
+    let account_with_key = http_get_with_headers(http, "/account", &[("Cookie", &cookies)]);
+    assert!(account_with_key.contains("laptop"));
+    assert!(account_with_key.contains(&second_fingerprint));
+
+    let begin_revoke = http_form_with_headers(
+        http,
+        "/account/keys/revoke",
+        &[("csrf", csrf), ("fingerprint", &second_fingerprint)],
+        &[("Cookie", &cookies)],
+    );
+    assert!(begin_revoke.starts_with("HTTP/1.1 200"));
+    let revoke_secret = between(&begin_revoke, "name=\"secret\" value=\"", "\">");
+    assert!(
+        ssh_exec(ssh, &private_key, &["auth", revoke_secret])
+            .status
+            .success()
+    );
+    let complete_revoke = http_form_with_headers(
+        http,
+        "/account/keys/revoke/complete",
+        &[
+            ("csrf", csrf),
+            ("secret", revoke_secret),
+            ("fingerprint", &second_fingerprint),
+        ],
+        &[("Cookie", &cookies)],
+    );
+    assert!(
+        complete_revoke.starts_with("HTTP/1.1 303"),
+        "{complete_revoke}"
+    );
+    assert!(!ssh_exec(ssh, &second_key, &["help"]).status.success());
+
+    let initial_fingerprint = ssh_fingerprint(&private_key);
+    let begin_final_revoke = http_form_with_headers(
+        http,
+        "/account/keys/revoke",
+        &[("csrf", csrf), ("fingerprint", &initial_fingerprint)],
+        &[("Cookie", &cookies)],
+    );
+    let final_secret = between(&begin_final_revoke, "name=\"secret\" value=\"", "\">");
+    assert!(
+        ssh_exec(ssh, &private_key, &["auth", final_secret])
+            .status
+            .success()
+    );
+    let final_revoke = http_form_with_headers(
+        http,
+        "/account/keys/revoke/complete",
+        &[
+            ("csrf", csrf),
+            ("secret", final_secret),
+            ("fingerprint", &initial_fingerprint),
+        ],
+        &[("Cookie", &cookies)],
+    );
+    assert!(final_revoke.starts_with("HTTP/1.1 400"));
+    assert!(final_revoke.contains("must keep at least one active SSH key"));
+
+    let profile_without_contact_email = http_get(http, "/alice");
+    assert!(profile_without_contact_email.starts_with("HTTP/1.1 200"));
+    assert!(!profile_without_contact_email.contains("mailto:"));
+    let profile_update = http_form_with_headers(
+        http,
+        "/account/profile",
+        &[
+            ("csrf", csrf),
+            ("bio", "Builds small systems."),
+            ("contact-email", "alice@example.test"),
+        ],
+        &[("Cookie", &cookies)],
+    );
+    assert!(profile_update.starts_with("HTTP/1.1 303"));
+    let public_profile = http_get(http, "/alice");
+    assert!(public_profile.starts_with("HTTP/1.1 200"));
+    assert!(public_profile.contains("Builds small systems."));
+    assert!(public_profile.contains("mailto:alice@example.test"));
+    assert!(public_profile.contains("href=\"/alice/example\""));
+    let settings = http_get_with_headers(http, "/alice/example/settings", &[("Cookie", &cookies)]);
+    assert!(settings.starts_with("HTTP/1.1 200"));
+    assert!(settings.contains("<h2>Repository settings</h2>"));
+    assert!(settings.contains("<option value=\"refs/heads/trunk\" selected>"));
+    let pulls = http_get_with_headers(http, "/alice/example/pulls", &[("Cookie", &cookies)]);
+    assert!(pulls.contains("value=\"refs/heads/trunk\" required"));
+    for invalid in [
+        "refs/heads/missing",
+        "refs/tags/v1",
+        "main",
+        "refs/heads/../bad",
+    ] {
+        let rejected = http_form_with_headers(
+            http,
+            "/alice/example/settings/default-branch",
+            &[("csrf", csrf), ("default-branch", invalid)],
+            &[("Cookie", &cookies)],
+        );
+        assert!(
+            rejected.starts_with("HTTP/1.1 400"),
+            "{invalid}: {rejected}"
+        );
+    }
+    let default_branch_update = http_form_with_headers(
+        http,
+        "/alice/example/settings/default-branch",
+        &[("csrf", csrf), ("default-branch", "refs/heads/main")],
+        &[("Cookie", &cookies)],
+    );
+    assert!(default_branch_update.starts_with("HTTP/1.1 303"));
+    let updated_pulls =
+        http_get_with_headers(http, "/alice/example/pulls", &[("Cookie", &cookies)]);
+    assert!(updated_pulls.contains("value=\"refs/heads/main\" required"));
+    assert!(!http_get(http, "/alice/example").contains("trunk head"));
+    assert_eq!(
+        fs::read_to_string(
+            instance
+                .path()
+                .join("repositories")
+                .join(format!("{restored_repository}.git"))
+                .join("HEAD")
+        )
+        .expect("read the changed symbolic HEAD"),
+        "ref: refs/heads/main\n"
+    );
+    let settings_update = http_form_with_headers(
+        http,
+        "/alice/example/settings/general",
+        &[
+            ("csrf", csrf),
+            ("description", "A repository with self-service settings."),
+            ("visibility", "public"),
+        ],
+        &[("Cookie", &cookies)],
+    );
+    assert!(settings_update.starts_with("HTTP/1.1 303"));
+    let collaborator_update = http_form_with_headers(
+        http,
+        "/alice/example/settings/collaborators",
+        &[
+            ("csrf", csrf),
+            ("username", "carol"),
+            ("role", "reader"),
+            ("action", "set"),
+        ],
+        &[("Cookie", &cookies)],
+    );
+    assert!(collaborator_update.starts_with("HTTP/1.1 303"));
+    let updated_settings =
+        http_get_with_headers(http, "/alice/example/settings", &[("Cookie", &cookies)]);
+    assert!(updated_settings.contains("A repository with self-service settings."));
+    assert!(updated_settings.contains("carol · reader"));
+    assert!(http_get(http, "/alice/example").contains(
+        "<p class=\"repository-description\">A repository with self-service settings.</p>"
+    ));
     let logout_page = http_get_with_headers(http, "/logout", &[("Cookie", &cookies)]);
     assert!(logout_page.starts_with("HTTP/1.1 200"));
     assert!(logout_page.contains("<form method=\"post\" action=\"/logout\">"));
@@ -388,12 +595,15 @@ fn serves_an_imported_repository_through_http_and_ssh() {
         )
         .expect("make the repository private");
     assert!(http_get(http, "/alice/example").starts_with("HTTP/1.1 404"));
+    let public_profile_with_private_repository = http_get(http, "/alice");
+    assert!(public_profile_with_private_repository.starts_with("HTTP/1.1 200"));
+    assert!(!public_profile_with_private_repository.contains("href=\"/alice/example\""));
     let private_summary =
         http_get_with_headers(http, "/alice/example", &[("Cookie", &private_cookies)]);
     assert!(private_summary.starts_with("HTTP/1.1 200"));
     let private_feed = http_get_with_headers(
         http,
-        "/alice/example/atom.xml",
+        "/alice/example/rss.xml",
         &[("Cookie", &private_cookies)],
     );
     assert!(private_feed.starts_with("HTTP/1.1 200"));
@@ -733,7 +943,6 @@ fn keeps_private_git_hidden_from_http_but_allows_its_owner_over_ssh() {
     for route in [
         "/alice/private",
         "/alice/private/refs",
-        "/alice/private/atom.xml",
         "/alice/private/rss.xml",
         "/alice/private/search?q=serve&ref=HEAD",
         "/alice/private/commit/main",
@@ -841,6 +1050,12 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
     assert!(git_push(&member_key, &created_clone, &["feature"]).success());
     let base = git_revision(&created_clone, "main");
     let head = git_revision(&created_clone, "feature");
+    command(&created_clone, ["switch", "-q", "main"]);
+    command(&created_clone, ["switch", "-q", "-c", "feature-two"]);
+    fs::write(created_clone.join("feature-two.txt"), b"second feature\n")
+        .expect("write the second pull-request feature");
+    git_commit(&created_clone, "create second feature");
+    assert!(git_push(&member_key, &created_clone, &["feature-two"]).success());
     let pull_request_database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
         .expect("open the pull-request command database");
     let repository_id: String = pull_request_database
@@ -886,6 +1101,15 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
             rusqlite::params![base, head],
         )
         .expect("create a pull-request revision fixture");
+    pull_request_database
+        .execute(
+            "INSERT INTO repository_counter (repository_id, next_pull_request_number)
+             VALUES (?1, 2)
+             ON CONFLICT (repository_id)
+             DO UPDATE SET next_pull_request_number = 2",
+            [&repository_id],
+        )
+        .expect("advance the pull-request number fixture");
     drop(pull_request_database);
 
     let human_checkout = ssh_exec(ssh, &member_key, &["pr", "checkout", "bob/example", "1"]);
@@ -913,6 +1137,60 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
         machine_checkout["commands"]["fetch"],
         "git fetch origin refs/pull/1/head:refs/heads/pr-1"
     );
+    let listed_pull_requests = ssh_exec(
+        ssh,
+        &member_key,
+        &[
+            "pr",
+            "list",
+            "bob/example",
+            "--state",
+            "open",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(listed_pull_requests.status.success());
+    let listed_pull_requests: serde_json::Value =
+        serde_json::from_slice(&listed_pull_requests.stdout).expect("parse pull-request list");
+    assert_eq!(listed_pull_requests["version"], 1);
+    assert_eq!(listed_pull_requests["pull_requests"][0]["number"], 1);
+    let closed_pull_request = ssh_exec(ssh, &member_key, &["pr", "close", "bob/example", "1"]);
+    assert!(closed_pull_request.status.success());
+    assert_eq!(
+        String::from_utf8(closed_pull_request.stdout).expect("read pull-request close output"),
+        "Closed pull request bob/example#1.\n"
+    );
+    assert!(
+        ssh_exec(ssh, &member_key, &["pr", "reopen", "bob/example", "1"])
+            .status
+            .success()
+    );
+    let created_pull_request = ssh_exec_with_input(
+        ssh,
+        &member_key,
+        &[
+            "pr",
+            "create",
+            "bob/example",
+            "refs/heads/main",
+            "refs/heads/feature-two",
+            "--output",
+            "json",
+        ],
+        b"Second feature\nOpened through SSH.\n",
+    );
+    assert!(
+        created_pull_request.status.success(),
+        "pr create failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&created_pull_request.stdout),
+        String::from_utf8_lossy(&created_pull_request.stderr)
+    );
+    let created_pull_request: serde_json::Value =
+        serde_json::from_slice(&created_pull_request.stdout)
+            .expect("parse pull-request create output");
+    assert_eq!(created_pull_request["version"], 1);
+    assert_eq!(created_pull_request["pull_request"]["number"], 2);
     let checkout_clone = instance.path().join("pull-request-checkout");
     assert!(ssh_clone_repository_succeeds(
         ssh,
@@ -976,6 +1254,33 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
     assert_eq!(machine_issues["repository"]["name"], "example");
     assert_eq!(machine_issues["issues"][0]["number"], 1);
     assert_eq!(machine_issues["issues"][0]["title"], "First issue");
+    let issue_comment = ssh_exec_with_input(
+        ssh,
+        &member_key,
+        &["issue", "comment", "bob/example", "1", "--output", "json"],
+        b"A bounded SSH comment.",
+    );
+    assert!(issue_comment.status.success());
+    let issue_comment: serde_json::Value =
+        serde_json::from_slice(&issue_comment.stdout).expect("parse issue comment");
+    assert_eq!(issue_comment["operation"], "commented");
+    assert!(issue_comment["comment_id"].is_string());
+    assert!(
+        ssh_exec(ssh, &member_key, &["issue", "close", "bob/example", "1"])
+            .status
+            .success()
+    );
+    let reopened_issue = ssh_exec(
+        ssh,
+        &member_key,
+        &["issue", "reopen", "bob/example", "1", "--output", "json"],
+    );
+    assert!(reopened_issue.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&reopened_issue.stdout)
+            .expect("parse issue reopen")["operation"],
+        "reopened"
+    );
 
     let access_database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
         .expect("open the issue access database");
@@ -1015,6 +1320,17 @@ fn creates_owned_repositories_with_stable_ssh_command_output() {
         )
         .expect("give the administrator reader access");
     drop(access_database);
+    let denied_pull_request = ssh_exec(
+        ssh,
+        &private_key,
+        &["pr", "close", "bob/example", "1", "--output", "json"],
+    );
+    assert!(!denied_pull_request.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&denied_pull_request.stdout)
+            .expect("parse denied pull-request mutation")["error"]["code"],
+        "permission-denied"
+    );
     let reader_create = ssh_exec_with_input(
         ssh,
         &private_key,
@@ -1334,14 +1650,14 @@ fn enforces_account_roles_and_ref_policy_through_the_production_ssh_server() {
     git_commit(&writer_clone, "second writer update");
     assert!(git_push(&writer_key, &writer_clone, &["topic"]).success());
     assert!(git_push(&writer_key, &writer_clone, &["--delete", "topic"]).success());
-    assert!(!git_push(&writer_key, &writer_clone, &["HEAD:main"]).success());
+    assert!(!git_push(&writer_key, &writer_clone, &["HEAD:trunk"]).success());
     assert!(!git_push(&writer_key, &writer_clone, &["HEAD:refs/notes/test"]).success());
 
     let owner_clone = instance.path().join("owner-private");
     fs::write(owner_clone.join("owner.txt"), b"owner update\n").expect("write an owner change");
     git_commit(&owner_clone, "owner update");
-    assert!(git_push(&owner_key, &owner_clone, &["main"]).success());
-    assert!(!git_push(&owner_key, &owner_clone, &["--delete", "main"]).success());
+    assert!(git_push(&owner_key, &owner_clone, &["trunk"]).success());
+    assert!(!git_push(&owner_key, &owner_clone, &["--delete", "trunk"]).success());
     command(&owner_clone, ["switch", "-q", "-c", "force-test"]);
     fs::write(owner_clone.join("force.txt"), b"first history\n").expect("write a branch change");
     git_commit(&owner_clone, "first branch history");
@@ -1452,6 +1768,10 @@ fn create_source_repository(parent: &Path) -> std::path::PathBuf {
         .output()
         .expect("commit source content");
     assert!(output.status.success(), "Git commit failed");
+    command(&worktree, ["branch", "trunk"]);
+    command(&worktree, ["switch", "-q", "trunk"]);
+    fs::write(worktree.join("TRUNK.md"), b"trunk default\n").expect("write trunk content");
+    git_commit(&worktree, "trunk head");
     let bare = parent.join("source.git");
     command(
         parent,
@@ -1846,6 +2166,21 @@ fn provision_account(
         )
         .expect("create an SSH key fixture");
     private_key
+}
+
+fn ssh_fingerprint(private_key: &Path) -> String {
+    let output = Command::new("ssh-keygen")
+        .args(["-E", "sha256", "-lf"])
+        .arg(private_key.with_extension("pub"))
+        .output()
+        .expect("read an SSH key fingerprint");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("read a UTF-8 SSH key fingerprint")
+        .split_whitespace()
+        .nth(1)
+        .expect("read the SSH key fingerprint")
+        .to_owned()
 }
 
 fn git_commit(worktree: &Path, message: &str) {

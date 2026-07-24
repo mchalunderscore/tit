@@ -11,6 +11,9 @@
 {% endif %}
 
 {% if page_kind == "summary" %}
+{% if description != "" %}
+  <p class="repository-description">{{ description }}</p>
+{% endif %}
   <section aria-labelledby="clone-heading">
     <h2 id="clone-heading">Clone</h2>
     <dl>
@@ -112,6 +115,7 @@
 {% if page_kind == "commit" %}
   <article>
     <h2>Commit <code title="{{ commit.id }}">{{ commit.id|short_id }}</code></h2>
+    <p><a href="/{{ owner }}/{{ repository }}/commit/{{ commit.id }}.patch">Download patch</a></p>
     <dl>
       <dt>Author</dt><dd>{{ commit.author_name }} &lt;{{ commit.author_email }}&gt;</dd>
       <dt>Committed</dt><dd><time datetime="{{ commit.committed_at }}">{{ commit.committed_at|human_time }}</time></dd>

@@ -22,8 +22,9 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::auth::validate_username;
 use crate::domain::repository::validate_slug;
-use crate::feed::{FeedFormat, FeedPage, PAGE_SIZE, RepositoryFeedKind};
+use crate::feed::{FeedPage, PAGE_SIZE, RepositoryFeedKind};
 use crate::git::packetline::MAX_REQUEST_BYTES;
+use crate::git::patch::write_patch;
 use crate::git::read::{
     BlameHunk, CommitInfo, DiffFile, ReadCancellation, ReadError, ReadLimits,
     RepositoryReadService, SearchOutcome, TreeEntryInfo,
@@ -242,14 +243,14 @@ impl PublicWeb {
         owner: String,
         repository: String,
         id: ObjectId,
-    ) -> Result<Body, RouteError> {
-        let path = self
+    ) -> Result<(bool, Body), RouteError> {
+        let (is_public, path) = self
             .path_job(actor, owner, repository, move |record, path| {
                 require_id_format(id, &record)?;
                 let service = RepositoryReadService::open(&path, ReadLimits::default())?;
                 let cancellation = ReadCancellation::default();
                 service.commit(id, &cancellation)?;
-                Ok(path)
+                Ok((record.visibility == "public", path))
             })
             .await?;
         let permit = self
@@ -272,7 +273,7 @@ impl PublicWeb {
                 let _ = sender.blocking_send(Err(std::io::Error::other(error.to_string())));
             }
         });
-        Ok(Body::from_stream(ReceiverStream::new(receiver)))
+        Ok((is_public, Body::from_stream(ReceiverStream::new(receiver))))
     }
 }
 
@@ -284,12 +285,7 @@ pub(super) fn routes() -> Router<WebState> {
             post(git_upload_pack).layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)),
         )
         .route("/{owner}/{repository}/refs", get(refs))
-        .route("/{owner}/{repository}/atom.xml", get(atom_feed))
         .route("/{owner}/{repository}/rss.xml", get(rss_feed))
-        .route(
-            "/{owner}/{repository}/issues/atom.xml",
-            get(issue_atom_feed),
-        )
         .route("/{owner}/{repository}/issues/rss.xml", get(issue_rss_feed))
         .route("/{owner}/{repository}/search", get(search))
         .route("/{owner}/{repository}/commits", get(commits))
@@ -302,26 +298,6 @@ pub(super) fn routes() -> Router<WebState> {
         .route("/{owner}/{repository}/blame/{commit}/{*path}", get(blame))
         .route("/{owner}/{repository}/archive/{archive}", get(archive))
         .route("/{owner}/{repository}", get(summary))
-}
-
-async fn atom_feed(
-    State(state): State<WebState>,
-    Extension(request_id): Extension<RequestId>,
-    Extension(actor): Extension<RequestActor>,
-    AxumPath(path): AxumPath<RepositoryPath>,
-    Query(query): Query<FeedQuery>,
-    headers: HeaderMap,
-) -> Response {
-    feed_response(
-        state,
-        request_id,
-        actor,
-        path,
-        query,
-        headers,
-        (FeedFormat::Atom, RepositoryFeedKind::Activity),
-    )
-    .await
 }
 
 async fn rss_feed(
@@ -339,27 +315,7 @@ async fn rss_feed(
         path,
         query,
         headers,
-        (FeedFormat::Rss, RepositoryFeedKind::Activity),
-    )
-    .await
-}
-
-async fn issue_atom_feed(
-    State(state): State<WebState>,
-    Extension(request_id): Extension<RequestId>,
-    Extension(actor): Extension<RequestActor>,
-    AxumPath(path): AxumPath<RepositoryPath>,
-    Query(query): Query<FeedQuery>,
-    headers: HeaderMap,
-) -> Response {
-    feed_response(
-        state,
-        request_id,
-        actor,
-        path,
-        query,
-        headers,
-        (FeedFormat::Atom, RepositoryFeedKind::Issues),
+        RepositoryFeedKind::Activity,
     )
     .await
 }
@@ -379,7 +335,7 @@ async fn issue_rss_feed(
         path,
         query,
         headers,
-        (FeedFormat::Rss, RepositoryFeedKind::Issues),
+        RepositoryFeedKind::Issues,
     )
     .await
 }
@@ -391,9 +347,8 @@ async fn feed_response(
     path: RepositoryPath,
     query: FeedQuery,
     headers: HeaderMap,
-    feed: (FeedFormat, RepositoryFeedKind),
+    kind: RepositoryFeedKind,
 ) -> Response {
-    let (format, kind) = feed;
     if matches!(query.before, Some(before) if before <= 0) {
         return route_error(RouteError::InvalidRequest, &request_id.0);
     }
@@ -420,10 +375,7 @@ async fn feed_response(
     let next_before = has_next
         .then(|| events.last().map(|event| event.sequence))
         .flatten();
-    let name = match format {
-        FeedFormat::Atom => "atom.xml",
-        FeedFormat::Rss => "rss.xml",
-    };
+    let name = "rss.xml";
     let feed_url = format!("{}/{owner}/{repository}/{name}", web.http_clone_base);
     let self_url = query.before.map_or_else(
         || feed_url.clone(),
@@ -443,12 +395,12 @@ async fn feed_response(
         next_before,
         kind,
     })
-    .render(format)
+    .render()
     {
         Ok(body) => body,
         Err(_) => return route_error(RouteError::Internal, &request_id.0),
     };
-    conditional_feed(&headers, name, body, newest, record.visibility == "public")
+    conditional_feed(&headers, body, newest, record.visibility == "public")
 }
 
 async fn summary(
@@ -468,17 +420,21 @@ async fn summary(
     };
     let signed_in = actor.0.is_some();
     let clone_urls = web.clone_urls(&path.owner, &path.repository);
+    let database = web.database.clone();
     let result = web
         .read(
             actor.0,
             path.owner,
             path.repository,
             move |record, service| {
+                let description = Store::open(&database)?.repository_description(&record.id)?;
                 let cancellation = ReadCancellation::default();
                 let references = service.references(&cancellation)?;
+                let default_branch = Store::open(&database)?
+                    .repository_default_branch(&record.owner, &record.slug)?;
                 let head = references
                     .iter()
-                    .find(|reference| reference.name == b"HEAD")
+                    .find(|reference| reference.name == default_branch.as_bytes())
                     .map(|reference| reference.target);
                 let (history, readme) = match head {
                     Some(head) => (
@@ -489,6 +445,7 @@ async fn summary(
                 };
                 Ok(RepositoryPage::summary(
                     record,
+                    description,
                     clone_urls,
                     head,
                     history,
@@ -536,6 +493,7 @@ async fn commits(
         return route_error(RouteError::NotFound, &request_id.0);
     };
     let signed_in = actor.0.is_some();
+    let database = web.database.clone();
     let page = query.page.unwrap_or(1);
     if page == 0 {
         return route_error(RouteError::InvalidRequest, &request_id.0);
@@ -548,9 +506,11 @@ async fn commits(
             move |record, service| {
                 let cancellation = ReadCancellation::default();
                 let references = service.references(&cancellation)?;
+                let default_branch = Store::open(&database)?
+                    .repository_default_branch(&record.owner, &record.slug)?;
                 let head = references
                     .iter()
-                    .find(|reference| reference.name == b"HEAD")
+                    .find(|reference| reference.name == default_branch.as_bytes())
                     .map(|reference| reference.target);
                 let history = match head {
                     Some(head) => service.history(head, &cancellation)?,
@@ -579,6 +539,7 @@ async fn search(
         return route_error(RouteError::InvalidRequest, &request_id.0);
     }
     let signed_in = actor.0.is_some();
+    let database = web.database.clone();
     let result = web
         .read(
             actor.0,
@@ -587,7 +548,10 @@ async fn search(
             move |record, service| {
                 let cancellation = ReadCancellation::default();
                 let references = service.references(&cancellation)?;
-                let selected = select_search_ref(&references, query.reference.as_deref())?;
+                let default_branch = Store::open(&database)?
+                    .repository_default_branch(&record.owner, &record.slug)?;
+                let selected =
+                    select_search_ref(&references, query.reference.as_deref(), &default_branch)?;
                 let outcome = match (&query.query, selected.as_ref()) {
                     (Some(query), Some((_, commit))) => {
                         Some(service.search(*commit, query.as_bytes(), &cancellation)?)
@@ -614,6 +578,9 @@ async fn commit(
     Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<CommitPath>,
 ) -> Response {
+    if path.commit.ends_with(".patch") {
+        return commit_patch(state, request_id, actor, path).await;
+    }
     let Some(web) = state.public else {
         return route_error(RouteError::NotFound, &request_id.0);
     };
@@ -636,6 +603,52 @@ async fn commit(
         )
         .await;
     render_page(result, &request_id.0, signed_in)
+}
+
+async fn commit_patch(
+    state: WebState,
+    request_id: RequestId,
+    actor: RequestActor,
+    path: CommitPath,
+) -> Response {
+    let Some(commit) = path.commit.strip_suffix(".patch") else {
+        return route_error(RouteError::NotFound, &request_id.0);
+    };
+    let id = match parse_id(commit) {
+        Ok(id) => id,
+        Err(error) => return route_error(error, &request_id.0),
+    };
+    let Some(web) = state.public else {
+        return route_error(RouteError::NotFound, &request_id.0);
+    };
+    let result = web
+        .read(
+            actor.0,
+            path.owner,
+            path.repository,
+            move |record, service| {
+                require_id_format(id, &record)?;
+                let files = service.commit_diff(id, &ReadCancellation::default())?;
+                Ok((record.visibility == "public", files))
+            },
+        )
+        .await;
+    let (is_public, files) = match result {
+        Ok(result) => result,
+        Err(error) => return route_error(error, &request_id.0),
+    };
+    let body = match stream_patch(state.jobs.clone(), files).await {
+        Ok(body) => body,
+        Err(()) => return route_error(RouteError::Unavailable, &request_id.0),
+    };
+    patch_response(
+        body,
+        &format!(
+            "{}.patch",
+            id.to_string().chars().take(12).collect::<String>()
+        ),
+        is_public,
+    )
 }
 
 async fn diff(
@@ -860,10 +873,17 @@ async fn archive(
     };
     let result = web.archive(actor.0, path.owner, path.repository, id).await;
     match result {
-        Ok(body) => Response::builder()
+        Ok((is_public, body)) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/x-tar")
-            .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+            .header(
+                header::CACHE_CONTROL,
+                if is_public {
+                    "public, max-age=31536000, immutable"
+                } else {
+                    "private, no-store"
+                },
+            )
             .header(
                 header::CONTENT_DISPOSITION,
                 HeaderValue::from_static("attachment; filename=repository.tar"),
@@ -993,7 +1013,6 @@ fn render_page(
 
 pub(super) fn conditional_feed(
     headers: &HeaderMap,
-    name: &str,
     body: String,
     timestamp: i64,
     is_public: bool,
@@ -1019,11 +1038,7 @@ pub(super) fn conditional_feed(
     } else {
         StatusCode::OK
     };
-    let content_type = if name == "atom.xml" {
-        "application/atom+xml; charset=utf-8"
-    } else {
-        "application/rss+xml; charset=utf-8"
-    };
+    let content_type = "application/rss+xml; charset=utf-8";
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
@@ -1247,6 +1262,36 @@ struct ChannelWriter<'a> {
     sender: &'a mpsc::Sender<Result<Bytes, std::io::Error>>,
 }
 
+pub(super) async fn stream_patch(jobs: Arc<Semaphore>, files: Vec<DiffFile>) -> Result<Body, ()> {
+    let permit = jobs.acquire_owned().await.map_err(|_| ())?;
+    let (sender, receiver) = mpsc::channel(8);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if let Err(error) = write_patch(&files, &mut ChannelWriter { sender: &sender }) {
+            let _ = sender.blocking_send(Err(std::io::Error::other(error.to_string())));
+        }
+    });
+    Ok(Body::from_stream(ReceiverStream::new(receiver)))
+}
+
+pub(super) fn patch_response(body: Body, filename: &str, is_public: bool) -> Response {
+    let disposition = format!("attachment; filename=\"{filename}\"");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/x-diff; charset=utf-8")
+        .header(
+            header::CACHE_CONTROL,
+            if is_public {
+                "public, max-age=31536000, immutable"
+            } else {
+                "private, no-store"
+            },
+        )
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .body(body)
+        .expect("the patch response is valid")
+}
+
 impl Write for ChannelWriter<'_> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         self.sender
@@ -1327,6 +1372,7 @@ struct RepositoryPage {
     owner: String,
     repository: String,
     created_at: i64,
+    description: String,
     page_title: String,
     page_kind: &'static str,
     commit_id: String,
@@ -1370,6 +1416,7 @@ impl RepositoryPage {
             owner: record.owner,
             repository: record.slug,
             created_at: record.created_at,
+            description: String::new(),
             page_title: title,
             page_kind,
             commit_id: String::new(),
@@ -1408,6 +1455,7 @@ impl RepositoryPage {
 
     fn summary(
         record: RepositoryRecord,
+        description: String,
         clone_urls: (String, String),
         head: Option<ObjectId>,
         history: Vec<CommitInfo>,
@@ -1415,6 +1463,7 @@ impl RepositoryPage {
     ) -> Self {
         let title = format!("{}/{}", record.owner, record.slug);
         let mut page = Self::base(record, "summary", title);
+        page.description = description;
         page.http_clone_url = clone_urls.0;
         page.ssh_clone_url = clone_urls.1;
         page.has_head = head.is_some();
@@ -1797,6 +1846,7 @@ impl From<ReadError> for RouteError {
 fn select_search_ref(
     references: &[crate::git::read::RefInfo],
     requested: Option<&str>,
+    default_branch: &str,
 ) -> Result<Option<(Vec<u8>, ObjectId)>, RouteError> {
     if requested.is_some_and(|name| name.is_empty() || name.len() > 4096) {
         return Err(RouteError::InvalidRequest);
@@ -1808,7 +1858,7 @@ fn select_search_ref(
             .ok_or(RouteError::NotFound)?,
         None => match references
             .iter()
-            .find(|reference| reference.name == b"HEAD")
+            .find(|reference| reference.name == default_branch.as_bytes())
         {
             Some(reference) => reference,
             None => match references.iter().find(|reference| {

@@ -12,6 +12,7 @@ use crate::pull_request::PullRequestError;
 use crate::store::StoreError;
 
 use super::filters;
+use super::public::{patch_response, stream_patch};
 use super::{
     CSRF_COOKIE, RequestActor, RequestId, WebState, authenticate_mutation, cookie,
     parse_named_form, render, render_error,
@@ -34,6 +35,18 @@ pub(super) fn routes() -> Router<WebState> {
             post(revise_pull_request),
         )
         .route(
+            "/{owner}/{repository}/pulls/{number}/revisions/{revision}",
+            get(download_revision_patch),
+        )
+        .route(
+            "/{owner}/{repository}/pulls/{number}/edit",
+            post(edit_pull_request),
+        )
+        .route(
+            "/{owner}/{repository}/pulls/{number}/state",
+            post(change_pull_request_state),
+        )
+        .route(
             "/{owner}/{repository}/pulls/{number}/reviews",
             post(create_review),
         )
@@ -44,11 +57,61 @@ pub(super) fn routes() -> Router<WebState> {
         .layer(DefaultBodyLimit::max(MAX_PULL_REQUEST_BYTES))
 }
 
+async fn download_revision_patch(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
+    Path(path): Path<PullRequestRevisionPath>,
+) -> Response {
+    let Some(service) = state.pull_requests.clone() else {
+        return internal(&request_id.0);
+    };
+    let Some(revision) = path.revision.strip_suffix(".patch") else {
+        return bad_request(&request_id.0);
+    };
+    let Ok(revision) = revision.parse::<i64>() else {
+        return bad_request(&request_id.0);
+    };
+    let owner = path.owner.clone();
+    let repository = path.repository.clone();
+    let number = path.number;
+    let result = job(state.clone(), move || {
+        service.compare_page(
+            &owner,
+            &repository,
+            number,
+            Some(revision),
+            actor.0.as_deref(),
+            1,
+            1,
+        )
+    })
+    .await;
+    let comparison = match result {
+        Ok(comparison) => comparison,
+        Err(error) => return read_error(error, &request_id.0),
+    };
+    let is_public = comparison.detail.repository.visibility == "public";
+    let body = match stream_patch(state.jobs.clone(), comparison.comparison.files).await {
+        Ok(body) => body,
+        Err(()) => return internal(&request_id.0),
+    };
+    patch_response(
+        body,
+        &format!(
+            "{}-{}-pr-{}-revision-{}.patch",
+            path.owner, path.repository, path.number, revision
+        ),
+        is_public,
+    )
+}
+
 async fn pull_request_list(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
     Extension(actor): Extension<RequestActor>,
     Path(path): Path<RepositoryPath>,
+    Query(query): Query<ListQuery>,
     headers: HeaderMap,
 ) -> Response {
     let Some(service) = state.pull_requests.clone() else {
@@ -59,12 +122,21 @@ async fn pull_request_list(
     let signed_in = actor.0.is_some();
     let actor_name = actor.0;
     let actor_for_list = actor_name.clone();
+    let state_filter = query.state.unwrap_or_else(|| "open".to_owned());
+    let page_number = query.page.unwrap_or(1);
+    let state_for_job = state_filter.clone();
     let result = job(state.clone(), move || {
-        service.list(&owner, &repository, actor_for_list.as_deref())
+        service.list_page(
+            &owner,
+            &repository,
+            actor_for_list.as_deref(),
+            &state_for_job,
+            page_number,
+        )
     })
     .await;
     match result {
-        Ok((record, pull_requests, can_create)) => {
+        Ok((record, page, can_create)) => {
             let csrf = cookie(&headers, CSRF_COOKIE).unwrap_or_default();
             let branches = match state.public.as_ref() {
                 Some(public) => public
@@ -73,6 +145,13 @@ async fn pull_request_list(
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
+            let default_owner = record.owner.clone();
+            let default_repository = record.slug.clone();
+            let default_branch = super::repository_job(state, move |repositories| {
+                repositories.default_branch(&default_owner, &default_repository)
+            })
+            .await
+            .unwrap_or_else(|_| "refs/heads/main".to_owned());
             render(
                 StatusCode::OK,
                 &PullRequestListTemplate {
@@ -80,7 +159,8 @@ async fn pull_request_list(
                     signed_in,
                     owner: &record.owner,
                     repository: &record.slug,
-                    pull_requests: pull_requests
+                    pull_requests: page
+                        .items
                         .iter()
                         .map(|pull_request| PullRequestListItem {
                             number: pull_request.number,
@@ -93,6 +173,16 @@ async fn pull_request_list(
                     csrf: &csrf,
                     can_create: can_create && !csrf.is_empty(),
                     branches,
+                    default_branch: &default_branch,
+                    state: &state_filter,
+                    state_all: state_filter == "all",
+                    state_open: state_filter == "open",
+                    state_closed: state_filter == "closed",
+                    state_merged: state_filter == "merged",
+                    has_previous: page.page > 1,
+                    has_next: page.has_next,
+                    previous_page: page.page.saturating_sub(1),
+                    next_page: page.page.saturating_add(1),
                 },
             )
         }
@@ -115,12 +205,14 @@ async fn pull_request_detail(
     let repository = path.repository.clone();
     let signed_in = actor.0.is_some();
     let result = job(state, move || {
-        service.compare(
+        service.compare_page(
             &owner,
             &repository,
             path.number,
             query.revision,
             actor.0.as_deref(),
+            query.reviews_page.unwrap_or(1),
+            query.timeline_page.unwrap_or(1),
         )
     })
     .await;
@@ -184,10 +276,87 @@ async fn pull_request_detail(
                     can_merge: detail.can_merge
                         && !csrf.is_empty()
                         && result.revision.number == pull_request_revision(detail),
+                    can_edit: detail.can_edit && !csrf.is_empty(),
+                    can_change_state: detail.can_change_state && !csrf.is_empty(),
+                    is_open: pull_request.state == "open",
+                    reviews_page: detail.reviews_page,
+                    reviews_has_previous: detail.reviews_page > 1,
+                    reviews_has_next: detail.reviews_has_next,
+                    reviews_previous_page: detail.reviews_page.saturating_sub(1),
+                    reviews_next_page: detail.reviews_page.saturating_add(1),
+                    timeline_page: detail.timeline_page,
+                    timeline_has_previous: detail.timeline_page > 1,
+                    timeline_has_next: detail.timeline_has_next,
+                    timeline_previous_page: detail.timeline_page.saturating_sub(1),
+                    timeline_next_page: detail.timeline_page.saturating_add(1),
                 },
             )
         }
         Err(error) => read_error(error, &request_id.0),
+    }
+}
+
+async fn edit_pull_request(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(path): Path<PullRequestPath>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "title", "body"]) {
+        Ok(fields) => fields,
+        Err(()) => return bad_request(&request_id.0),
+    };
+    let actor =
+        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
+            Ok(actor) => actor,
+            Err(response) => return response,
+        };
+    let Some(service) = state.pull_requests.clone() else {
+        return internal(&request_id.0);
+    };
+    let owner = path.owner.clone();
+    let repository = path.repository.clone();
+    let number = path.number;
+    let result = job(state, move || {
+        service.edit(&owner, &repository, number, &actor, &fields[1], &fields[2])
+    })
+    .await;
+    match result {
+        Ok(()) => redirect(&path.owner, &path.repository, path.number),
+        Err(error) => mutation_error(error, &request_id.0),
+    }
+}
+
+async fn change_pull_request_state(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(path): Path<PullRequestPath>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "state"]) {
+        Ok(fields) => fields,
+        Err(()) => return bad_request(&request_id.0),
+    };
+    let actor =
+        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
+            Ok(actor) => actor,
+            Err(response) => return response,
+        };
+    let Some(service) = state.pull_requests.clone() else {
+        return internal(&request_id.0);
+    };
+    let owner = path.owner.clone();
+    let repository = path.repository.clone();
+    let number = path.number;
+    let result = job(state, move || {
+        service.set_state(&owner, &repository, number, &actor, &fields[1])
+    })
+    .await;
+    match result {
+        Ok(()) => redirect(&path.owner, &path.repository, path.number),
+        Err(error) => mutation_error(error, &request_id.0),
     }
 }
 
@@ -399,6 +568,7 @@ fn read_error(error: PullRequestError, request_id: &str) -> Response {
             "The pull request was not found.",
         ),
         PullRequestError::Number
+        | PullRequestError::State
         | PullRequestError::Revision
         | PullRequestError::Auth(_)
         | PullRequestError::RepositoryName(_) => bad_request(request_id),
@@ -429,6 +599,7 @@ fn mutation_error(error: PullRequestError, request_id: &str) -> Response {
         | PullRequestError::Body
         | PullRequestError::Branch
         | PullRequestError::Number
+        | PullRequestError::State
         | PullRequestError::Unchanged
         | PullRequestError::Revision
         | PullRequestError::ReviewKind
@@ -514,9 +685,25 @@ struct PullRequestPath {
     number: i64,
 }
 
+#[derive(Clone, Deserialize)]
+struct PullRequestRevisionPath {
+    owner: String,
+    repository: String,
+    number: i64,
+    revision: String,
+}
+
 #[derive(Clone, Default, Deserialize)]
 struct RevisionQuery {
     revision: Option<i64>,
+    reviews_page: Option<usize>,
+    timeline_page: Option<usize>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct ListQuery {
+    state: Option<String>,
+    page: Option<usize>,
 }
 
 #[derive(Template)]
@@ -530,6 +717,16 @@ struct PullRequestListTemplate<'a> {
     csrf: &'a str,
     can_create: bool,
     branches: Vec<String>,
+    default_branch: &'a str,
+    state: &'a str,
+    state_all: bool,
+    state_open: bool,
+    state_closed: bool,
+    state_merged: bool,
+    has_previous: bool,
+    has_next: bool,
+    previous_page: usize,
+    next_page: usize,
 }
 
 struct PullRequestListItem<'a> {
@@ -558,6 +755,19 @@ struct PullRequestTemplate<'a> {
     can_revise: bool,
     can_review: bool,
     can_merge: bool,
+    can_edit: bool,
+    can_change_state: bool,
+    is_open: bool,
+    reviews_page: usize,
+    reviews_has_previous: bool,
+    reviews_has_next: bool,
+    reviews_previous_page: usize,
+    reviews_next_page: usize,
+    timeline_page: usize,
+    timeline_has_previous: bool,
+    timeline_has_next: bool,
+    timeline_previous_page: usize,
+    timeline_next_page: usize,
 }
 
 struct ReviewView<'a> {

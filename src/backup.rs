@@ -859,6 +859,50 @@ mod tests {
     #[test]
     fn creates_and_restores_a_private_offline_backup() {
         let (instance, config) = source_instance();
+        let mut store =
+            Store::open(&instance.path().join(DATABASE_FILE)).expect("open the source database");
+        store
+            .create_initial_administrator(&crate::store::InitialAdministrator {
+                username: "alice",
+                canonical_key: "ssh-ed25519 AAAAbackup",
+                fingerprint: "SHA256:backup",
+                recovery_hash: &[7; 32],
+                created_at: 1,
+            })
+            .expect("create a backup account");
+        let repository_id = "00112233445566778899aabbccddeeff";
+        store
+            .create_repository(&crate::store::NewRepository {
+                id: repository_id,
+                owner: "alice",
+                slug: "before",
+                object_format: "sha1",
+                default_branch: "refs/heads/main",
+                created_at: 2,
+                origin: crate::store::RepositoryOrigin::Created,
+                initial_references: &[],
+                actor: "alice",
+                correlation_id: "backup-create",
+            })
+            .expect("create a backup repository");
+        store
+            .rename_repository_for_owner("alice", "before", "after", "alice", 3, "backup-rename")
+            .expect("rename the backup repository");
+        store
+            .archive_repository_for_actor("alice", "after", "alice", 4, "backup-archive")
+            .expect("archive the backup repository");
+        store
+            .unarchive_repository_for_owner("alice", "after", "alice", 5, "backup-unarchive")
+            .expect("unarchive the backup repository");
+        drop(store);
+        crate::git::repository::GitRepository::create_bare(
+            &instance
+                .path()
+                .join(REPOSITORY_DIRECTORY)
+                .join(format!("{repository_id}.git")),
+            gix::hash::Kind::Sha1,
+        )
+        .expect("create the backup repository directory");
         let output_directory = private_directory();
         let archive = output_directory.path().join("instance.tar");
         create_offline(instance.path(), &config, &archive).expect("create a backup");
@@ -879,6 +923,12 @@ mod tests {
             fs::read(config).expect("read the source configuration")
         );
         crate::store::doctor(target.path()).expect("check the restored database");
+        let restored = Store::open(&target.path().join(DATABASE_FILE))
+            .expect("open the restored lifecycle database")
+            .repository("alice", "after")
+            .expect("read the restored lifecycle repository");
+        assert_eq!(restored.state, "active");
+        assert_eq!(restored.archived_at, None);
     }
 
     #[test]

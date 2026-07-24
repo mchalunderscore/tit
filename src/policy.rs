@@ -40,15 +40,13 @@ impl RepositoryPolicy {
         ref_name: &[u8],
         change: RefChange,
     ) -> Result<RepositoryRecord, PolicyError> {
-        let record = Store::open(&self.database)?.repository_authorization(
-            owner,
-            repository,
-            Some(actor),
-        )?;
+        let store = Store::open(&self.database)?;
+        let record = store.repository_authorization(owner, repository, Some(actor))?;
         if !allows(&record, RepositoryOperation::Write)? {
             return Err(PolicyError::Denied);
         }
-        let protected = ref_name == b"refs/heads/main";
+        let default_branch = store.repository_default_branch(owner, repository)?;
+        let protected = ref_name == default_branch.as_bytes();
         if matches!(change, RefChange::Force)
             || (protected && matches!(change, RefChange::Delete))
             || (protected && !allows(&record, RepositoryOperation::Maintain)?)

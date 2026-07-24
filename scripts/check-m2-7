@@ -1,7 +1,0 @@
-#!/bin/sh
-set -eu
-
-./scripts/check
-cargo test --locked --release --test sqlite creates_renames_archives_and_reads_owned_repositories
-cargo test --locked --release --test sqlite backfills_repository_events_when_version_five_is_migrated
-cargo test --locked --release --test public_routes browses_and_clones_public_repositories_for_both_hash_formats

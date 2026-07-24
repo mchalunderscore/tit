@@ -41,6 +41,7 @@ use std::process::Command;
 use http::RunningGitHttpServer;
 use tempfile::TempDir;
 use transport::GitRepositories;
+use upload_pack::{ProtocolVersion, UploadPack, UploadPackError};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stock_git_clones_and_fetches_both_hash_formats_over_smart_http() {
@@ -177,6 +178,40 @@ async fn rejects_invalid_http_routes_and_oversized_requests() {
     );
     assert!(oversized.starts_with(b"HTTP/1.1 413"));
     server.shutdown().await.expect("stop the Git HTTP server");
+}
+
+#[test]
+fn upload_pack_deduplicates_and_limits_negotiation_ids() {
+    let directory = TempDir::new().expect("create an upload-pack fixture directory");
+    let worktree = directory.path().join("worktree");
+    let bare = directory.path().join("repository.git");
+    create_fixture(&worktree, &bare, "sha1");
+    let head = rev_parse(&bare, "refs/heads/main");
+    let service = UploadPack::open(&bare).expect("open upload-pack");
+
+    let mut duplicate = Vec::new();
+    for _ in 0..512 {
+        packetline::encode_data(format!("want {head}\n").as_bytes(), &mut duplicate)
+            .expect("encode a duplicate want");
+    }
+    packetline::encode_data(b"done\n", &mut duplicate).expect("encode done");
+    packetline::encode_flush(&mut duplicate);
+    let response = service
+        .respond(ProtocolVersion::V1, &duplicate)
+        .expect("deduplicate negotiation IDs");
+    assert!(response.windows(4).any(|window| window == b"PACK"));
+
+    let mut excessive = Vec::new();
+    for value in 1_u64..=257 {
+        packetline::encode_data(format!("want {value:040x}\n").as_bytes(), &mut excessive)
+            .expect("encode a distinct want");
+    }
+    packetline::encode_data(b"done\n", &mut excessive).expect("encode done");
+    packetline::encode_flush(&mut excessive);
+    assert!(matches!(
+        service.respond(ProtocolVersion::V1, &excessive),
+        Err(UploadPackError::NegotiationLimit)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

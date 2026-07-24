@@ -10,10 +10,12 @@ _tit()
     'inspect:Show one typed instance record as JSON'
     'dump:Write all SQLite rows as deterministic JSON Lines'
     'repair:Run an explicit repair operation'
+    'maintenance:Prune old terminal records and compact the database'
     'backup:Create a backup archive'
     'restore:Restore a backup archive to an empty instance directory'
     'setup:Set up an uninitialized instance'
     'admin:Run an offline administrator command'
+    'help:Print help for a command'
   )
 
   _arguments \
@@ -36,6 +38,7 @@ _tit()
     arguments)
       case $words[1] in
         backup|restore) _files ;;
+        maintenance) _arguments '--retention-days[Set the retention period]:days:' ;;
       esac
       ;;
   esac

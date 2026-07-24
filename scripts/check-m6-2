@@ -1,7 +1,0 @@
-#!/bin/sh
-set -eu
-
-./scripts/check
-cargo test --locked --release --bin tit backup::tests
-cargo test --locked --release --bin tit control::tests::online_backup_waits_for_a_git_mutation
-cargo test --locked --release --test serve serves_an_imported_repository_through_http_and_ssh

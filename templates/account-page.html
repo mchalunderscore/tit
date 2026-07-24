@@ -8,6 +8,24 @@
     <dt>Administrator</dt>
     <dd>{% if administrator %}Yes{% else %}No{% endif %}</dd>
   </dl>
+  <div class="two-column">
+  <section>
+  <h2>Public profile</h2>
+  <p><a href="/{{ username }}">View your public profile</a></p>
+  <form action="/account/profile" method="post">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="field">
+      <label for="profile-bio">Bio</label>
+      <textarea id="profile-bio" name="bio" maxlength="512" rows="5">{{ bio }}</textarea>
+    </div>
+    <div class="field">
+      <label for="profile-email">Public contact email</label>
+      <input id="profile-email" type="email" name="contact-email" maxlength="254" value="{{ contact_email }}">
+    </div>
+    <button type="submit">Save profile</button>
+  </form>
+  </section>
+  <section>
   <h2>Create repository</h2>
   <form action="/account/repositories" method="post">
     <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -21,4 +39,62 @@
   <p><a href="/feeds">Manage private feed tokens</a></p>
   <h2>Sessions</h2>
   <p><a href="/logout">Log out all sessions</a></p>
+  </section>
+  </div>
+  <section>
+  <h2>SSH keys</h2>
+  <div class="table-scroll">
+  <table>
+    <thead>
+      <tr>
+        <th>Label</th>
+        <th>Fingerprint</th>
+        <th>Created</th>
+        <th>Last used</th>
+        <th>State</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for key in keys %}
+      <tr>
+        <td>{{ key.label }}</td>
+        <td><code>{{ key.fingerprint }}</code></td>
+        <td>{{ key.created_at }}</td>
+        <td>{{ key.last_used_at }}</td>
+        <td>{% if key.active %}Active{% else %}Revoked{% endif %}</td>
+        <td>
+        {% if key.active %}
+          {% if active_key_count > 1 %}
+          <form action="/account/keys/revoke" method="post">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="fingerprint" value="{{ key.fingerprint }}">
+            <button type="submit">Revoke</button>
+          </form>
+          {% else %}
+          Final active key
+          {% endif %}
+        {% else %}
+          —
+        {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <h3>Add SSH key</h3>
+  <form action="/account/keys/add" method="post">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="field">
+      <label for="key-label">Label</label>
+      <input id="key-label" name="label" required maxlength="80">
+    </div>
+    <div class="field">
+      <label for="public-key">SSH public key</label>
+      <textarea id="public-key" name="public-key" required rows="4"></textarea>
+    </div>
+    <button type="submit">Add key</button>
+  </form>
+  </section>
 {% endblock %}

@@ -18,12 +18,11 @@ pub(super) enum EventKind {
     IssueCommented,
     IssueClosed,
     IssueReopened,
-    IssueLabeled,
-    IssueUnlabeled,
-    IssueAssigned,
-    IssueUnassigned,
     PullRequestCreated,
     PullRequestRevised,
+    PullRequestEdited,
+    PullRequestClosed,
+    PullRequestReopened,
     PullRequestCommented,
     PullRequestLineCommented,
     PullRequestApproved,
@@ -48,18 +47,45 @@ impl EventKind {
             Self::IssueCommented => "issue-commented",
             Self::IssueClosed => "issue-closed",
             Self::IssueReopened => "issue-reopened",
-            Self::IssueLabeled => "issue-labeled",
-            Self::IssueUnlabeled => "issue-unlabeled",
-            Self::IssueAssigned => "issue-assigned",
-            Self::IssueUnassigned => "issue-unassigned",
             Self::PullRequestCreated => "pull-request-created",
             Self::PullRequestRevised => "pull-request-revised",
+            Self::PullRequestEdited => "pull-request-edited",
+            Self::PullRequestClosed => "pull-request-closed",
+            Self::PullRequestReopened => "pull-request-reopened",
             Self::PullRequestCommented => "pull-request-commented",
             Self::PullRequestLineCommented => "pull-request-line-commented",
             Self::PullRequestApproved => "pull-request-approved",
             Self::PullRequestChangesRequested => "pull-request-changes-requested",
             Self::PullRequestMerged => "pull-request-merged",
         }
+    }
+}
+
+pub(super) fn pull_request_change(
+    kind: EventKind,
+    pull_request_id: &str,
+    number: i64,
+    title: &str,
+    body: &str,
+    state: &str,
+) -> VersionedEvent {
+    debug_assert!(matches!(
+        kind,
+        EventKind::PullRequestEdited
+            | EventKind::PullRequestClosed
+            | EventKind::PullRequestReopened
+    ));
+    VersionedEvent {
+        kind,
+        payload: json!({
+            "version": PAYLOAD_VERSION,
+            "pull_request_id": pull_request_id,
+            "number": number,
+            "title": title,
+            "body": body,
+            "state": state,
+        })
+        .to_string(),
     }
 }
 
@@ -292,52 +318,6 @@ pub(super) fn issue_state(
             "issue_id": issue_id,
             "number": number,
             "state": state,
-        })
-        .to_string(),
-    }
-}
-
-pub(super) fn issue_label(
-    kind: EventKind,
-    issue_id: &str,
-    number: i64,
-    label_id: &str,
-    label: &str,
-) -> VersionedEvent {
-    debug_assert!(matches!(
-        kind,
-        EventKind::IssueLabeled | EventKind::IssueUnlabeled
-    ));
-    VersionedEvent {
-        kind,
-        payload: json!({
-            "version": PAYLOAD_VERSION,
-            "issue_id": issue_id,
-            "number": number,
-            "label_id": label_id,
-            "label": label,
-        })
-        .to_string(),
-    }
-}
-
-pub(super) fn issue_assignee(
-    kind: EventKind,
-    issue_id: &str,
-    number: i64,
-    assignee: &str,
-) -> VersionedEvent {
-    debug_assert!(matches!(
-        kind,
-        EventKind::IssueAssigned | EventKind::IssueUnassigned
-    ));
-    VersionedEvent {
-        kind,
-        payload: json!({
-            "version": PAYLOAD_VERSION,
-            "issue_id": issue_id,
-            "number": number,
-            "assignee": assignee,
         })
         .to_string(),
     }

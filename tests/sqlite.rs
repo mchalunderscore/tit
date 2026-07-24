@@ -11,8 +11,8 @@ use std::{env, ffi::OsString, fs};
 
 use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
 use store::{
-    GitOperationIntent, InitialAdministrator, IssueChange, NewAuditEvent, NewIssue, NewRepository,
-    NewRepositoryReference, RepositoryOrigin, Store, StoreError, WatchPreferences,
+    AuditContext, GitOperationIntent, InitialAdministrator, IssueChange, NewAuditEvent, NewIssue,
+    NewRepository, NewRepositoryReference, RepositoryOrigin, Store, StoreError,
 };
 use tempfile::TempDir;
 
@@ -235,7 +235,7 @@ fn configures_connections_and_creates_the_current_schema() {
     let directory = TempDir::new().expect("create a temporary directory");
     let store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
 
-    assert_eq!(store.schema_version().expect("read the schema version"), 18);
+    assert_eq!(store.schema_version().expect("read the schema version"), 23);
     assert_eq!(
         store
             .connection()
@@ -421,6 +421,7 @@ fn creates_renames_archives_and_reads_owned_repositories() {
         owner: "alice",
         slug: "project",
         object_format: "sha256",
+        default_branch: "refs/heads/main",
         created_at: 20,
         origin: RepositoryOrigin::Imported,
         initial_references: &initial_references,
@@ -533,6 +534,7 @@ fn creates_renames_archives_and_reads_owned_repositories() {
         owner: "alice",
         slug: "event-failure",
         object_format: "sha1",
+        default_branch: "refs/heads/main",
         created_at: 20,
         origin: RepositoryOrigin::Created,
         initial_references: &[],
@@ -682,6 +684,59 @@ fn creates_renames_archives_and_reads_owned_repositories() {
         store.audit_events(1).expect("read the newest audit event")[0].outcome,
         "failure"
     );
+    store
+        .connection()
+        .execute(
+            "INSERT INTO account
+             (id, username, is_administrator, state, created_at)
+             VALUES (2, 'bob', 0, 'active', 20)",
+            [],
+        )
+        .expect("create a collaborator");
+    store
+        .update_repository_settings(
+            "alice",
+            "project",
+            "alice",
+            "A small public repository.",
+            "private",
+            23,
+            "settings",
+        )
+        .expect("update repository settings");
+    store
+        .update_repository_collaborator(
+            "alice",
+            "project",
+            "alice",
+            "bob",
+            Some("reader"),
+            24,
+            "collaborator",
+        )
+        .expect("add a repository collaborator");
+    let settings = store
+        .repository_settings("alice", "project", "alice")
+        .expect("read repository settings");
+    assert_eq!(settings.description, "A small public repository.");
+    assert_eq!(settings.repository.visibility, "private");
+    assert_eq!(settings.collaborators.len(), 1);
+    assert_eq!(settings.collaborators[0].username, "bob");
+    assert!(matches!(
+        store.repository_settings("alice", "project", "bob"),
+        Err(StoreError::PullRequestDenied)
+    ));
+    store
+        .update_repository_settings(
+            "alice",
+            "project",
+            "alice",
+            "A small public repository.",
+            "public",
+            25,
+            "settings-public",
+        )
+        .expect("restore public visibility");
 
     assert!(matches!(
         store.create_repository(&repository),
@@ -698,9 +753,10 @@ fn creates_renames_archives_and_reads_owned_repositories() {
     ));
     let missing_owner = NewRepository {
         id: "1234567890abcdef1234567890abcdef",
-        owner: "bob",
+        owner: "charlie",
         slug: "project",
         object_format: "sha1",
+        default_branch: "refs/heads/main",
         created_at: 20,
         origin: RepositoryOrigin::Created,
         initial_references: &[],
@@ -709,29 +765,33 @@ fn creates_renames_archives_and_reads_owned_repositories() {
     };
     assert!(matches!(
         store.create_repository(&missing_owner),
-        Err(StoreError::AccountNotFound(owner)) if owner == "bob"
+        Err(StoreError::AccountNotFound(owner)) if owner == "charlie"
     ));
     let (_, unchanged_events) = store
         .public_repository_events("alice", "project", None, 10)
         .expect("read events after rejected repository mutations");
     assert_eq!(unchanged_events.len(), 5);
 
-    store
-        .rename_repository(
+    assert!(matches!(
+        store.rename_repository_for_owner(
             "alice",
             "project",
-            "renamed",
+            "reader-rename",
+            "bob",
             25,
-            "admin-cli",
-            "test-rename",
-        )
+            "test-reader-rename",
+        ),
+        Err(StoreError::PullRequestDenied)
+    ));
+    store
+        .rename_repository_for_owner("alice", "project", "renamed", "alice", 25, "test-rename")
         .expect("rename a repository");
     assert!(matches!(
         store.repository("alice", "project"),
         Err(StoreError::RepositoryNotFound(_, _))
     ));
     store
-        .archive_repository("alice", "renamed", 30, "admin-cli", "test-archive")
+        .archive_repository_for_actor("alice", "renamed", "alice", 30, "test-archive")
         .expect("archive a repository");
     let archived = store
         .repository("alice", "renamed")
@@ -753,6 +813,27 @@ fn creates_renames_archives_and_reads_owned_repositories() {
         ),
         Err(StoreError::RepositoryArchived(_, _))
     ));
+    assert!(matches!(
+        store.unarchive_repository_for_owner(
+            "alice",
+            "renamed",
+            "bob",
+            33,
+            "test-reader-unarchive",
+        ),
+        Err(StoreError::PullRequestDenied)
+    ));
+    store
+        .unarchive_repository_for_owner("alice", "renamed", "alice", 34, "test-unarchive")
+        .expect("unarchive a repository");
+    let unarchived = Store::open(&database(&directory, "store.sqlite"))
+        .expect("reopen the unarchived repository store")
+        .repository_settings("alice", "renamed", "alice")
+        .expect("read the unarchived repository after restart");
+    assert_eq!(unarchived.repository.state, "active");
+    assert_eq!(unarchived.repository.archived_at, None);
+    assert_eq!(unarchived.repository.visibility, "public");
+    assert_eq!(unarchived.collaborators.len(), 1);
 }
 
 #[test]
@@ -785,6 +866,7 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
             owner: "alice",
             slug: "project",
             object_format: "sha1",
+            default_branch: "refs/heads/main",
             created_at: 2,
             origin: RepositoryOrigin::Created,
             initial_references: &[],
@@ -876,40 +958,23 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
         )
         .expect("comment as a reader");
     assert_eq!(comment_id.len(), 32);
-    assert!(matches!(
-        store.set_issue_label(&change("bob", 10), "bug", true),
-        Err(StoreError::IssueDenied)
-    ));
     store
-        .set_issue_label(&change("maintainer", 11), "bug", true)
-        .expect("label as a maintainer");
-    store
-        .set_issue_assignee(&change("maintainer", 12), "bob", true)
-        .expect("assign a repository reader");
-    assert!(matches!(
-        store.set_issue_assignee(&change("maintainer", 13), "stranger", true),
-        Err(StoreError::IssueAssigneeNotFound(username)) if username == "stranger"
-    ));
-    store
-        .set_issue_state("alice", "project", 1, "bob", "closed", 14)
+        .set_issue_state("alice", "project", 1, "bob", "closed", 10)
         .expect("close an authored issue");
     store
-        .set_issue_state("alice", "project", 1, "carol", "open", 15)
+        .set_issue_state("alice", "project", 1, "carol", "open", 11)
         .expect("reopen an issue as a writer");
 
     let detail = store
-        .issue_detail("alice", "project", 1, Some("maintainer"))
+        .issue_detail("alice", "project", 1, Some("maintainer"), 1, 1, 50)
         .expect("read the issue timeline");
     assert_eq!(detail.repository.slug, "project");
     assert_eq!(detail.issue.title, "Writer edit");
     assert_eq!(detail.issue.body, source);
     assert_eq!(detail.issue.state, "open");
     assert_eq!(detail.comments.len(), 1);
-    assert_eq!(detail.labels, ["bug"]);
-    assert_eq!(detail.assignees, ["bob"]);
     assert!(detail.can_comment);
     assert!(detail.can_edit);
-    assert!(detail.can_maintain);
     assert_eq!(
         detail
             .timeline
@@ -921,8 +986,6 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
             "issue-edited",
             "issue-edited",
             "issue-commented",
-            "issue-labeled",
-            "issue-assigned",
             "issue-closed",
             "issue-reopened",
         ]
@@ -933,6 +996,18 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
             .windows(2)
             .all(|events| events[0].sequence < events[1].sequence)
     );
+    let first_activity_page = store
+        .issue_detail("alice", "project", 1, Some("maintainer"), 1, 1, 1)
+        .expect("read the first bounded activity page");
+    assert_eq!(first_activity_page.comments.len(), 1);
+    assert!(!first_activity_page.comments_has_next);
+    assert_eq!(first_activity_page.timeline.len(), 1);
+    assert!(first_activity_page.timeline_has_next);
+    let second_timeline_page = store
+        .issue_detail("alice", "project", 1, Some("maintainer"), 1, 2, 1)
+        .expect("read the second timeline page");
+    assert_eq!(second_timeline_page.timeline_page, 2);
+    assert_eq!(second_timeline_page.timeline.len(), 1);
     for event in &detail.timeline {
         let payload: serde_json::Value =
             serde_json::from_str(&event.payload).expect("parse an issue event payload");
@@ -948,32 +1023,20 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
             row.get(0)
         })
         .expect("count events before watch changes");
-    let everything = WatchPreferences {
-        pushes: true,
-        issues: true,
-        pull_requests: true,
-    };
     let watch = store
-        .set_watch("alice", "project", "bob", everything, 16)
+        .set_watch("alice", "project", "bob", true, 16)
         .expect("watch all repository activity")
         .expect("read the created watch");
     assert_eq!(watch.id.len(), 32);
-    assert!(watch.pushes && watch.issues && watch.pull_requests);
     assert_eq!(watch.created_at, 16);
     assert_eq!(watch.updated_at, 16);
-    let granular = WatchPreferences {
-        pushes: false,
-        issues: true,
-        pull_requests: false,
-    };
     let updated = store
-        .set_watch("alice", "project", "bob", granular, 17)
-        .expect("set granular watch preferences")
+        .set_watch("alice", "project", "bob", true, 17)
+        .expect("keep watching")
         .expect("read the updated watch");
     assert_eq!(updated.id, watch.id);
     assert_eq!(updated.created_at, 16);
     assert_eq!(updated.updated_at, 17);
-    assert!(!updated.pushes && updated.issues && !updated.pull_requests);
     let (watched_repository, stored_watch) = store
         .watch("alice", "project", Some("bob"))
         .expect("read watch preferences");
@@ -984,7 +1047,7 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
         Err(StoreError::WatchDenied)
     ));
     assert!(matches!(
-        store.set_watch("alice", "project", "suspended", everything, 18),
+        store.set_watch("alice", "project", "suspended", true, 18),
         Err(StoreError::WatchDenied)
     ));
     assert_eq!(
@@ -997,17 +1060,7 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
     );
     assert_eq!(
         store
-            .set_watch(
-                "alice",
-                "project",
-                "bob",
-                WatchPreferences {
-                    pushes: false,
-                    issues: false,
-                    pull_requests: false,
-                },
-                19,
-            )
+            .set_watch("alice", "project", "bob", false, 19)
             .expect("stop watching the repository"),
         None
     );
@@ -1018,33 +1071,9 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
             .1,
         None
     );
-    assert!(
-        store
-            .connection()
-            .execute(
-                "INSERT INTO watch
-             (id, repository_id, account_id, pushes, issues, pull_requests,
-              created_at, updated_at)
-             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                     '00112233445566778899aabbccddeeff', 2, 0, 0, 0, 20, 20)",
-                [],
-            )
-            .is_err()
-    );
-
     store
-        .set_watch(
-            "alice",
-            "project",
-            "bob",
-            WatchPreferences {
-                pushes: false,
-                issues: true,
-                pull_requests: false,
-            },
-            20,
-        )
-        .expect("restore the issue watch");
+        .set_watch("alice", "project", "bob", true, 20)
+        .expect("restore the watch");
     store
         .comment_issue(
             "alice",
@@ -1055,53 +1084,85 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
             21,
         )
         .expect("create a mention event");
-    let repository_token = store
-        .create_feed_token(
-            "bob",
-            "repository",
-            Some(("alice", "project")),
-            &[1; 32],
-            22,
-        )
-        .expect("create a private repository feed token");
-    let watched_token = store
-        .create_feed_token("bob", "watched", None, &[2; 32], 23)
-        .expect("create a watched feed token");
-    let assignment_token = store
-        .create_feed_token("bob", "assignments", None, &[3; 32], 24)
-        .expect("create an assignment feed token");
-    let mention_token = store
-        .create_feed_token("bob", "mentions", None, &[4; 32], 25)
-        .expect("create a mention feed token");
-    assert!(matches!(
-        store.create_feed_token(
-            "stranger",
-            "repository",
-            Some(("alice", "project")),
-            &[5; 32],
-            26,
-        ),
-        Err(StoreError::FeedTokenDenied)
-    ));
-    assert!(matches!(
-        store.create_feed_token("bob", "repository", None, &[5; 32], 26),
-        Err(StoreError::InvalidFeedScope)
-    ));
-    let private_page = store
-        .token_feed_events(&[1; 32], 100)
-        .expect("read a private repository feed");
-    assert_eq!(private_page.scope, "repository");
-    assert_eq!(private_page.username, "bob");
-    assert_eq!(
-        private_page.target.as_deref(),
-        Some("00112233445566778899aabbccddeeff")
-    );
-    assert!(
-        private_page
+    let first_web_activity = store
+        .watched_activity_page("bob", None, 2)
+        .expect("read the first watched activity page");
+    assert_eq!(first_web_activity.events.len(), 2);
+    let before = first_web_activity
+        .next_before
+        .as_ref()
+        .expect("read the stable activity cursor");
+    store
+        .comment_issue("alice", "project", 1, "carol", "Newer activity.", 22)
+        .expect("create activity after the first page");
+    let second_web_activity = store
+        .watched_activity_page("bob", Some(before), 2)
+        .expect("read the second watched activity page");
+    assert!(second_web_activity.events.iter().all(|second| {
+        first_web_activity
             .events
             .iter()
-            .all(|event| event.repository.slug == "project")
+            .all(|first| first.event.event_id != second.event.event_id)
+    }));
+    store
+        .connection()
+        .execute_batch(
+            "UPDATE repository SET visibility = 'private' WHERE slug = 'project';
+             DELETE FROM repository_collaborator
+             WHERE repository_id = (SELECT id FROM repository WHERE slug = 'project')
+               AND account_id = (SELECT id FROM account WHERE username = 'bob');",
+        )
+        .expect("remove watched private repository access");
+    assert!(
+        store
+            .watched_activity_page("bob", None, 20)
+            .expect("apply activity access immediately")
+            .events
+            .is_empty()
     );
+    store
+        .set_repository_collaborator(
+            "alice",
+            "project",
+            "bob",
+            "maintainer",
+            &AuditContext {
+                actor: "alice",
+                correlation_id: "restore-activity-access",
+                created_at: 22,
+            },
+        )
+        .expect("restore watched repository access");
+    store
+        .connection()
+        .execute(
+            "UPDATE repository
+             SET state = 'archived', archived_at = 22 WHERE slug = 'project'",
+            [],
+        )
+        .expect("archive the watched repository");
+    assert!(
+        store
+            .watched_activity_page("bob", None, 20)
+            .expect("apply archived state immediately")
+            .events
+            .is_empty()
+    );
+    store
+        .connection()
+        .execute(
+            "UPDATE repository
+             SET state = 'active', archived_at = NULL WHERE slug = 'project'",
+            [],
+        )
+        .expect("restore the watched repository");
+    let watched_token = store
+        .create_feed_token("bob", &[2; 32], 23)
+        .expect("create a watched feed token");
+    assert!(matches!(
+        store.create_feed_token("bob", &[3; 32], 24),
+        Err(StoreError::FeedTokenLimit)
+    ));
     let watched_page = store
         .token_feed_events(&[2; 32], 100)
         .expect("read watched issue activity");
@@ -1109,20 +1170,10 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
         watched_page
             .events
             .iter()
-            .all(|event| event.event.kind.starts_with("issue-"))
+            .any(|event| event.event.kind == "issue-commented")
     );
     assert!(!watched_page.events.is_empty());
-    let assignment_page = store
-        .token_feed_events(&[3; 32], 100)
-        .expect("read assignment activity");
-    assert_eq!(assignment_page.events.len(), 1);
-    assert_eq!(assignment_page.events[0].event.kind, "issue-assigned");
-    let mention_page = store
-        .token_feed_events(&[4; 32], 100)
-        .expect("read mention activity");
-    assert_eq!(mention_page.events.len(), 1);
-    assert_eq!(mention_page.events[0].event.kind, "issue-commented");
-    assert_eq!(store.feed_tokens("bob").expect("list feed tokens").len(), 4);
+    assert_eq!(store.feed_tokens("bob").expect("list feed tokens").len(), 1);
     store
         .connection()
         .execute_batch(
@@ -1134,27 +1185,27 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
         )
         .expect("inject a feed token failure");
     assert!(matches!(
-        store.rotate_feed_token("bob", &repository_token.id, &[7; 32], 27),
+        store.rotate_feed_token("bob", &watched_token.id, &[7; 32], 27),
         Err(StoreError::Sqlite(_))
     ));
     store
-        .token_feed_events(&[1; 32], 100)
+        .token_feed_events(&[2; 32], 100)
         .expect("retain the old token after a failed rotation");
     store
         .connection()
         .execute_batch("DROP TRIGGER reject_feed_token;")
         .expect("remove the feed token failure");
     let rotated = store
-        .rotate_feed_token("bob", &repository_token.id, &[6; 32], 28)
-        .expect("rotate a repository feed token");
-    assert_eq!(rotated.scope, repository_token.scope);
+        .rotate_feed_token("bob", &watched_token.id, &[6; 32], 28)
+        .expect("rotate the watched feed token");
+    assert_eq!(rotated.scope, watched_token.scope);
     assert!(matches!(
-        store.token_feed_events(&[1; 32], 100),
+        store.token_feed_events(&[2; 32], 100),
         Err(StoreError::FeedTokenNotFound)
     ));
     store
         .revoke_feed_token("bob", &rotated.id, 29)
-        .expect("revoke a repository feed token");
+        .expect("revoke the watched feed token");
     assert!(matches!(
         store.token_feed_events(&[6; 32], 100),
         Err(StoreError::FeedTokenNotFound)
@@ -1168,11 +1219,9 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
             .all(|event| event.kind.starts_with("issue-"))
     );
     assert_eq!(watched_token.scope, "watched");
-    assert_eq!(assignment_token.scope, "assignments");
-    assert_eq!(mention_token.scope, "mentions");
     let mut metadata = Vec::new();
     let metadata_truncated = store
-        .visit_metadata_search_candidates(Some("bob"), 100, 1024, |candidate| {
+        .visit_metadata_search_candidates(Some("bob"), 100, |candidate| {
             metadata.push(candidate);
             true
         })
@@ -1186,14 +1235,9 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
             && candidate.title == b"alice/project"
             && candidate.body.is_empty()
     }));
-    assert!(
-        metadata
-            .iter()
-            .any(|candidate| candidate.issue_number == Some(1))
-    );
     let mut anonymous_metadata = Vec::new();
     let anonymous_truncated = store
-        .visit_metadata_search_candidates(None, 100, 1024, |candidate| {
+        .visit_metadata_search_candidates(None, 100, |candidate| {
             anonymous_metadata.push(candidate);
             true
         })
@@ -1228,30 +1272,10 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
         comments_before
     );
     store
-        .connection()
-        .execute(
-            "DELETE FROM repository_collaborator
-             WHERE repository_id = '00112233445566778899aabbccddeeff'
-               AND account_id = 2",
-            [],
-        )
-        .expect("remove the feed account repository role");
-    for hash in [[2; 32], [3; 32], [4; 32]] {
-        assert!(
-            store
-                .token_feed_events(&hash, 100)
-                .expect("read a feed after role removal")
-                .events
-                .is_empty()
-        );
-    }
-    for value in 10_u8..39 {
-        store
-            .create_feed_token("bob", "mentions", None, &[value; 32], 30 + i64::from(value))
-            .expect("fill the active feed token limit");
-    }
+        .create_feed_token("bob", &[10; 32], 30)
+        .expect("create a replacement watched feed token");
     assert!(matches!(
-        store.create_feed_token("bob", "mentions", None, &[40; 32], 70),
+        store.create_feed_token("bob", &[11; 32], 31),
         Err(StoreError::FeedTokenLimit)
     ));
 }
@@ -1607,7 +1631,7 @@ fn migrates_each_committed_historical_fixture() {
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
-        assert_eq!(store.schema_version().expect("read the schema version"), 18);
+        assert_eq!(store.schema_version().expect("read the schema version"), 23);
         store.integrity_check().expect("check migrated integrity");
         let state: String = store
             .connection()
@@ -1632,6 +1656,60 @@ fn migrates_each_committed_historical_fixture() {
         );
         backup.integrity_check().expect("check backup integrity");
     }
+}
+
+#[test]
+fn migration_uses_an_existing_repository_symbolic_head() {
+    let directory = TempDir::new().expect("create a migration directory");
+    let path = database(&directory, "tit.sqlite3");
+    let mut store = Store::open(&path).expect("create the current database");
+    store
+        .connection()
+        .execute(
+            "INSERT INTO account
+             (id, username, is_administrator, state, created_at)
+             VALUES (1, 'alice', 1, 'active', 1)",
+            [],
+        )
+        .expect("create the migration account");
+    store
+        .create_repository(&NewRepository {
+            id: "00112233445566778899aabbccddeeff",
+            owner: "alice",
+            slug: "project",
+            object_format: "sha1",
+            default_branch: "refs/heads/main",
+            created_at: 2,
+            origin: RepositoryOrigin::Created,
+            initial_references: &[],
+            actor: "alice",
+            correlation_id: "migration-default",
+        })
+        .expect("create the migration repository");
+    store
+        .connection()
+        .execute("DROP TABLE repository_default_branch", [])
+        .expect("remove the new table from the historical fixture");
+    store
+        .connection()
+        .pragma_update(None, "user_version", 22)
+        .expect("set the historical schema version");
+    drop(store);
+    let repository = directory
+        .path()
+        .join("repositories")
+        .join("00112233445566778899aabbccddeeff.git");
+    fs::create_dir_all(&repository).expect("create the historical repository directory");
+    fs::write(repository.join("HEAD"), "ref: refs/heads/trunk\n")
+        .expect("write the historical symbolic HEAD");
+
+    let migrated = Store::open(&path).expect("migrate the historical database");
+    assert_eq!(
+        migrated
+            .repository_default_branch("alice", "project")
+            .expect("read the migrated default branch"),
+        "refs/heads/trunk"
+    );
 }
 
 #[test]
@@ -1680,7 +1758,7 @@ fn backfills_repository_events_when_version_five_is_migrated() {
 
 #[test]
 fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
-    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 18)] {
+    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 23)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "fixture.sqlite");
         create_fixture(&path, V1_FIXTURE);
@@ -1749,4 +1827,93 @@ fn checkpoints_and_vacuums_without_losing_data() {
             .expect("count parents"),
         1
     );
+}
+
+#[test]
+fn maintenance_prunes_only_terminal_records_before_the_cutoff() {
+    let directory = TempDir::new().expect("create a maintenance fixture directory");
+    let mut store =
+        Store::open(&database(&directory, "maintenance.sqlite")).expect("open the store");
+    store
+        .create_initial_administrator(&InitialAdministrator {
+            username: "alice",
+            canonical_key: "ssh-ed25519 AAAAmaintenance",
+            fingerprint: "SHA256:maintenance",
+            recovery_hash: &[7; 32],
+            created_at: 1,
+        })
+        .expect("create the account");
+    store
+        .create_repository(&NewRepository {
+            id: "00112233445566778899aabbccddeeff",
+            owner: "alice",
+            slug: "project",
+            object_format: "sha1",
+            default_branch: "refs/heads/main",
+            created_at: 1,
+            origin: RepositoryOrigin::Created,
+            initial_references: &[],
+            actor: "alice",
+            correlation_id: "maintenance-repository",
+        })
+        .expect("create the repository");
+    store
+        .connection()
+        .execute_batch(
+            "DELETE FROM audit_event;
+             INSERT INTO signup_invitation
+                 (code_hash, created_at, expires_at, consumed_at)
+             VALUES
+                 (randomblob(32), 1, 2, NULL),
+                 (randomblob(32), 99, 100, NULL);
+             INSERT INTO login_nonce
+                 (nonce_hash, csrf_hash, account_id, ssh_public_key_id,
+                  created_at, expires_at, consumed_at)
+             VALUES
+                 (randomblob(32), randomblob(32), 1, 1, 1, 2, NULL),
+                 (randomblob(32), randomblob(32), 1, 1, 99, 100, NULL);
+             INSERT INTO ssh_login_approval
+                 (secret_hash, csrf_hash, account_id, ssh_public_key_id,
+                  created_at, expires_at, approved_at, consumed_at)
+             VALUES
+                 (randomblob(32), randomblob(32), NULL, NULL, 1, 2, NULL, NULL),
+                 (randomblob(32), randomblob(32), NULL, NULL, 99, 100, NULL, NULL);
+             INSERT INTO web_session
+                 (session_hash, csrf_hash, account_id, created_at, expires_at, ended_at)
+             VALUES
+                 (randomblob(32), randomblob(32), 1, 1, 2, NULL),
+                 (randomblob(32), randomblob(32), 1, 99, 200, NULL);
+             INSERT INTO feed_token
+                 (id, token_hash, account_id, scope, repository_id, created_at, revoked_at)
+             VALUES
+                 ('11111111111111111111111111111111', randomblob(32), 1,
+                  'repository', '00112233445566778899aabbccddeeff', 1, 2),
+                 ('22222222222222222222222222222222', randomblob(32), 1,
+                  'repository', '00112233445566778899aabbccddeeff', 99, 100);
+             INSERT INTO audit_event
+                 (action, actor, target, outcome, correlation_id, created_at)
+             VALUES
+                 ('old', 'test', 'old', 'success', 'old', 1),
+                 ('current', 'test', 'current', 'success', 'current', 100);",
+        )
+        .expect("create maintenance records");
+
+    let result = store.maintain(100).expect("run maintenance");
+    assert_eq!(result.deleted, 6);
+    for table in [
+        "signup_invitation",
+        "login_nonce",
+        "ssh_login_approval",
+        "web_session",
+        "feed_token",
+        "audit_event",
+    ] {
+        let count: i64 = store
+            .connection()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("count retained maintenance records");
+        assert_eq!(count, 1, "unexpected retained count for {table}");
+    }
 }

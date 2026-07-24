@@ -6,12 +6,20 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::auth::{AuthError, SshPublicKey, validate_username};
-use crate::store::{AccountRecovery, InvitedAccount, NewAuditEvent, NewSshKey, Store, StoreError};
+use crate::store::{
+    AccountKeyAuthorization, AccountRecovery, InvitedAccount, KeyInspection, NewAuditEvent,
+    NewSshKey, PublicProfile, Store, StoreError,
+};
 
 const INVITATION_PREFIX: &str = "tit-invite-v1:";
 const RECOVERY_PREFIX: &str = "tit-recovery-v1:";
 const SECRET_BYTES: usize = 32;
 const INVITATION_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
+#[allow(
+    dead_code,
+    reason = "the account integration test imports this module without the Web profile route"
+)]
+const PROFILE_REPOSITORY_PAGE_SIZE: usize = 20;
 
 #[derive(Clone)]
 pub(crate) struct AccountService {
@@ -178,6 +186,141 @@ impl AccountService {
         Ok(())
     }
 
+    pub(crate) fn profile(&self, username: &str) -> Result<PublicProfile, AccountError> {
+        validate_username(username)?;
+        Store::open(&self.database)?
+            .public_profile(username)
+            .map_err(Into::into)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the account integration test imports this module without the Web profile route"
+    )]
+    pub(crate) fn profile_page(
+        &self,
+        username: &str,
+        page: usize,
+    ) -> Result<PublicProfile, AccountError> {
+        validate_username(username)?;
+        if page == 0 || page > 10_000 {
+            return Err(AccountError::InvalidProfile);
+        }
+        let profile = Store::open(&self.database)?
+            .public_profile_page(username, page, PROFILE_REPOSITORY_PAGE_SIZE)
+            .map_err(AccountError::from)?;
+        if page > 1 && profile.repositories.is_empty() {
+            return Err(AccountError::InvalidProfile);
+        }
+        Ok(profile)
+    }
+
+    pub(crate) fn update_profile(
+        &self,
+        username: &str,
+        bio: &str,
+        contact_email: &str,
+    ) -> Result<(), AccountError> {
+        validate_username(username)?;
+        validate_profile(bio, contact_email)?;
+        Store::open(&self.database)?
+            .update_profile(username, bio, contact_email)
+            .map_err(Into::into)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the account integration test imports this module without Web account routes"
+    )]
+    pub(crate) fn keys(&self, username: &str) -> Result<Vec<KeyInspection>, AccountError> {
+        validate_username(username)?;
+        Ok(Store::open(&self.database)?.inspect_account(username)?.keys)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the account integration test imports this module without Web account routes"
+    )]
+    pub(crate) fn complete_key_add(
+        &self,
+        request: &AccountKeyRequest<'_>,
+        label: &str,
+        public_key: &str,
+    ) -> Result<String, AccountError> {
+        let changed_at = now()?;
+        let result = (|| {
+            validate_username(request.username)?;
+            validate_token(request.session)?;
+            validate_token(request.csrf)?;
+            validate_token(request.secret)?;
+            validate_label(label)?;
+            let key = SshPublicKey::parse(public_key)?;
+            Store::open(&self.database)?.complete_account_key_add(
+                &AccountKeyAuthorization {
+                    username: request.username,
+                    session_hash: &hash(request.session),
+                    csrf_hash: &hash(request.csrf),
+                    secret_hash: &hash(request.secret),
+                    changed_at,
+                    correlation_id: request.correlation_id,
+                },
+                &new_key(&key, label),
+            )?;
+            Ok(key.fingerprint().to_owned())
+        })();
+        if result.is_err() {
+            self.audit_failure(
+                "key.add",
+                request.username,
+                request.username,
+                request.correlation_id,
+                changed_at,
+            )?;
+        }
+        result
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the account integration test imports this module without Web account routes"
+    )]
+    pub(crate) fn complete_key_revoke(
+        &self,
+        request: &AccountKeyRequest<'_>,
+        fingerprint: &str,
+    ) -> Result<(), AccountError> {
+        let changed_at = now()?;
+        let result = (|| {
+            validate_username(request.username)?;
+            validate_token(request.session)?;
+            validate_token(request.csrf)?;
+            validate_token(request.secret)?;
+            Store::open(&self.database)?.complete_account_key_revoke(
+                &AccountKeyAuthorization {
+                    username: request.username,
+                    session_hash: &hash(request.session),
+                    csrf_hash: &hash(request.csrf),
+                    secret_hash: &hash(request.secret),
+                    changed_at,
+                    correlation_id: request.correlation_id,
+                },
+                fingerprint,
+            )?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let target = format!("{}:{fingerprint}", request.username);
+            self.audit_failure(
+                "key.revoke",
+                request.username,
+                bounded_audit_target(&target),
+                request.correlation_id,
+                changed_at,
+            )?;
+        }
+        result
+    }
+
     fn audit_failure(
         &self,
         action: &str,
@@ -206,6 +349,14 @@ impl AccountService {
     }
 }
 
+pub(crate) struct AccountKeyRequest<'a> {
+    pub(crate) username: &'a str,
+    pub(crate) session: &'a str,
+    pub(crate) csrf: &'a str,
+    pub(crate) secret: &'a str,
+    pub(crate) correlation_id: &'a str,
+}
+
 fn new_key<'a>(key: &'a SshPublicKey, label: &'a str) -> NewSshKey<'a> {
     NewSshKey {
         canonical_key: key.canonical(),
@@ -222,6 +373,26 @@ fn bounded_audit_target(target: &str) -> &str {
     }
 }
 
+fn validate_profile(bio: &str, contact_email: &str) -> Result<(), AccountError> {
+    if bio.len() > 512
+        || bio
+            .chars()
+            .any(|character| character.is_control() && character != '\n')
+    {
+        return Err(AccountError::InvalidProfile);
+    }
+    if contact_email.len() > 254
+        || contact_email.chars().any(char::is_control)
+        || (!contact_email.is_empty()
+            && (contact_email.matches('@').count() != 1
+                || contact_email.starts_with('@')
+                || contact_email.ends_with('@')))
+    {
+        return Err(AccountError::InvalidProfile);
+    }
+    Ok(())
+}
+
 fn validate_label(label: &str) -> Result<(), AccountError> {
     if label.is_empty()
         || label.len() > 80
@@ -229,6 +400,17 @@ fn validate_label(label: &str) -> Result<(), AccountError> {
         || label.chars().any(char::is_control)
     {
         return Err(AccountError::InvalidLabel);
+    }
+    Ok(())
+}
+
+#[allow(
+    dead_code,
+    reason = "the account integration test imports this module without Web account routes"
+)]
+fn validate_token(token: &str) -> Result<(), AccountError> {
+    if token.len() != SECRET_BYTES * 2 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AccountError::InvalidSecret);
     }
     Ok(())
 }
@@ -278,6 +460,8 @@ pub(crate) enum AccountError {
     Store(#[from] StoreError),
     #[error("key label is not valid")]
     InvalidLabel,
+    #[error("profile is not valid")]
+    InvalidProfile,
     #[error("credential format is not valid")]
     InvalidSecret,
     #[error("cannot create a random credential")]

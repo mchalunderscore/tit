@@ -6,12 +6,13 @@ use thiserror::Error;
 use crate::auth::{AuthError, validate_username};
 use crate::domain::repository::{RepositoryNameError, validate_slug};
 use crate::store::{
-    IssueChange, IssueDetail, IssueRecord, NewIssue, RepositoryRecord, Store, StoreError,
+    IssueChange, IssueDetail, IssueRecord, NewIssue, RecordPage, RepositoryRecord, Store,
+    StoreError,
 };
 
 pub(crate) const MAX_TITLE_BYTES: usize = 200;
 pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024;
-const MAX_LABEL_BYTES: usize = 80;
+pub(crate) const PAGE_SIZE: usize = 50;
 
 #[derive(Clone)]
 pub(crate) struct IssueService {
@@ -61,18 +62,55 @@ impl IssueService {
             .map_err(Into::into)
     }
 
-    pub(crate) fn get(
+    pub(crate) fn list_page(
+        &self,
+        owner: &str,
+        repository: &str,
+        actor: Option<&str>,
+        state: &str,
+        page: usize,
+    ) -> Result<(RepositoryRecord, RecordPage<IssueRecord>), IssueError> {
+        validate_context(owner, repository, actor)?;
+        validate_list(state, page)?;
+        let result = Store::open(&self.database)?
+            .issue_page(owner, repository, actor, state, page, PAGE_SIZE)
+            .map_err(IssueError::from)?;
+        if page > 1 && result.1.items.is_empty() {
+            return Err(IssueError::State);
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn get_page(
         &self,
         owner: &str,
         repository: &str,
         number: i64,
         actor: Option<&str>,
+        comments_page: usize,
+        timeline_page: usize,
     ) -> Result<IssueDetail, IssueError> {
         validate_context(owner, repository, actor)?;
         validate_number(number)?;
-        Store::open(&self.database)?
-            .issue_detail(owner, repository, number, actor)
-            .map_err(Into::into)
+        validate_page(comments_page)?;
+        validate_page(timeline_page)?;
+        let detail = Store::open(&self.database)?
+            .issue_detail(
+                owner,
+                repository,
+                number,
+                actor,
+                comments_page,
+                timeline_page,
+                PAGE_SIZE,
+            )
+            .map_err(IssueError::from)?;
+        if (comments_page > 1 && detail.comments.is_empty())
+            || (timeline_page > 1 && detail.timeline.is_empty())
+        {
+            return Err(IssueError::Number);
+        }
+        Ok(detail)
     }
 
     pub(crate) fn edit(
@@ -136,60 +174,6 @@ impl IssueService {
             .set_issue_state(owner, repository, number, actor, state, timestamp()?)
             .map_err(Into::into)
     }
-
-    pub(crate) fn set_label(
-        &self,
-        owner: &str,
-        repository: &str,
-        number: i64,
-        actor: &str,
-        label: &str,
-        present: bool,
-    ) -> Result<(), IssueError> {
-        validate_context(owner, repository, Some(actor))?;
-        validate_number(number)?;
-        validate_label(label)?;
-        Store::open(&self.database)?
-            .set_issue_label(
-                &IssueChange {
-                    owner,
-                    repository,
-                    number,
-                    actor,
-                    changed_at: timestamp()?,
-                },
-                label,
-                present,
-            )
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn set_assignee(
-        &self,
-        owner: &str,
-        repository: &str,
-        number: i64,
-        actor: &str,
-        assignee: &str,
-        present: bool,
-    ) -> Result<(), IssueError> {
-        validate_context(owner, repository, Some(actor))?;
-        validate_number(number)?;
-        validate_username(assignee)?;
-        Store::open(&self.database)?
-            .set_issue_assignee(
-                &IssueChange {
-                    owner,
-                    repository,
-                    number,
-                    actor,
-                    changed_at: timestamp()?,
-                },
-                assignee,
-                present,
-            )
-            .map_err(Into::into)
-    }
 }
 
 fn validate_context(owner: &str, repository: &str, actor: Option<&str>) -> Result<(), IssueError> {
@@ -203,6 +187,20 @@ fn validate_context(owner: &str, repository: &str, actor: Option<&str>) -> Resul
 
 fn validate_number(number: i64) -> Result<(), IssueError> {
     if number < 1 {
+        return Err(IssueError::Number);
+    }
+    Ok(())
+}
+
+fn validate_list(state: &str, page: usize) -> Result<(), IssueError> {
+    if !matches!(state, "all" | "open" | "closed") || page == 0 || page > 10_000 {
+        return Err(IssueError::State);
+    }
+    Ok(())
+}
+
+fn validate_page(page: usize) -> Result<(), IssueError> {
+    if page == 0 || page > 10_000 {
         return Err(IssueError::Number);
     }
     Ok(())
@@ -231,17 +229,6 @@ fn validate_body(body: &str, empty_ok: bool) -> Result<(), IssueError> {
     Ok(())
 }
 
-fn validate_label(label: &str) -> Result<(), IssueError> {
-    if label.is_empty()
-        || label.len() > MAX_LABEL_BYTES
-        || label.trim() != label
-        || label.chars().any(char::is_control)
-    {
-        return Err(IssueError::Label);
-    }
-    Ok(())
-}
-
 fn timestamp() -> Result<i64, IssueError> {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -266,8 +253,6 @@ pub(crate) enum IssueError {
     Body,
     #[error("issue state is not valid")]
     State,
-    #[error("issue label is not valid")]
-    Label,
     #[error("system time is not valid")]
     Clock,
 }

@@ -21,7 +21,7 @@ const MAX_OPERATION_TIME: Duration = Duration::from_secs(120);
 const MAX_P99_QUERY_TIME: Duration = Duration::from_millis(250);
 
 #[test]
-#[ignore = "run through scripts/check-m1a"]
+#[ignore = "run this workload explicitly"]
 fn measures_the_m1a_workload() {
     let directory = TempDir::new().expect("create a temporary directory");
     let database_path = directory.path().join("workload.sqlite");

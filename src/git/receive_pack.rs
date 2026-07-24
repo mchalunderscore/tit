@@ -4,7 +4,7 @@ use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gix::bstr::ByteSlice;
 use gix::hash::{Kind, ObjectId};
@@ -280,17 +280,20 @@ impl ReceivePack {
         repository: &gix::Repository,
         commands: &[RefCommand],
     ) -> Result<Option<PathBuf>, ReceivePackError> {
+        let deadline = Instant::now() + MAX_PROCESSING_TIME;
         let metadata = fs::metadata(&self.incoming_pack)?;
         if metadata.len() == 0 || metadata.len() > MAX_PACK_BYTES {
             return Err(ReceivePackError::PackLimit);
         }
+        validate_pack_allocation_limits(&self.incoming_pack, self.object_format)?;
         let mut reader = BufReader::new(File::open(&self.incoming_pack)?);
         let mut progress = gix::progress::Discard;
         let interrupt = Arc::new(AtomicBool::new(false));
         let timer_interrupt = Arc::clone(&interrupt);
         let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let remaining = deadline.saturating_duration_since(Instant::now());
         let timer = std::thread::spawn(move || {
-            if done_receiver.recv_timeout(MAX_PROCESSING_TIME).is_err() {
+            if done_receiver.recv_timeout(remaining).is_err() {
                 timer_interrupt.store(true, Ordering::Relaxed);
             }
         });
@@ -319,9 +322,12 @@ impl ReceivePack {
         if outcome.index.num_objects > MAX_OBJECTS as u32 {
             return Err(ReceivePackError::ObjectLimit);
         }
+        check_deadline(deadline)?;
         if outcome.index.num_objects == 0 {
             let changes = validate_proposed_objects(repository, None, commands)?;
+            check_deadline(deadline)?;
             self.validate_policy(commands, &changes)?;
+            check_deadline(deadline)?;
             if let Some(path) = outcome.data_path {
                 let _ = fs::remove_file(path);
             }
@@ -333,13 +339,17 @@ impl ReceivePack {
             }
             return Ok(None);
         }
-        let bundle = outcome
+        let mut bundle = outcome
             .to_bundle()
             .ok_or(ReceivePackError::MissingPack)?
             .map_err(|error| ReceivePackError::Pack(error.to_string()))?;
+        bundle.pack = bundle.pack.with_alloc_limit_bytes(Some(MAX_OBJECT_BYTES));
         validate_delta_depth(&bundle)?;
+        check_deadline(deadline)?;
         let changes = validate_proposed_objects(repository, Some(&bundle), commands)?;
+        check_deadline(deadline)?;
         self.validate_policy(commands, &changes)?;
+        check_deadline(deadline)?;
 
         let source_pack = outcome.data_path.ok_or(ReceivePackError::MissingPack)?;
         let source_index = outcome.index_path.ok_or(ReceivePackError::MissingPack)?;
@@ -348,6 +358,7 @@ impl ReceivePack {
         }
         let destination = self.repository_path.join("objects/pack");
         fs::create_dir_all(&destination)?;
+        check_deadline(deadline)?;
         let destination_pack =
             destination.join(source_pack.file_name().ok_or(ReceivePackError::Path)?);
         let destination_index =
@@ -375,6 +386,7 @@ impl ReceivePack {
             let _ = fs::remove_file(keep);
         }
         sync_directory(&destination)?;
+        check_deadline(deadline)?;
         Ok(promoted.then_some(destination_pack))
     }
 
@@ -414,6 +426,76 @@ impl ReceivePack {
     }
 }
 
+fn validate_pack_allocation_limits(
+    path: &Path,
+    object_format: Kind,
+) -> Result<(), ReceivePackError> {
+    let pack = gix_pack::data::File::at(path, object_format)
+        .map_err(|error| ReceivePackError::Pack(error.to_string()))?
+        .with_alloc_limit_bytes(Some(MAX_OBJECT_BYTES));
+    if pack.num_objects() > MAX_OBJECTS as u32 {
+        return Err(ReceivePackError::ObjectLimit);
+    }
+    let entries = pack
+        .streaming_iter()
+        .map_err(|error| ReceivePackError::Pack(error.to_string()))?;
+    let mut inflate = gix::features::zlib::Inflate::default();
+    for entry in entries {
+        let entry = entry.map_err(|error| ReceivePackError::Pack(error.to_string()))?;
+        if entry.decompressed_size > MAX_OBJECT_BYTES as u64 {
+            return Err(ReceivePackError::ObjectLimit);
+        }
+        if !matches!(
+            entry.header,
+            gix_pack::data::entry::Header::OfsDelta { .. }
+                | gix_pack::data::entry::Header::RefDelta { .. }
+        ) {
+            continue;
+        }
+        let pack_entry = pack
+            .entry(entry.pack_offset)
+            .map_err(|error| ReceivePackError::Pack(error.to_string()))?;
+        let compressed_end = pack_entry
+            .data_offset
+            .checked_add(entry.compressed_size)
+            .ok_or(ReceivePackError::PackLimit)?;
+        let compressed = pack
+            .entry_slice(pack_entry.data_offset..compressed_end)
+            .ok_or(ReceivePackError::PackLimit)?;
+        inflate.reset();
+        let mut header = [0_u8; 20];
+        let (_, _, written) = inflate
+            .once(compressed, &mut header)
+            .map_err(|error| ReceivePackError::Pack(error.to_string()))?;
+        let (_, base_end) = decode_delta_size(&header[..written])?;
+        let (result_size, _) = decode_delta_size(&header[base_end..written])?;
+        if result_size > MAX_OBJECT_BYTES as u64 {
+            return Err(ReceivePackError::ObjectLimit);
+        }
+    }
+    Ok(())
+}
+
+fn decode_delta_size(input: &[u8]) -> Result<(u64, usize), ReceivePackError> {
+    let mut size = 0_u64;
+    let mut shift = 0_u32;
+    for (index, byte) in input.iter().copied().enumerate() {
+        if shift >= u64::BITS {
+            return Err(ReceivePackError::Pack(
+                "delta object size is invalid".to_owned(),
+            ));
+        }
+        size |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok((size, index + 1));
+        }
+        shift += 7;
+    }
+    Err(ReceivePackError::Pack(
+        "delta object size is incomplete".to_owned(),
+    ))
+}
+
 fn validate_delta_depth(bundle: &gix_pack::Bundle) -> Result<(), ReceivePackError> {
     let entries = bundle.index.iter().collect::<Vec<_>>();
     let offsets_by_id = entries
@@ -431,9 +513,8 @@ fn validate_delta_depth(bundle: &gix_pack::Bundle) -> Result<(), ReceivePackErro
         })
         .collect::<Result<HashMap<_, _>, _>>()?;
     let mut depths = HashMap::new();
-    let mut visiting = HashSet::new();
     for offset in headers.keys().copied() {
-        let depth = delta_depth(offset, &headers, &offsets_by_id, &mut depths, &mut visiting)?;
+        let depth = delta_depth(offset, &headers, &offsets_by_id, &mut depths)?;
         if depth > MAX_DELTA_DEPTH {
             return Err(ReceivePackError::DeltaDepthLimit);
         }
@@ -446,34 +527,66 @@ fn delta_depth(
     headers: &HashMap<u64, gix_pack::data::entry::Header>,
     offsets_by_id: &HashMap<ObjectId, u64>,
     depths: &mut HashMap<u64, usize>,
-    visiting: &mut HashSet<u64>,
 ) -> Result<usize, ReceivePackError> {
     if let Some(depth) = depths.get(&offset) {
         return Ok(*depth);
     }
-    if !visiting.insert(offset) {
-        return Err(ReceivePackError::DeltaDepthLimit);
-    }
-    let header = headers.get(&offset).ok_or(ReceivePackError::RecoveryData)?;
-    let depth = match header {
-        gix_pack::data::entry::Header::OfsDelta { base_distance } => {
-            let base = offset
-                .checked_sub(*base_distance)
-                .ok_or(ReceivePackError::DeltaDepthLimit)?;
-            delta_depth(base, headers, offsets_by_id, depths, visiting)? + 1
+    let mut path = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = offset;
+    let base_depth = loop {
+        if let Some(depth) = depths.get(&current) {
+            break *depth;
         }
-        gix_pack::data::entry::Header::RefDelta { base_id } => {
-            if let Some(base) = offsets_by_id.get(base_id) {
-                delta_depth(*base, headers, offsets_by_id, depths, visiting)? + 1
-            } else {
-                1
+        if !seen.insert(current) || path.len() > MAX_DELTA_DEPTH {
+            return Err(ReceivePackError::DeltaDepthLimit);
+        }
+        path.push(current);
+        let header = headers
+            .get(&current)
+            .ok_or(ReceivePackError::RecoveryData)?;
+        match header {
+            gix_pack::data::entry::Header::OfsDelta { base_distance } => {
+                current = current
+                    .checked_sub(*base_distance)
+                    .ok_or(ReceivePackError::DeltaDepthLimit)?;
             }
+            gix_pack::data::entry::Header::RefDelta { base_id } => {
+                let Some(base) = offsets_by_id.get(base_id) else {
+                    break 0;
+                };
+                current = *base;
+            }
+            _ => break 0,
         }
-        _ => 0,
     };
-    visiting.remove(&offset);
-    depths.insert(offset, depth);
-    Ok(depth)
+    let mut depth = base_depth;
+    for item in path.into_iter().rev() {
+        let header = headers.get(&item).ok_or(ReceivePackError::RecoveryData)?;
+        if matches!(
+            header,
+            gix_pack::data::entry::Header::OfsDelta { .. }
+                | gix_pack::data::entry::Header::RefDelta { .. }
+        ) {
+            depth += 1;
+        }
+        if depth > MAX_DELTA_DEPTH {
+            return Err(ReceivePackError::DeltaDepthLimit);
+        }
+        depths.insert(item, depth);
+    }
+    depths
+        .get(&offset)
+        .copied()
+        .ok_or(ReceivePackError::RecoveryData)
+}
+
+fn check_deadline(deadline: Instant) -> Result<(), ReceivePackError> {
+    if Instant::now() >= deadline {
+        Err(ReceivePackError::WallClockLimit)
+    } else {
+        Ok(())
+    }
 }
 
 impl Drop for ReceivePack {
@@ -1009,5 +1122,56 @@ impl ReceivePackError {
             _ if self.is_unpack_error() => "pack validation failed",
             _ => "push validation failed",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_a_compressed_object_before_large_allocation() {
+        let directory = tempfile::TempDir::new().expect("create a pack directory");
+        let path = directory.path().join("oversized.pack");
+        let object_size = MAX_OBJECT_BYTES + 1;
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2_u32.to_be_bytes());
+        pack.extend_from_slice(&1_u32.to_be_bytes());
+        pack.extend_from_slice(&pack_object_header(3, object_size as u64));
+
+        let mut compressed = gix::features::zlib::stream::deflate::Write::new(Vec::new());
+        let block = [0_u8; 64 * 1024];
+        for _ in 0..(object_size / block.len()) {
+            compressed.write_all(&block).expect("compress a zero block");
+        }
+        compressed
+            .write_all(&block[..object_size % block.len()])
+            .expect("compress the final zero block");
+        compressed.flush().expect("finish the compressed object");
+        pack.extend_from_slice(&compressed.into_inner());
+
+        let mut hasher = gix::hash::hasher(Kind::Sha1);
+        hasher.update(&pack);
+        let checksum = hasher.try_finalize().expect("hash the pack");
+        pack.extend_from_slice(checksum.as_bytes());
+        assert!(pack.len() < 1024 * 1024);
+        fs::write(&path, pack).expect("write the compressed pack");
+
+        assert!(matches!(
+            validate_pack_allocation_limits(&path, Kind::Sha1),
+            Err(ReceivePackError::ObjectLimit)
+        ));
+    }
+
+    fn pack_object_header(kind: u8, mut size: u64) -> Vec<u8> {
+        let mut header = vec![((kind & 0x07) << 4) | (size as u8 & 0x0f)];
+        size >>= 4;
+        while size != 0 {
+            *header.last_mut().expect("the header has one byte") |= 0x80;
+            header.push((size as u8) & 0x7f);
+            size >>= 7;
+        }
+        header
     }
 }

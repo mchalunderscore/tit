@@ -12,11 +12,11 @@ mod store;
 use std::time::{Duration, Instant};
 
 use search::{MetadataSearchError, MetadataSearchService};
-use store::{InitialAdministrator, NewIssue, NewRepository, RepositoryOrigin, Store};
+use store::{InitialAdministrator, NewRepository, RepositoryOrigin, Store};
 use tempfile::TempDir;
 
 #[test]
-fn searches_only_authorized_repository_and_issue_metadata_with_limits() {
+fn searches_only_authorized_repository_names_with_limits() {
     let directory = TempDir::new().expect("create a search fixture directory");
     let database = directory.path().join("tit.sqlite3");
     let mut store = Store::open(&database).expect("create the search database");
@@ -57,93 +57,39 @@ fn searches_only_authorized_repository_and_issue_metadata_with_limits() {
              VALUES ('22222222222222222222222222222222', 2, 'reader', 2);",
         )
         .expect("make one repository private");
-    store
-        .create_issue(&NewIssue {
-            owner: "alice",
-            repository: "public-project",
-            actor: "alice",
-            title: "Public Needle",
-            body: "The public body contains metadata.",
-            created_at: 3,
-        })
-        .expect("create a public issue");
-    store
-        .comment_issue(
-            "alice",
-            "public-project",
-            1,
-            "alice",
-            "A needle in a comment must not duplicate the issue result.",
-            4,
-        )
-        .expect("create a matching comment");
-    store
-        .create_issue(&NewIssue {
-            owner: "alice",
-            repository: "private-project",
-            actor: "alice",
-            title: "Private Secret",
-            body: "Only a repository reader can find this.",
-            created_at: 5,
-        })
-        .expect("create a private issue");
-    store
-        .connection()
-        .execute_batch(
-            "WITH RECURSIVE sequence(number) AS (
-                 VALUES (2)
-                 UNION ALL
-                 SELECT number + 1 FROM sequence WHERE number < 102
-             )
-             INSERT INTO issue
-                 (id, repository_id, number, title, body, state,
-                  author_account_id, created_at, updated_at, closed_at)
-             SELECT printf('%032x', number + 1000),
-                    '11111111111111111111111111111111',
-                    number, printf('Bulk match %03d', number), '',
-                    'open', 1, number + 10, number + 10, NULL
-             FROM sequence;",
-        )
-        .expect("create enough matches to reach the result limit");
     drop(store);
 
     let service = MetadataSearchService::new(&database);
     let public = service
-        .search(None, "NEEDLE")
-        .expect("search public metadata");
+        .search(None, "PUBLIC-PROJECT")
+        .expect("search public repositories");
     assert_eq!(public.results.len(), 1);
-    assert_eq!(public.query, "NEEDLE");
-    assert_eq!(public.results[0].kind, "Issue");
-    assert_eq!(public.results[0].url, "/alice/public-project/issues/1");
-    assert!(public.results[0].title.contains("Public Needle"));
-    assert!(public.results[0].summary.contains("public body"));
+    assert_eq!(public.query, "PUBLIC-PROJECT");
+    assert_eq!(public.results[0].kind, "Repository");
+    assert_eq!(public.results[0].url, "/alice/public-project");
+    assert!(public.results[0].title.contains("public-project"));
+    assert!(public.results[0].summary.is_empty());
     assert_eq!(public.results[0].stable_id.len(), 32);
     assert!(!public.truncated);
-    assert!(public.rows_scanned >= 3);
+    assert!(public.rows_scanned >= 1);
     assert!(public.bytes_scanned > 0);
 
-    let bounded = service
-        .search(None, "bulk match")
-        .expect("search more results than the output limit");
-    assert_eq!(bounded.results.len(), 100);
-    assert!(bounded.truncated);
-
     let reader = service
-        .search(Some("bob"), "private secret")
-        .expect("search private metadata as a reader");
+        .search(Some("bob"), "private-project")
+        .expect("search private repositories as a reader");
     assert_eq!(reader.results.len(), 1);
-    assert_eq!(reader.results[0].url, "/alice/private-project/issues/1");
+    assert_eq!(reader.results[0].url, "/alice/private-project");
     assert!(
         service
-            .search(Some("stranger"), "private secret")
-            .expect("search private metadata as a stranger")
+            .search(Some("stranger"), "private-project")
+            .expect("search private repositories as a stranger")
             .results
             .is_empty()
     );
 
     let restarted = MetadataSearchService::new(&database)
-        .search(None, "needle")
-        .expect("repeat metadata search after restart");
+        .search(None, "public-project")
+        .expect("repeat repository search after restart");
     assert_eq!(
         restarted
             .results
@@ -169,8 +115,8 @@ fn searches_only_authorized_repository_and_issue_metadata_with_limits() {
 }
 
 #[test]
-#[ignore = "M4.5 representative metadata search measurement"]
-fn measures_bounded_metadata_search_without_an_index() {
+#[ignore = "M4.5 representative repository name search measurement"]
+fn measures_bounded_repository_name_search_without_an_index() {
     let directory = TempDir::new().expect("create a search measurement directory");
     let database = directory.path().join("tit.sqlite3");
     let mut store = Store::open(&database).expect("create the search measurement database");
@@ -196,24 +142,22 @@ fn measures_bounded_metadata_search_without_an_index() {
                  UNION ALL
                  SELECT number + 1 FROM sequence WHERE number < 9999
              )
-             INSERT INTO issue
-                 (id, repository_id, number, title, body, state,
-                  author_account_id, created_at, updated_at, closed_at)
+             INSERT INTO repository
+                 (id, owner_account_id, slug, visibility, state, object_format,
+                  created_at, archived_at)
              SELECT printf('%032x', number),
-                    '33333333333333333333333333333333',
-                    number,
-                    printf('Issue %05d', number),
-                    printf('Representative metadata body %05d', number),
-                    'open', 1, number + 2, number + 2, NULL
+                    1,
+                    printf('repository-%05d', number),
+                    'public', 'active', 'sha1', number + 2, NULL
              FROM sequence;",
         )
-        .expect("create representative metadata");
+        .expect("create representative repositories");
     drop(store);
 
     let started = Instant::now();
     let outcome = MetadataSearchService::new(&database)
-        .search(None, "representative metadata body 09999")
-        .expect("measure metadata search");
+        .search(None, "repository-09999")
+        .expect("measure repository name search");
     let elapsed = started.elapsed();
     assert_eq!(outcome.results.len(), 1);
     assert_eq!(outcome.rows_scanned, 10_000);
@@ -235,6 +179,7 @@ fn create_repository(store: &mut Store, id: &str, slug: &str) {
             owner: "alice",
             slug,
             object_format: "sha1",
+            default_branch: "refs/heads/main",
             created_at: 2,
             origin: RepositoryOrigin::Created,
             initial_references: &[],

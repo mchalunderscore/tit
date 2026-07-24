@@ -72,10 +72,44 @@ impl WebLoginService {
         Store::open(&self.database)?.create_login_approval(&NewLoginApproval {
             secret_hash: &hash(secret.as_bytes()),
             csrf_hash: &hash(login_csrf.as_bytes()),
+            purpose: "login",
+            expected_username: None,
             created_at,
             expires_at,
         })?;
         Ok(IssuedLoginApproval { secret, login_csrf })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the Web session integration test imports this module without account routes"
+    )]
+    pub(crate) fn issue_account_approval(
+        &self,
+        username: &str,
+        csrf: &str,
+    ) -> Result<IssuedLoginApproval, SessionError> {
+        crate::auth::validate_username(username)?;
+        validate_token(csrf)?;
+        let created_at = now()?;
+        let expires_at = created_at
+            .checked_add(
+                i64::try_from(CHALLENGE_LIFETIME_SECONDS).map_err(|_| SessionError::Clock)?,
+            )
+            .ok_or(SessionError::Clock)?;
+        let secret = encode_hex(&random_bytes()?);
+        Store::open(&self.database)?.create_login_approval(&NewLoginApproval {
+            secret_hash: &hash(secret.as_bytes()),
+            csrf_hash: &hash(csrf.as_bytes()),
+            purpose: "account-key",
+            expected_username: Some(username),
+            created_at,
+            expires_at,
+        })?;
+        Ok(IssuedLoginApproval {
+            secret,
+            login_csrf: csrf.to_owned(),
+        })
     }
 
     pub(crate) fn approve(

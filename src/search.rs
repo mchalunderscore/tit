@@ -46,11 +46,8 @@ impl MetadataSearchService {
         let mut seen = BTreeSet::new();
         let mut results = Vec::new();
         let mut candidate_error = None;
-        let truncated = store.visit_metadata_search_candidates(
-            actor,
-            MAX_SCAN_ROWS,
-            MAX_SCAN_BYTES,
-            |candidate| {
+        let truncated =
+            store.visit_metadata_search_candidates(actor, MAX_SCAN_ROWS, |candidate| {
                 if started.elapsed() >= MAX_DURATION {
                     return false;
                 }
@@ -86,8 +83,7 @@ impl MetadataSearchService {
                 }
                 results.push(result);
                 true
-            },
-        )?;
+            })?;
         if let Some(error) = candidate_error {
             return Err(error);
         }
@@ -109,30 +105,13 @@ fn result_from_candidate(
         String::from_utf8(candidate.title).map_err(|_| MetadataSearchError::StoredCandidate)?;
     let body =
         String::from_utf8(candidate.body).map_err(|_| MetadataSearchError::StoredCandidate)?;
-    let (kind, url, title) = match candidate.kind.as_str() {
-        "repository" => (
-            "Repository",
-            format!("/{}/{}", candidate.owner, candidate.repository),
-            title,
-        ),
-        "issue" | "issue-comment" => {
-            let number = candidate
-                .issue_number
-                .ok_or(MetadataSearchError::StoredCandidate)?;
-            (
-                "Issue",
-                format!(
-                    "/{}/{}/issues/{number}",
-                    candidate.owner, candidate.repository
-                ),
-                format!(
-                    "{}/{} #{number}: {}",
-                    candidate.owner, candidate.repository, title
-                ),
-            )
-        }
-        _ => return Err(MetadataSearchError::StoredCandidate),
-    };
+    if candidate.kind != "repository" {
+        return Err(MetadataSearchError::StoredCandidate);
+    }
+    let (kind, url) = (
+        "Repository",
+        format!("/{}/{}", candidate.owner, candidate.repository),
+    );
     let summary = body
         .split_whitespace()
         .collect::<Vec<_>>()

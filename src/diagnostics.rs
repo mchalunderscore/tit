@@ -21,11 +21,8 @@ const REQUIRED_INDEXES: &[&str] = &[
     "feed_token_account_active",
     "feed_token_repository_active",
     "git_operation_intent_incomplete",
-    "issue_assignee_account",
     "issue_comment_history",
-    "issue_label_label",
     "issue_repository_state",
-    "label_repository_name",
     "login_nonce_active",
     "m1a_child_state_parent",
     "m1a_parent_created_at",
@@ -89,7 +86,8 @@ pub(crate) fn inspect_repository(
 ) -> Result<RepositoryInspection, DiagnosticError> {
     let store = Store::open_read_only(&config.instance_dir.join(DATABASE_FILE))?;
     let repository = store.repository(owner, slug)?;
-    check_repository(&config.instance_dir, &repository)?;
+    let default_branch = store.repository_default_branch(owner, slug)?;
+    check_repository(&config.instance_dir, &repository, &default_branch)?;
     Ok(repository.into())
 }
 
@@ -118,7 +116,9 @@ fn check_repositories(instance_dir: &Path, store: &Store) -> Result<(), Diagnost
         .map(|repository| format!("{}.git", repository.id))
         .collect();
     for repository in &repositories {
-        check_repository(instance_dir, repository)?;
+        let default_branch =
+            store.repository_default_branch(&repository.owner, &repository.slug)?;
+        check_repository(instance_dir, repository, &default_branch)?;
     }
     for entry in fs::read_dir(&root).map_err(|source| DiagnosticError::Io {
         path: root.clone(),
@@ -141,6 +141,7 @@ fn check_repositories(instance_dir: &Path, store: &Store) -> Result<(), Diagnost
 fn check_repository(
     instance_dir: &Path,
     repository: &crate::store::RepositoryRecord,
+    default_branch: &str,
 ) -> Result<(), DiagnosticError> {
     let path = instance_dir
         .join(REPOSITORY_DIRECTORY)
@@ -160,6 +161,9 @@ fn check_repository(
     };
     if format != repository.object_format {
         return Err(DiagnosticError::ObjectFormat(repository.id.clone()));
+    }
+    if git.default_branch()?.as_deref() != Some(default_branch) {
+        return Err(DiagnosticError::DefaultBranch(repository.id.clone()));
     }
     git.integrity_check()?;
 
@@ -245,6 +249,8 @@ pub(crate) enum DiagnosticError {
     QuarantineDebris(PathBuf),
     #[error("repository object format does not match its database record: {0}")]
     ObjectFormat(String),
+    #[error("repository default branch does not match its database record: {0}")]
+    DefaultBranch(String),
     #[error("repository object format is not supported")]
     UnsupportedObjectFormat,
     #[error("diagnostic I/O failed for {path}: {source}")]

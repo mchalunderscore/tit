@@ -107,6 +107,8 @@ async fn serves_the_semantic_shell_without_javascript() {
     assert_eq!(css.header("content-type"), "text/css; charset=utf-8");
     assert_eq!(css.header("cache-control"), "no-cache");
     assert_eq!(css.body, include_str!("../assets/style.css"));
+    assert!(css.body.contains("@media (max-width: 44rem)"));
+    assert!(css.body.contains(".two-column"));
     assert_security_policy(&css);
 
     let css_head = request(server.address(), "HEAD", "/assets/style.css", &[]);
@@ -250,8 +252,21 @@ async fn serves_useful_errors_and_owns_request_ids() {
 async fn enforces_request_and_login_attempt_limits() {
     let server = start().await;
 
-    for _ in 0..10 {
-        assert_eq!(request(server.address(), "POST", "/login", &[]).status, 400);
+    for attempt in 0..10 {
+        let forwarded = format!("for=192.0.2.{attempt}");
+        assert_eq!(
+            request(
+                server.address(),
+                "POST",
+                "/login",
+                &[
+                    ("Forwarded", &forwarded),
+                    ("X-Forwarded-For", "198.51.100.1")
+                ]
+            )
+            .status,
+            400
+        );
     }
     let limited = request(server.address(), "POST", "/login", &[]);
     assert_eq!(limited.status, 429);
@@ -261,6 +276,20 @@ async fn enforces_request_and_login_attempt_limits() {
     assert_eq!(oversized.status, 413);
 
     server.shutdown().await.expect("stop the Web server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rate_limits_signup_and_recovery() {
+    for path in ["/signup", "/recover"] {
+        let server = start().await;
+        for _ in 0..10 {
+            assert_eq!(request(server.address(), "POST", path, &[]).status, 400);
+        }
+        let limited = request(server.address(), "POST", path, &[]);
+        assert_eq!(limited.status, 429);
+        assert_eq!(limited.body, "Account attempt limit exceeded.\n");
+        server.shutdown().await.expect("stop the Web server");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -25,6 +25,9 @@ mod maintenance;
 )]
 #[path = "../src/policy.rs"]
 mod policy;
+#[allow(dead_code, reason = "the SSH identity test does not use pull requests")]
+#[path = "../src/pull_request.rs"]
+mod pull_request;
 #[path = "../src/rate_limit.rs"]
 mod rate_limit;
 #[allow(
@@ -102,10 +105,17 @@ async fn reports_available_commands_and_explains_invalid_commands() {
     );
     let help_text = String::from_utf8(help.stdout).expect("read the help output");
     assert!(help_text.contains("Available tit SSH commands:"));
-    assert!(help_text.contains("login ONE-TIME-SECRET"));
+    assert!(help_text.contains("auth ONE-TIME-SECRET"));
     assert!(help_text.contains("repo create NAME"));
     assert!(!help_text.contains("object-format"));
     assert!(help_text.contains("issue list OWNER/REPOSITORY"));
+    assert!(help_text.contains("issue comment OWNER/REPOSITORY NUMBER"));
+    assert!(help_text.contains("issue close OWNER/REPOSITORY NUMBER"));
+    assert!(help_text.contains("issue reopen OWNER/REPOSITORY NUMBER"));
+    assert!(help_text.contains("pr list OWNER/REPOSITORY"));
+    assert!(help_text.contains("pr create OWNER/REPOSITORY BASE HEAD"));
+    assert!(help_text.contains("pr close OWNER/REPOSITORY NUMBER"));
+    assert!(help_text.contains("pr reopen OWNER/REPOSITORY NUMBER"));
     assert!(help_text.contains("pr checkout OWNER/REPOSITORY NUMBER"));
 
     let invalid = ssh(&server, &private_key, "alice", &["not-a-command"]);

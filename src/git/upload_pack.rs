@@ -1,4 +1,7 @@
+use std::collections::HashSet;
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use gix::hash::{Kind, ObjectId};
 use thiserror::Error;
@@ -9,6 +12,7 @@ use super::packetline::{
 use super::repository::{GitReference, GitRepository, GitRepositoryError};
 
 const AGENT: &str = concat!("tit/", env!("CARGO_PKG_VERSION"));
+const MAX_NEGOTIATION_IDS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProtocolVersion {
@@ -51,10 +55,19 @@ impl UploadPack {
         version: ProtocolVersion,
         request: &[u8],
     ) -> Result<Vec<u8>, UploadPackError> {
+        self.respond_with_cancellation(version, request, &AtomicBool::new(false))
+    }
+
+    pub(crate) fn respond_with_cancellation(
+        &self,
+        version: ProtocolVersion,
+        request: &[u8],
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<u8>, UploadPackError> {
         let packets = decode(request)?;
         match version {
-            ProtocolVersion::V0 | ProtocolVersion::V1 => self.respond_v1(&packets),
-            ProtocolVersion::V2 => self.respond_v2(&packets),
+            ProtocolVersion::V0 | ProtocolVersion::V1 => self.respond_v1(&packets, cancelled),
+            ProtocolVersion::V2 => self.respond_v2(&packets, cancelled),
         }
     }
 
@@ -126,9 +139,15 @@ impl UploadPack {
         Ok(())
     }
 
-    fn respond_v1(&self, packets: &[Packet]) -> Result<Vec<u8>, UploadPackError> {
+    fn respond_v1(
+        &self,
+        packets: &[Packet],
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<u8>, UploadPackError> {
         let mut wants = Vec::new();
         let mut haves = Vec::new();
+        let mut unique_wants = HashSet::new();
+        let mut unique_haves = HashSet::new();
         let mut done = false;
         for packet in packets {
             let Packet::Data(line) = packet else {
@@ -137,27 +156,40 @@ impl UploadPack {
             let line = trim_line(line);
             if let Some(value) = line.strip_prefix(b"want ") {
                 let id = value.split(|byte| *byte == b' ').next().unwrap_or_default();
-                wants.push(self.parse_id(id)?);
+                let id = self.parse_id(id)?;
+                if unique_wants.insert(id) {
+                    wants.push(id);
+                }
             } else if let Some(value) = line.strip_prefix(b"have ") {
-                haves.push(self.parse_id(value)?);
+                let id = self.parse_id(value)?;
+                if unique_haves.insert(id) {
+                    haves.push(id);
+                }
             } else if line == b"done" {
                 done = true;
             } else {
                 return Err(UploadPackError::UnsupportedRequest);
+            }
+            if wants.len() > MAX_NEGOTIATION_IDS || haves.len() > MAX_NEGOTIATION_IDS {
+                return Err(UploadPackError::NegotiationLimit);
             }
         }
         if !done || wants.is_empty() {
             return Err(UploadPackError::IncompleteNegotiation);
         }
 
-        let pack = self.repository.make_pack(&wants, &haves)?;
-        let mut output = Vec::with_capacity(pack.len() + 8);
+        let mut output = Vec::new();
         encode_data(b"NAK\n", &mut output)?;
-        output.extend_from_slice(&pack);
+        self.repository
+            .write_pack(&wants, &haves, &mut output, cancelled)?;
         Ok(output)
     }
 
-    fn respond_v2(&self, packets: &[Packet]) -> Result<Vec<u8>, UploadPackError> {
+    fn respond_v2(
+        &self,
+        packets: &[Packet],
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<u8>, UploadPackError> {
         let delimiter = packets
             .iter()
             .position(|packet| *packet == Packet::Delimiter)
@@ -166,7 +198,7 @@ impl UploadPack {
         let arguments = &packets[delimiter + 1..];
         match command {
             b"ls-refs" => self.respond_ls_refs(arguments),
-            b"fetch" => self.respond_fetch(arguments),
+            b"fetch" => self.respond_fetch(arguments, cancelled),
             _ => Err(UploadPackError::UnsupportedRequest),
         }
     }
@@ -211,18 +243,30 @@ impl UploadPack {
         Ok(output)
     }
 
-    fn respond_fetch(&self, packets: &[Packet]) -> Result<Vec<u8>, UploadPackError> {
+    fn respond_fetch(
+        &self,
+        packets: &[Packet],
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<u8>, UploadPackError> {
         let mut wants = Vec::new();
         let mut haves = Vec::new();
+        let mut unique_wants = HashSet::new();
+        let mut unique_haves = HashSet::new();
         let mut done = false;
         for packet in packets {
             match packet {
                 Packet::Data(line) => {
                     let line = trim_line(line);
                     if let Some(value) = line.strip_prefix(b"want ") {
-                        wants.push(self.parse_id(value)?);
+                        let id = self.parse_id(value)?;
+                        if unique_wants.insert(id) {
+                            wants.push(id);
+                        }
                     } else if let Some(value) = line.strip_prefix(b"have ") {
-                        haves.push(self.parse_id(value)?);
+                        let id = self.parse_id(value)?;
+                        if unique_haves.insert(id) {
+                            haves.push(id);
+                        }
                     } else if line == b"done" {
                         done = true;
                     } else if !matches!(
@@ -230,6 +274,9 @@ impl UploadPack {
                         b"thin-pack" | b"no-progress" | b"include-tag" | b"ofs-delta"
                     ) {
                         return Err(UploadPackError::UnsupportedRequest);
+                    }
+                    if wants.len() > MAX_NEGOTIATION_IDS || haves.len() > MAX_NEGOTIATION_IDS {
+                        return Err(UploadPackError::NegotiationLimit);
                     }
                 }
                 Packet::Flush => {}
@@ -249,10 +296,16 @@ impl UploadPack {
             return Ok(output);
         }
 
-        let pack = self.repository.make_pack(&wants, &haves)?;
-        let mut output = Vec::with_capacity(pack.len() + 32);
+        let mut output = Vec::new();
         encode_data(b"packfile\n", &mut output)?;
-        encode_sideband(&pack, &mut output)?;
+        self.repository.write_pack(
+            &wants,
+            &haves,
+            SidebandWriter {
+                output: &mut output,
+            },
+            cancelled,
+        )?;
         encode_flush(&mut output);
         Ok(output)
     }
@@ -263,6 +316,21 @@ impl UploadPack {
             return Err(UploadPackError::InvalidObjectId);
         }
         Ok(id)
+    }
+}
+
+struct SidebandWriter<'a> {
+    output: &'a mut Vec<u8>,
+}
+
+impl Write for SidebandWriter<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        encode_sideband(data, self.output).map_err(std::io::Error::other)?;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -328,6 +396,8 @@ pub(crate) enum UploadPackError {
     UnsupportedRequest,
     #[error("upload-pack object ID is not valid for this repository")]
     InvalidObjectId,
+    #[error("upload-pack negotiation exceeds the object ID limit")]
+    NegotiationLimit,
     #[error("upload-pack negotiation is incomplete")]
     IncompleteNegotiation,
 }

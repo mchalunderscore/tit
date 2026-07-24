@@ -68,6 +68,12 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: RepairCommand,
     },
+    /// Prune old terminal records and compact the database
+    Maintenance {
+        /// Retain terminal records for this number of days
+        #[arg(long, default_value_t = 365)]
+        retention_days: u32,
+    },
     /// Create a backup archive
     Backup {
         /// Write the backup archive to FILE
@@ -151,12 +157,7 @@ pub(crate) enum AccountCommand {
 #[derive(Clone, Debug, Subcommand)]
 pub(crate) enum RepositoryCommand {
     /// Create an empty repository
-    Create {
-        owner: String,
-        slug: String,
-        #[arg(long, value_enum, default_value_t = ObjectFormat::Sha1)]
-        object_format: ObjectFormat,
-    },
+    Create { owner: String, slug: String },
     /// Import a bare repository
     Import {
         owner: String,
@@ -205,13 +206,6 @@ pub(crate) enum CollaboratorRole {
     Maintainer,
     Writer,
     Reader,
-}
-
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
-pub(crate) enum ObjectFormat {
-    #[default]
-    Sha1,
-    Sha256,
 }
 
 #[derive(Clone, Debug, Subcommand)]

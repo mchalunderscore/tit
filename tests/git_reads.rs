@@ -1,3 +1,5 @@
+#[path = "../src/git/patch.rs"]
+mod patch;
 #[allow(
     dead_code,
     reason = "the test uses each public read contract selectively"
@@ -7,6 +9,7 @@ mod read;
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -17,6 +20,7 @@ use tempfile::TempDir;
 
 struct Fixture {
     _directory: TempDir,
+    worktree: PathBuf,
     bare: PathBuf,
     first: ObjectId,
     second: ObjectId,
@@ -71,6 +75,8 @@ fn reads_repository_content_for_both_object_formats() {
                 b"README.md".as_slice(),
                 b"binary".as_slice(),
                 b"docs".as_slice(),
+                b"mode.sh".as_slice(),
+                b"renamed.txt".as_slice(),
                 b"src".as_slice()
             ]
         );
@@ -154,6 +160,22 @@ fn produces_bounded_diffs_blame_and_streaming_archives() {
         .expect("find the binary diff");
     assert!(binary.binary);
     assert!(binary.hunks.is_empty());
+    let mut patch = Vec::new();
+    patch::write_patch(&diff, &mut patch).expect("write an applicable patch");
+    let patch_path = fixture
+        .bare
+        .parent()
+        .expect("a fixture parent")
+        .join("change.patch");
+    fs::write(&patch_path, &patch).expect("write a patch fixture");
+    run(Command::new("git")
+        .args(["checkout", "-q", "--detach"])
+        .arg(fixture.first.to_string())
+        .current_dir(&fixture.worktree));
+    run(Command::new("git")
+        .args(["apply", "--check"])
+        .arg(&patch_path)
+        .current_dir(&fixture.worktree));
 
     let blame = service
         .blame(fixture.second, b"src/lib.rs", &cancellation)
@@ -296,6 +318,16 @@ fn enforces_each_read_boundary_and_rejects_unsafe_paths() {
     assert!(matches!(
         service.archive(fixture.second, &cancellation, &mut Vec::new()),
         Err(ReadError::Limit("archive bytes"))
+    ));
+
+    let limits = ReadLimits {
+        max_archive_depth: 0,
+        ..ReadLimits::default()
+    };
+    let service = RepositoryReadService::open(&fixture.bare, limits).expect("open the service");
+    assert!(matches!(
+        service.archive(fixture.second, &cancellation, &mut Vec::new()),
+        Err(ReadError::Limit("archive tree depth"))
     ));
 
     let limits = ReadLimits {
@@ -454,6 +486,9 @@ fn fixture(object_format: &str) -> Fixture {
     fs::write(worktree.join("README.md"), b"Tit read service\n").expect("write a README");
     fs::write(worktree.join("src/lib.rs"), b"one\ntwo\n").expect("write source");
     fs::write(worktree.join("binary"), b"old\0binary").expect("write binary content");
+    fs::write(worktree.join("deleted.txt"), b"delete this\n").expect("write deleted content");
+    fs::write(worktree.join("rename-me.txt"), b"renamed content\n").expect("write renamed content");
+    fs::write(worktree.join("mode.sh"), b"#!/bin/sh\n").expect("write mode content");
     run(Command::new("git")
         .args(["add", "."])
         .current_dir(&worktree));
@@ -470,6 +505,11 @@ fn fixture(object_format: &str) -> Fixture {
     fs::create_dir(worktree.join("docs")).expect("create a documentation directory");
     fs::write(worktree.join("src/lib.rs"), b"one\nchanged\nthree\n").expect("change source");
     fs::write(worktree.join("binary"), b"new\0binary").expect("change binary content");
+    fs::remove_file(worktree.join("deleted.txt")).expect("delete content");
+    fs::rename(worktree.join("rename-me.txt"), worktree.join("renamed.txt"))
+        .expect("rename content");
+    fs::set_permissions(worktree.join("mode.sh"), fs::Permissions::from_mode(0o755))
+        .expect("change file mode");
     fs::write(worktree.join("docs/note.txt"), b"note \xff needle\n").expect("write documentation");
     let long_directory = worktree.join("docs").join("a".repeat(60));
     fs::create_dir(&long_directory).expect("create a long archive directory");
@@ -494,6 +534,7 @@ fn fixture(object_format: &str) -> Fixture {
         .arg(&bare));
     Fixture {
         _directory: directory,
+        worktree,
         bare,
         first,
         second,

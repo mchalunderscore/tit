@@ -58,9 +58,6 @@ for required in \
     "$package/LICENSE" \
     "$package/README.md" \
     "$package/etc/tit/config.toml" \
-    "$package/share/doc/tit/install.md" \
-    "$package/share/doc/tit/upgrade.md" \
-    "$package/share/doc/tit/disaster-recovery.md" \
     "$package/share/doc/tit/examples/Caddyfile" \
     "$package/share/man/man1/tit.1" \
     "$package/share/bash-completion/completions/tit" \

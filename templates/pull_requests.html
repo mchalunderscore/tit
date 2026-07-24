@@ -7,6 +7,16 @@
   </header>
 
   <h2>Pull requests</h2>
+  <form method="get" action="/{{ owner }}/{{ repository }}/pulls">
+    <label for="pull-request-state">State</label>
+    <select id="pull-request-state" name="state">
+      <option value="open"{% if state_open %} selected{% endif %}>Open</option>
+      <option value="closed"{% if state_closed %} selected{% endif %}>Closed</option>
+      <option value="merged"{% if state_merged %} selected{% endif %}>Merged</option>
+      <option value="all"{% if state_all %} selected{% endif %}>All</option>
+    </select>
+    <button type="submit">Filter</button>
+  </form>
 {% if pull_requests.is_empty() %}
   <p>This repository has no pull requests.</p>
 {% else %}
@@ -15,6 +25,16 @@
     <li><a href="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}">#{{ pull_request.number }} {{ pull_request.title }}</a> — {{ pull_request.state }}, opened by {{ pull_request.author }}, updated <time datetime="{{ pull_request.updated_at }}">{{ pull_request.updated_at|human_time }}</time></li>
 {% endfor %}
   </ol>
+{% if has_previous || has_next %}
+  <nav class="pagination" aria-label="Pull-request pages">
+{% if has_previous %}
+    <a href="/{{ owner }}/{{ repository }}/pulls?state={{ state }}&page={{ previous_page }}">Newer pull requests</a>
+{% endif %}
+{% if has_next %}
+    <a href="/{{ owner }}/{{ repository }}/pulls?state={{ state }}&page={{ next_page }}">Older pull requests</a>
+{% endif %}
+  </nav>
+{% endif %}
 {% endif %}
 
 {% if can_create %}
@@ -32,7 +52,7 @@
       </div>
       <div class="field">
         <label for="pull-request-base">Base branch</label>
-        <input id="pull-request-base" name="base-ref" list="repository-branches" maxlength="1024" value="refs/heads/main" required>
+        <input id="pull-request-base" name="base-ref" list="repository-branches" maxlength="1024" value="{{ default_branch }}" required>
       </div>
       <div class="field">
         <label for="pull-request-head">Head branch</label>

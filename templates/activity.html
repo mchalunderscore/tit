@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Activity · tit{% endblock %}
+{% block content %}
+  <h1>Activity</h1>
+  <p>Events from repositories that you watch.</p>
+{% if events.is_empty() %}
+  <p>No watched activity is available.</p>
+{% else %}
+  <ol class="activity-list">
+{% for event in events %}
+    <li data-event-id="{{ event.event_id }}">
+      <a href="{{ event.link }}">{{ event.title }}</a>
+      <span>{{ event.created_at|human_time }}</span>
+    </li>
+{% endfor %}
+  </ol>
+{% endif %}
+{% if has_next %}
+  <nav class="pagination" aria-label="Activity pages">
+    <a href="/activity?before-time={{ next_before_time }}&amp;before-id={{ next_before_id }}">Older activity</a>
+  </nav>
+{% endif %}
+{% endblock %}

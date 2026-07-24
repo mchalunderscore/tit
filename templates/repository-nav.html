@@ -4,7 +4,9 @@
       <a href="/{{ owner }}/{{ repository }}/issues">Issues</a>
       <a href="/{{ owner }}/{{ repository }}/pulls">Pull requests</a>
       <a href="/{{ owner }}/{{ repository }}/watch">Watch</a>
-      <a href="/{{ owner }}/{{ repository }}/atom.xml">Atom</a>
       <a href="/{{ owner }}/{{ repository }}/rss.xml">RSS</a>
       <a href="/{{ owner }}/{{ repository }}/search">Search</a>
+{% if signed_in %}
+      <a href="/{{ owner }}/{{ repository }}/settings">Settings</a>
+{% endif %}
     </nav>

@@ -13,6 +13,33 @@
     <p>Head: <code>{{ pull_request.head_ref }}</code> at <code title="{{ pull_request.head_object_id }}">{{ pull_request.head_object_id|short_id }}</code></p>
     <p>Fetch: <code>git fetch origin refs/pull/{{ pull_request.number }}/head</code></p>
     <div class="markdown">{{ body_html|safe }}</div>
+{% if can_edit %}
+    <details>
+      <summary>Edit pull request</summary>
+      <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/edit">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <div class="field">
+          <label for="pull-request-title">Title</label>
+          <input id="pull-request-title" name="title" value="{{ pull_request.title }}" maxlength="200" required>
+        </div>
+        <div class="field">
+          <label for="pull-request-body">Description (Markdown)</label>
+          <textarea id="pull-request-body" name="body" maxlength="262144" rows="10">{{ pull_request.body }}</textarea>
+        </div>
+        <button type="submit">Save pull request</button>
+      </form>
+    </details>
+{% endif %}
+{% if can_change_state %}
+    <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/state">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+{% if is_open %}
+      <button type="submit" name="state" value="closed">Close pull request</button>
+{% else %}
+      <button type="submit" name="state" value="open">Reopen pull request</button>
+{% endif %}
+    </form>
+{% endif %}
   </article>
 
   <section aria-labelledby="revisions-heading">
@@ -21,6 +48,7 @@
 {% for revision in revisions %}
       <li value="{{ revision.number }}">
         {{ revision.author }} recorded <code title="{{ revision.head_object_id }}">{{ revision.head_object_id|short_id }}</code> against <code title="{{ revision.base_object_id }}">{{ revision.base_object_id|short_id }}</code> at <time datetime="{{ revision.created_at }}">{{ revision.created_at|human_time }}</time>.
+        <a href="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/revisions/{{ revision.number }}.patch">Download patch</a>
 {% if revision.number == selected_revision %}
         <strong>Selected</strong>
 {% else %}
@@ -53,6 +81,16 @@
     </article>
 {% endfor %}
 {% endif %}
+{% if reviews_has_previous || reviews_has_next %}
+    <nav aria-label="Review pages">
+{% if reviews_has_previous %}
+      <a href="?revision={{ selected_revision }}&amp;reviews_page={{ reviews_previous_page }}&amp;timeline_page={{ timeline_page }}">Newer reviews</a>
+{% endif %}
+{% if reviews_has_next %}
+      <a href="?revision={{ selected_revision }}&amp;reviews_page={{ reviews_next_page }}&amp;timeline_page={{ timeline_page }}">Older reviews</a>
+{% endif %}
+    </nav>
+{% endif %}
   </section>
 
   <section aria-labelledby="timeline-heading">
@@ -62,6 +100,16 @@
       <li value="{{ event.sequence }}">{{ event.actor }} {{ event.kind|event_name }} at <time datetime="{{ event.created_at }}">{{ event.created_at|human_time }}</time></li>
 {% endfor %}
     </ol>
+{% if timeline_has_previous || timeline_has_next %}
+    <nav aria-label="Timeline pages">
+{% if timeline_has_previous %}
+      <a href="?revision={{ selected_revision }}&amp;reviews_page={{ reviews_page }}&amp;timeline_page={{ timeline_previous_page }}">Newer events</a>
+{% endif %}
+{% if timeline_has_next %}
+      <a href="?revision={{ selected_revision }}&amp;reviews_page={{ reviews_page }}&amp;timeline_page={{ timeline_next_page }}">Older events</a>
+{% endif %}
+    </nav>
+{% endif %}
   </section>
 
   <section aria-labelledby="comparison-heading">

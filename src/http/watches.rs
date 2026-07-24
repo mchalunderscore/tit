@@ -7,7 +7,7 @@ use axum::response::Response;
 use axum::routing::get;
 use serde::Deserialize;
 
-use crate::store::{StoreError, WatchPreferences};
+use crate::store::StoreError;
 use crate::watch::WatchError;
 
 use super::{
@@ -44,17 +44,7 @@ async fn watch_page(
     match result {
         Ok((record, watch)) => {
             let csrf = cookie(&headers, CSRF_COOKIE).unwrap_or_default();
-            let preferences = watch
-                .map(|record| WatchPreferences {
-                    pushes: record.pushes,
-                    issues: record.issues,
-                    pull_requests: record.pull_requests,
-                })
-                .unwrap_or(WatchPreferences {
-                    pushes: false,
-                    issues: false,
-                    pull_requests: false,
-                });
+            let watching = watch.is_some();
             render(
                 StatusCode::OK,
                 &WatchTemplate {
@@ -64,10 +54,7 @@ async fn watch_page(
                     repository: &record.slug,
                     csrf: &csrf,
                     can_change: authenticated && !csrf.is_empty(),
-                    pushes: preferences.pushes,
-                    issues: preferences.issues,
-                    pull_requests: preferences.pull_requests,
-                    watching: preferences.any(),
+                    watching,
                 },
             )
         }
@@ -82,24 +69,13 @@ async fn set_watch(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let fields = match parse_named_form(
-        &headers,
-        &body,
-        &["csrf", "pushes", "issues", "pull-requests"],
-    ) {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "state"]) {
         Ok(fields) => fields,
         Err(()) => return watch_bad_request(&request_id.0),
     };
-    let preferences = match (
-        preference(&fields[1]),
-        preference(&fields[2]),
-        preference(&fields[3]),
-    ) {
-        (Ok(pushes), Ok(issues), Ok(pull_requests)) => WatchPreferences {
-            pushes,
-            issues,
-            pull_requests,
-        },
+    let watching = match fields[1].as_str() {
+        "watch" => true,
+        "unwatch" => false,
         _ => return watch_bad_request(&request_id.0),
     };
     let actor =
@@ -113,7 +89,7 @@ async fn set_watch(
     let owner = path.owner.clone();
     let repository = path.repository.clone();
     let result = watch_job(state, move || {
-        service.set(&owner, &repository, &actor, preferences)
+        service.set(&owner, &repository, &actor, watching)
     })
     .await;
     match result {
@@ -145,14 +121,6 @@ async fn watch_job<T: Send + 'static>(
     })
     .await
     .map_err(|_| WatchError::Store(StoreError::Integrity("watch worker failed".to_owned())))?
-}
-
-fn preference(value: &str) -> Result<bool, ()> {
-    match value {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        _ => Err(()),
-    }
 }
 
 fn watch_error(error: WatchError, request_id: &str) -> Response {
@@ -204,8 +172,5 @@ struct WatchTemplate<'a> {
     repository: &'a str,
     csrf: &'a str,
     can_change: bool,
-    pushes: bool,
-    issues: bool,
-    pull_requests: bool,
     watching: bool,
 }

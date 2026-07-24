@@ -9,12 +9,6 @@
   <article>
     <h2>#{{ number }} {{ title }}</h2>
     <p>{{ state }} · opened by {{ author }} at <time datetime="{{ created_at }}">{{ created_at|human_time }}</time> · updated <time datetime="{{ updated_at }}">{{ updated_at|human_time }}</time></p>
-{% if labels.is_empty() %}{% else %}
-    <p>Labels:{% for label in labels %} <span>{{ label }}</span>{% endfor %}</p>
-{% endif %}
-{% if assignees.is_empty() %}{% else %}
-    <p>Assignees:{% for assignee in assignees %} <span>{{ assignee }}</span>{% endfor %}</p>
-{% endif %}
     <div class="markdown">{{ body_html|safe }}</div>
   </article>
 
@@ -30,6 +24,16 @@
     </article>
 {% endfor %}
 {% endif %}
+{% if comments_has_previous || comments_has_next %}
+    <nav aria-label="Comment pages">
+{% if comments_has_previous %}
+      <a href="?comments_page={{ comments_previous_page }}&amp;timeline_page={{ timeline_page }}">Newer comments</a>
+{% endif %}
+{% if comments_has_next %}
+      <a href="?comments_page={{ comments_next_page }}&amp;timeline_page={{ timeline_page }}">Older comments</a>
+{% endif %}
+    </nav>
+{% endif %}
   </section>
 
   <section aria-labelledby="timeline-heading">
@@ -39,6 +43,16 @@
       <li value="{{ event.sequence }}">{{ event.actor }} {{ event.kind|event_name }} at <time datetime="{{ event.created_at }}">{{ event.created_at|human_time }}</time></li>
 {% endfor %}
     </ol>
+{% if timeline_has_previous || timeline_has_next %}
+    <nav aria-label="Timeline pages">
+{% if timeline_has_previous %}
+      <a href="?comments_page={{ comments_page }}&amp;timeline_page={{ timeline_previous_page }}">Newer events</a>
+{% endif %}
+{% if timeline_has_next %}
+      <a href="?comments_page={{ comments_page }}&amp;timeline_page={{ timeline_next_page }}">Older events</a>
+{% endif %}
+    </nav>
+{% endif %}
   </section>
 
 {% if can_comment %}
@@ -83,27 +97,4 @@
   </section>
 {% endif %}
 
-{% if can_maintain %}
-  <section aria-labelledby="organize-heading">
-    <h2 id="organize-heading">Organize this issue</h2>
-    <form method="post" action="/{{ owner }}/{{ repository }}/issues/{{ number }}/labels">
-      <input type="hidden" name="csrf" value="{{ csrf }}">
-      <div class="field">
-        <label for="label-name">Label</label>
-        <input id="label-name" name="label" maxlength="80" required>
-      </div>
-      <button name="operation" value="add" type="submit">Add label</button>
-      <button name="operation" value="remove" type="submit">Remove label</button>
-    </form>
-    <form method="post" action="/{{ owner }}/{{ repository }}/issues/{{ number }}/assignees">
-      <input type="hidden" name="csrf" value="{{ csrf }}">
-      <div class="field">
-        <label for="assignee-name">Assignee</label>
-        <input id="assignee-name" name="assignee" maxlength="39" required>
-      </div>
-      <button name="operation" value="add" type="submit">Assign</button>
-      <button name="operation" value="remove" type="submit">Unassign</button>
-    </form>
-  </section>
-{% endif %}
 {% endblock %}

@@ -80,7 +80,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -125,7 +125,7 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
         assert!(!summary_text.contains("<img"));
         assert!(!summary_text.contains("tracker.example"));
         assert!(summary_text.contains("&#60;script&#62;alert(3)&#60;/script&#62;"));
-        assert!(summary_text.contains("/alice/example/atom.xml"));
+        assert!(!summary_text.contains("/alice/example/atom.xml"));
         assert!(summary_text.contains("/alice/example/rss.xml"));
         assert!(summary_text.contains("/alice/example/search"));
         assert!(summary_text.contains("/alice/example/commits\">View all commits</a>"));
@@ -185,17 +185,9 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
             .status,
             400
         );
-        let mut feed_entry_ids = Vec::new();
-        for (path, content_type) in [
-            (
-                "/alice/example/atom.xml",
-                "application/atom+xml; charset=utf-8",
-            ),
-            (
-                "/alice/example/rss.xml",
-                "application/rss+xml; charset=utf-8",
-            ),
-        ] {
+        {
+            let path = "/alice/example/rss.xml";
+            let content_type = "application/rss+xml; charset=utf-8";
             let feed = request(server.address(), "GET", path, &[], &[]);
             assert_eq!(feed.status, 200);
             assert_eq!(feed.header("content-type"), content_type);
@@ -205,7 +197,6 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
             let parsed = feed_rs::parser::parse(feed.body.as_slice()).expect("parse the feed");
             assert_eq!(parsed.entries.len(), 1);
             assert!(parsed.entries[0].id.starts_with("urn:tit:event:"));
-            feed_entry_ids.push(parsed.entries[0].id.clone());
             assert!(feed.text().contains("Repository imported"));
 
             let etag = feed.header("etag");
@@ -234,12 +225,15 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
             assert!(head.body.is_empty());
             assert_eq!(head.header("etag"), feed.header("etag"));
         }
-        assert_eq!(feed_entry_ids[0], feed_entry_ids[1]);
+        assert_eq!(
+            request(server.address(), "GET", "/alice/example/atom.xml", &[], &[]).status,
+            404
+        );
 
         let invalid_page = request(
             server.address(),
             "GET",
-            "/alice/example/atom.xml?before=0",
+            "/alice/example/rss.xml?before=0",
             &[],
             &[],
         );
@@ -271,7 +265,7 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
                 .expect("insert a page fixture event");
         }
         drop(feed_store);
-        let first_page = request(server.address(), "GET", "/alice/example/atom.xml", &[], &[]);
+        let first_page = request(server.address(), "GET", "/alice/example/rss.xml", &[], &[]);
         let first_feed =
             feed_rs::parser::parse(first_page.body.as_slice()).expect("parse the first page");
         assert_eq!(first_feed.entries.len(), 20);
@@ -330,6 +324,27 @@ async fn browses_and_clones_public_repositories_for_both_hash_formats() {
                 response.body.len().to_string()
             );
         }
+        let patch = request(
+            server.address(),
+            "GET",
+            &format!("/alice/example/commit/{}.patch", fixture.head),
+            &[],
+            &[],
+        );
+        assert_eq!(patch.status, 200);
+        assert_eq!(patch.header("content-type"), "text/x-diff; charset=utf-8");
+        assert!(patch.header("content-disposition").contains(".patch"));
+        let patch_path = fixture.instance.path().join("commit.patch");
+        fs::write(&patch_path, &patch.body).expect("write the downloaded patch");
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&fixture.worktree)
+            .args(["checkout", "-q", "--detach", "HEAD^"]));
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&fixture.worktree)
+            .args(["apply", "--check"])
+            .arg(&patch_path));
 
         let search = request(
             server.address(),
@@ -658,6 +673,10 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     let csrf = "22".repeat(32);
     let session_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
     let csrf_hash: [u8; 32] = Sha256::digest(csrf.as_bytes()).into();
+    let reader_token = "44".repeat(32);
+    let reader_csrf = "55".repeat(32);
+    let reader_session_hash: [u8; 32] = Sha256::digest(reader_token.as_bytes()).into();
+    let reader_csrf_hash: [u8; 32] = Sha256::digest(reader_csrf.as_bytes()).into();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("read current time")
@@ -672,6 +691,34 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
             rusqlite::params![session_hash, csrf_hash, now, now + 3600,],
         )
         .expect("create a Web session");
+    store
+        .connection()
+        .execute(
+            "INSERT INTO account (username, is_administrator, state, created_at)
+             VALUES ('bob', 0, 'active', ?1)",
+            [now],
+        )
+        .expect("create a reader account");
+    store
+        .connection()
+        .execute(
+            "INSERT INTO web_session
+             (session_hash, csrf_hash, account_id, created_at, expires_at)
+             SELECT ?1, ?2, id, ?3, ?4 FROM account WHERE username = 'bob'",
+            rusqlite::params![reader_session_hash, reader_csrf_hash, now, now + 3600],
+        )
+        .expect("create a reader Web session");
+    store
+        .connection()
+        .execute(
+            "INSERT INTO repository_collaborator
+             (repository_id, account_id, role, created_at)
+             SELECT repository.id, account.id, 'reader', ?1
+             FROM repository, account
+             WHERE repository.slug = 'example' AND account.username = 'bob'",
+            [now],
+        )
+        .expect("create a reader collaborator");
     drop(store);
 
     let server = RunningWebServer::start_public(
@@ -724,7 +771,7 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     assert!(detail.text().contains("<strong>safe</strong>"));
     assert!(!detail.text().contains("<script>"));
     assert!(detail.text().contains("Add a comment"));
-    assert!(detail.text().contains("Organize this issue"));
+    assert!(!detail.text().contains("Organize this issue"));
 
     let bad_csrf = form(&[("csrf", &"33".repeat(32)), ("state", "closed")]);
     assert_eq!(
@@ -752,22 +799,6 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
                 ("csrf", csrf.as_str()),
                 ("title", "Edited issue"),
                 ("body", "Preserved _Markdown_."),
-            ],
-        ),
-        (
-            "/alice/example/issues/1/labels",
-            vec![
-                ("csrf", csrf.as_str()),
-                ("label", "bug"),
-                ("operation", "add"),
-            ],
-        ),
-        (
-            "/alice/example/issues/1/assignees",
-            vec![
-                ("csrf", csrf.as_str()),
-                ("assignee", "alice"),
-                ("operation", "add"),
             ],
         ),
         (
@@ -802,8 +833,8 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     assert!(final_text.contains("<em>Markdown</em>"));
     assert!(final_text.contains("<strong>comment</strong>"));
     assert!(final_text.contains("<article class=\"comment-card\""));
-    assert!(final_text.contains("Labels: <span>bug</span>"));
-    assert!(final_text.contains("Assignees: <span>alice</span>"));
+    assert!(!final_text.contains("Labels:"));
+    assert!(!final_text.contains("Assignees:"));
     assert!(final_text.contains("created the issue"));
     assert!(final_text.contains("reopened the issue"));
 
@@ -920,6 +951,19 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     assert_eq!(first_revision.status, 200);
     assert!(first_revision.text().contains("Comparison for revision 1"));
     assert!(!first_revision.text().contains("pull-request.txt"));
+    let first_revision_patch = request(
+        server.address(),
+        "GET",
+        "/alice/example/pulls/1/revisions/1.patch",
+        &[],
+        &[],
+    );
+    assert_eq!(first_revision_patch.status, 200);
+    assert_eq!(
+        first_revision_patch.header("content-type"),
+        "text/x-diff; charset=utf-8"
+    );
+    let immutable_revision_patch = first_revision_patch.body.clone();
     for fields in [
         vec![
             ("csrf", csrf.as_str()),
@@ -983,6 +1027,17 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     );
     assert_eq!(revised_again.status, 303);
     let outdated = request(server.address(), "GET", "/alice/example/pulls/1", &[], &[]);
+    let first_revision_patch_after_revisions = request(
+        server.address(),
+        "GET",
+        "/alice/example/pulls/1/revisions/1.patch",
+        &[],
+        &[],
+    );
+    assert_eq!(
+        first_revision_patch_after_revisions.body,
+        immutable_revision_patch
+    );
     assert!(outdated.text().contains("<strong>Outdated</strong>"));
     let merge_page = request(
         server.address(),
@@ -1031,37 +1086,20 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     );
     let search_page = request(server.address(), "GET", "/search", &[], &[]);
     assert_eq!(search_page.status, 200);
-    assert!(
-        search_page
-            .text()
-            .contains("Search repositories and issues")
-    );
-    let metadata_search = request(
-        server.address(),
-        "GET",
-        "/search?q=Edited%20issue",
-        &[],
-        &[],
-    );
+    assert!(search_page.text().contains("Search repositories"));
+    let metadata_search = request(server.address(), "GET", "/search?q=example", &[], &[]);
     assert_eq!(metadata_search.status, 200);
-    assert!(metadata_search.text().contains("/alice/example/issues/1"));
+    assert!(metadata_search.text().contains("/alice/example"));
     assert_eq!(
         request(server.address(), "GET", "/search?q=", &[], &[]).status,
         400
     );
-    let feed = request(server.address(), "GET", "/alice/example/atom.xml", &[], &[]);
+    let feed = request(server.address(), "GET", "/alice/example/rss.xml", &[], &[]);
     assert_eq!(feed.status, 200);
     assert!(feed.text().contains("alice reopened #1"));
-    for (path, content_type) in [
-        (
-            "/alice/example/issues/atom.xml",
-            "application/atom+xml; charset=utf-8",
-        ),
-        (
-            "/alice/example/issues/rss.xml",
-            "application/rss+xml; charset=utf-8",
-        ),
-    ] {
+    {
+        let path = "/alice/example/issues/rss.xml";
+        let content_type = "application/rss+xml; charset=utf-8";
         let issue_feed = request(server.address(), "GET", path, &[], &[]);
         assert_eq!(issue_feed.status, 200);
         assert_eq!(issue_feed.header("content-type"), content_type);
@@ -1080,6 +1118,9 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
             .text()
             .contains("Log in</a> to change watch preferences.")
     );
+    let anonymous_activity = request(server.address(), "GET", "/activity", &[], &[]);
+    assert_eq!(anonymous_activity.status, 303);
+    assert_eq!(anonymous_activity.header("location"), "/login");
     let watch_page = request(
         server.address(),
         "GET",
@@ -1093,12 +1134,7 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
             .text()
             .contains("You do not watch this repository.")
     );
-    let everything = form(&[
-        ("csrf", csrf.as_str()),
-        ("pushes", "1"),
-        ("issues", "1"),
-        ("pull-requests", "1"),
-    ]);
+    let everything = form(&[("csrf", csrf.as_str()), ("state", "watch")]);
     let watched = request(
         server.address(),
         "POST",
@@ -1118,9 +1154,18 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     assert!(
         selected
             .text()
-            .contains("You watch selected activity in this repository.")
+            .contains("You watch activity in this repository.")
     );
-    assert_eq!(selected.text().matches("value=\"1\" selected").count(), 3);
+    let activity = request(
+        server.address(),
+        "GET",
+        "/activity",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    );
+    assert_eq!(activity.status, 200);
+    assert!(activity.text().contains("alice/example"));
+    assert!(activity.text().contains("reopened #1"));
 
     let feed_tokens = request(
         server.address(),
@@ -1131,12 +1176,7 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
     );
     assert_eq!(feed_tokens.status, 200);
     assert!(feed_tokens.text().contains("Feed URLs are credentials."));
-    let issue_repository_token = form(&[
-        ("csrf", csrf.as_str()),
-        ("scope", "repository"),
-        ("owner", "alice"),
-        ("repository", "example"),
-    ]);
+    let issue_repository_token = form(&[("csrf", csrf.as_str())]);
     let issued = request(
         server.address(),
         "POST",
@@ -1145,9 +1185,9 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
         issue_repository_token.as_bytes(),
     );
     assert_eq!(issued.status, 201);
-    assert!(issued.text().contains("tit will not show them again."));
+    assert!(issued.text().contains("tit will not show it again."));
     let private_token = extract_feed_token(issued.text());
-    let private_path = format!("/feeds/{private_token}/atom.xml");
+    let private_path = format!("/feeds/{private_token}/rss.xml");
     let private_feed = request(server.address(), "GET", &private_path, &[], &[]);
     assert_eq!(private_feed.status, 200);
     assert_eq!(private_feed.header("cache-control"), "private, no-store");
@@ -1159,13 +1199,25 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
         .connection()
         .query_row(
             "SELECT id, token_hash FROM feed_token
-             WHERE scope = 'repository' AND revoked_at IS NULL",
+             WHERE scope = 'watched' AND revoked_at IS NULL",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("read the stored feed token hash");
     assert_eq!(stored_hash, private_hash);
     assert_ne!(stored_hash, private_token.as_bytes());
+    let selected_events = token_store
+        .watched_activity_page("alice", None, crate::feed::PAGE_SIZE)
+        .expect("read watched Web activity");
+    assert!(!selected_events.events.is_empty());
+    for event in &selected_events.events {
+        assert!(activity.text().contains(&event.event.event_id));
+        assert!(
+            private_feed
+                .text()
+                .contains(&format!("urn:tit:event:{}", event.event.event_id))
+        );
+    }
     drop(token_store);
     let hidden_token = request(
         server.address(),
@@ -1185,41 +1237,77 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
         )
         .expect("make the feed repository private");
     drop(private_store);
+    let private_archive_path = format!("/alice/example/archive/{}.tar", fixture.head);
+    let owner_archive = request(
+        server.address(),
+        "GET",
+        &private_archive_path,
+        &[("Cookie", cookie.as_str())],
+        &[],
+    );
+    assert_eq!(owner_archive.status, 200);
+    assert_eq!(owner_archive.header("cache-control"), "private, no-store");
+    let anonymous_archive = request(server.address(), "GET", &private_archive_path, &[], &[]);
+    assert_eq!(anonymous_archive.status, 404);
+    let private_commit_patch_path = format!("/alice/example/commit/{}.patch", fixture.head);
     assert_eq!(
         request(
             server.address(),
             "GET",
-            "/alice/example/issues/atom.xml",
+            &private_commit_patch_path,
+            &[("Cookie", cookie.as_str())],
+            &[],
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        request(
+            server.address(),
+            "GET",
+            &private_commit_patch_path,
             &[],
             &[],
         )
         .status,
         404
     );
-    let anonymous_private_search = request(
-        server.address(),
-        "GET",
-        "/search?q=Edited%20issue",
-        &[],
-        &[],
+    assert_eq!(
+        request(
+            server.address(),
+            "GET",
+            "/alice/example/pulls/1/revisions/1.patch",
+            &[],
+            &[],
+        )
+        .status,
+        404
     );
+    assert_eq!(
+        request(
+            server.address(),
+            "GET",
+            "/alice/example/issues/rss.xml",
+            &[],
+            &[],
+        )
+        .status,
+        404
+    );
+    let anonymous_private_search = request(server.address(), "GET", "/search?q=example", &[], &[]);
     assert!(
         anonymous_private_search
             .text()
-            .contains("No repository or issue matched")
+            .contains("No repository matched")
     );
     let owner_private_search = request(
         server.address(),
         "GET",
-        "/search?q=Edited%20issue",
+        "/search?q=example",
         &[("Cookie", cookie.as_str())],
         &[],
     );
-    assert!(
-        owner_private_search
-            .text()
-            .contains("/alice/example/issues/1")
-    );
+    assert!(owner_private_search.text().contains("/alice/example"));
     assert_eq!(
         request(server.address(), "GET", &private_path, &[], &[]).status,
         200
@@ -1282,66 +1370,28 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
         404
     );
 
-    for (scope, expected, excluded, format) in [
-        (
-            "watched",
-            "commented on #1",
-            "no excluded event",
-            "atom.xml",
-        ),
-        (
-            "assignments",
-            "assigned alice on #1",
-            "commented on #1",
-            "rss.xml",
-        ),
-        (
-            "mentions",
-            "commented on #1",
-            "assigned alice on #1",
-            "atom.xml",
-        ),
-    ] {
-        let body = form(&[
-            ("csrf", csrf.as_str()),
-            ("scope", scope),
-            ("owner", ""),
-            ("repository", ""),
-        ]);
-        let issued = request(
-            server.address(),
-            "POST",
-            "/feeds/tokens",
-            &headers,
-            body.as_bytes(),
-        );
-        assert_eq!(issued.status, 201, "did not issue the {scope} token");
-        let token = extract_feed_token(issued.text());
-        let response = request(
-            server.address(),
-            "GET",
-            &format!("/feeds/{token}/{format}"),
-            &[],
-            &[],
-        );
-        assert_eq!(response.status, 200, "did not read the {scope} feed");
-        feed_rs::parser::parse(response.body.as_slice())
-            .unwrap_or_else(|_| panic!("parse the {scope} feed"));
-        assert!(response.text().contains(expected), "wrong {scope} feed");
-        if excluded != "no excluded event" {
-            assert!(
-                !response.text().contains(excluded),
-                "the {scope} token escaped its scope"
-            );
-        }
-    }
+    let body = form(&[("csrf", csrf.as_str())]);
+    let issued = request(
+        server.address(),
+        "POST",
+        "/feeds/tokens",
+        &headers,
+        body.as_bytes(),
+    );
+    assert_eq!(issued.status, 201);
+    let token = extract_feed_token(issued.text());
+    let response = request(
+        server.address(),
+        "GET",
+        &format!("/feeds/{token}/rss.xml"),
+        &[],
+        &[],
+    );
+    assert_eq!(response.status, 200);
+    feed_rs::parser::parse(response.body.as_slice()).expect("parse the watched feed");
+    assert!(response.text().contains("commented on #1"));
 
-    let none = form(&[
-        ("csrf", csrf.as_str()),
-        ("pushes", "0"),
-        ("issues", "0"),
-        ("pull-requests", "0"),
-    ]);
+    let none = form(&[("csrf", csrf.as_str()), ("state", "unwatch")]);
     assert_eq!(
         request(
             server.address(),
@@ -1361,6 +1411,166 @@ async fn runs_the_complete_issue_workflow_without_javascript() {
             .expect("count cleared watches"),
         0
     );
+
+    let reader_cookie = format!("tit-session={reader_token}; tit-csrf={reader_csrf}");
+    let reader_headers = [
+        ("Content-Type", "application/x-www-form-urlencoded"),
+        ("Cookie", reader_cookie.as_str()),
+    ];
+    let denied_rename = form(&[("csrf", reader_csrf.as_str()), ("new-name", "reader-name")]);
+    assert_eq!(
+        request(
+            server.address(),
+            "POST",
+            "/alice/example/settings/rename",
+            &reader_headers,
+            denied_rename.as_bytes(),
+        )
+        .status,
+        403
+    );
+    let conflicting_rename = form(&[("csrf", csrf.as_str()), ("new-name", "empty")]);
+    assert_eq!(
+        request(
+            server.address(),
+            "POST",
+            "/alice/example/settings/rename",
+            &headers,
+            conflicting_rename.as_bytes(),
+        )
+        .status,
+        400
+    );
+    let rename = form(&[("csrf", csrf.as_str()), ("new-name", "renamed")]);
+    let renamed = request(
+        server.address(),
+        "POST",
+        "/alice/example/settings/rename",
+        &headers,
+        rename.as_bytes(),
+    );
+    assert_eq!(renamed.status, 303);
+    assert_eq!(renamed.header("location"), "/alice/renamed/settings");
+    assert_eq!(
+        request(server.address(), "GET", "/alice/example", &[], &[]).status,
+        404
+    );
+    assert_eq!(
+        request(
+            server.address(),
+            "GET",
+            "/alice/renamed/issues/1",
+            &[("Cookie", cookie.as_str())],
+            &[],
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        request(
+            server.address(),
+            "GET",
+            "/alice/renamed/pulls/1",
+            &[("Cookie", cookie.as_str())],
+            &[],
+        )
+        .status,
+        200
+    );
+    let bare = fixture
+        .instance
+        .path()
+        .join("repositories")
+        .join(format!("{}.git", fixture.repository_id));
+    let ref_before_archive = rev_parse(&bare, "refs/heads/main");
+    let archive_repository = form(&[("csrf", csrf.as_str()), ("confirm", "yes")]);
+    assert_eq!(
+        request(
+            server.address(),
+            "POST",
+            "/alice/renamed/settings/archive",
+            &headers,
+            archive_repository.as_bytes(),
+        )
+        .status,
+        303
+    );
+    let archived_home = request(
+        server.address(),
+        "GET",
+        "/",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    );
+    assert!(archived_home.text().contains("alice/renamed · archived"));
+    assert!(archived_home.text().contains("Unarchive repository"));
+    let denied_unarchive = form(&[("csrf", reader_csrf.as_str()), ("confirm", "yes")]);
+    assert_eq!(
+        request(
+            server.address(),
+            "POST",
+            "/alice/renamed/settings/unarchive",
+            &reader_headers,
+            denied_unarchive.as_bytes(),
+        )
+        .status,
+        403
+    );
+    let unarchive = form(&[("csrf", csrf.as_str()), ("confirm", "yes")]);
+    assert_eq!(
+        request(
+            server.address(),
+            "POST",
+            "/alice/renamed/settings/unarchive",
+            &headers,
+            unarchive.as_bytes(),
+        )
+        .status,
+        303
+    );
+    assert_eq!(rev_parse(&bare, "refs/heads/main"), ref_before_archive);
+    assert_eq!(
+        request(
+            server.address(),
+            "GET",
+            "/alice/renamed",
+            &[("Cookie", cookie.as_str())],
+            &[],
+        )
+        .status,
+        200
+    );
+    let lifecycle_store = Store::open(&database).expect("open the lifecycle database");
+    let lifecycle: (String, String, i64) = lifecycle_store
+        .connection()
+        .query_row(
+            "SELECT repository.visibility, repository.state,
+                    (SELECT count(*) FROM repository_collaborator
+                     WHERE repository_id = repository.id)
+             FROM repository WHERE repository.slug = 'renamed'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read repository lifecycle state");
+    assert_eq!(lifecycle, ("private".to_owned(), "active".to_owned(), 1));
+    for action in [
+        "repository.rename",
+        "repository.archive",
+        "repository.unarchive",
+    ] {
+        assert_eq!(
+            lifecycle_store
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM audit_event
+                     WHERE action = ?1 AND actor = 'alice' AND outcome = 'success'",
+                    [action],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count a repository lifecycle audit event"),
+            1
+        );
+    }
 
     server.shutdown().await.expect("stop the issue Web server");
 }
@@ -1396,6 +1606,7 @@ fn assert_hidden(address: SocketAddr, head: &str) {
 
 struct Fixture {
     instance: TempDir,
+    worktree: PathBuf,
     repository_id: String,
     head: String,
     parent: String,
@@ -1499,6 +1710,7 @@ impl Fixture {
                 owner: "alice",
                 slug: "example",
                 object_format: format,
+                default_branch: "refs/heads/main",
                 created_at: 2,
                 origin: RepositoryOrigin::Imported,
                 initial_references: &[],
@@ -1512,6 +1724,7 @@ impl Fixture {
                 owner: "alice",
                 slug: "empty",
                 object_format: format,
+                default_branch: "refs/heads/main",
                 created_at: 2,
                 origin: RepositoryOrigin::Created,
                 initial_references: &[],
@@ -1523,6 +1736,7 @@ impl Fixture {
 
         Self {
             instance,
+            worktree,
             repository_id: id.to_owned(),
             head,
             parent,
@@ -1627,14 +1841,7 @@ fn assert_html_policy(response: &HttpResponse) {
 fn assert_repository_navigation(response: &HttpResponse, owner: &str, repository: &str) {
     let text = response.text();
     for suffix in [
-        "",
-        "/refs",
-        "/issues",
-        "/pulls",
-        "/watch",
-        "/atom.xml",
-        "/rss.xml",
-        "/search",
+        "", "/refs", "/issues", "/pulls", "/watch", "/rss.xml", "/search",
     ] {
         let link = format!("/{owner}/{repository}{suffix}");
         assert!(

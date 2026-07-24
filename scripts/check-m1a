@@ -1,5 +1,0 @@
-#!/bin/sh
-set -eu
-
-./scripts/check
-cargo test --locked --release --test sqlite_workload -- --ignored --nocapture

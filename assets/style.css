@@ -179,6 +179,24 @@ a {
   border-bottom: 1px solid GrayText;
 }
 
+.two-column {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr);
+  gap: 2rem;
+  align-items: start;
+}
+
+.profile-bio {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 44rem) {
+  .two-column {
+    grid-template-columns: 1fr;
+  }
+}
+
 .pagination {
   display: flex;
   flex-wrap: wrap;

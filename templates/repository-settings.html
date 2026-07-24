@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}Settings · {{ owner }}/{{ repository }} · tit{% endblock %}
+{% block content %}
+  <header class="repository-header">
+    <h1><a href="/{{ owner }}/{{ repository }}">{{ owner }}/{{ repository }}</a></h1>
+{% include "repository-nav.html" %}
+  </header>
+
+  <div class="two-column">
+    <section>
+      <h2>Repository settings</h2>
+      <form method="post" action="/{{ owner }}/{{ repository }}/settings/general">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <div class="field">
+          <label for="description">Description</label>
+          <textarea id="description" name="description" maxlength="512" rows="4">{{ description }}</textarea>
+        </div>
+        <div class="field">
+          <label for="visibility">Visibility</label>
+          <select id="visibility" name="visibility">
+            <option value="public"{% if visibility == "public" %} selected{% endif %}>Public</option>
+            <option value="private"{% if visibility == "private" %} selected{% endif %}>Private</option>
+          </select>
+        </div>
+        <button type="submit">Save settings</button>
+      </form>
+      <h3>Default branch</h3>
+      {% if branches.is_empty() %}
+      <p>This repository has no branches. New repositories use <code>{{ default_branch }}</code>.</p>
+      {% else %}
+      <form method="post" action="/{{ owner }}/{{ repository }}/settings/default-branch">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <div class="field">
+          <label for="default-branch">Default branch</label>
+          <select id="default-branch" name="default-branch">
+          {% for branch in branches %}
+            <option value="{{ branch }}"{% if branch == default_branch %} selected{% endif %}>{{ branch }}</option>
+          {% endfor %}
+          </select>
+        </div>
+        <button type="submit">Set default branch</button>
+      </form>
+      {% endif %}
+    </section>
+
+    <section>
+      <h2>Collaborators</h2>
+{% if collaborators.is_empty() %}
+      <p>This repository has no collaborators.</p>
+{% else %}
+      <ul>
+{% for collaborator in collaborators %}
+        <li>
+          {{ collaborator.username }} · {{ collaborator.role }}
+          <form class="inline-form" method="post" action="/{{ owner }}/{{ repository }}/settings/collaborators">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="username" value="{{ collaborator.username }}">
+            <input type="hidden" name="role" value="{{ collaborator.role }}">
+            <button type="submit" name="action" value="remove">Remove</button>
+          </form>
+        </li>
+{% endfor %}
+      </ul>
+{% endif %}
+      <form method="post" action="/{{ owner }}/{{ repository }}/settings/collaborators">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <div class="field">
+          <label for="collaborator-username">Username</label>
+          <input id="collaborator-username" name="username" required maxlength="40">
+        </div>
+        <div class="field">
+          <label for="collaborator-role">Role</label>
+          <select id="collaborator-role" name="role">
+            <option value="reader">Reader</option>
+            <option value="writer">Writer</option>
+            <option value="maintainer">Maintainer</option>
+          </select>
+        </div>
+        <button type="submit" name="action" value="set">Set collaborator</button>
+      </form>
+    </section>
+  </div>
+
+{% if is_owner %}
+  <section>
+    <h2>Rename repository</h2>
+    <form method="post" action="/{{ owner }}/{{ repository }}/settings/rename">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="field">
+        <label for="new-name">New repository name</label>
+        <input id="new-name" name="new-name" value="{{ repository }}" maxlength="100" required>
+      </div>
+      <button type="submit">Rename repository</button>
+    </form>
+  </section>
+{% endif %}
+
+  <section>
+    <h2>Archive repository</h2>
+    <form method="post" action="/{{ owner }}/{{ repository }}/settings/archive">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <fieldset class="confirmation">
+        <legend>Archive this repository?</legend>
+        <label><input type="radio" name="confirm" value="no" checked> No</label>
+        <label><input type="radio" name="confirm" value="yes"> Yes</label>
+      </fieldset>
+      <button type="submit">Archive repository</button>
+    </form>
+  </section>
+{% endblock %}

@@ -1,5 +1,0 @@
-#!/bin/sh
-set -eu
-
-./scripts/check
-cargo test --locked --release --test serve creates_owned_repositories_with_stable_ssh_command_output

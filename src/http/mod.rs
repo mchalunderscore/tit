@@ -3,6 +3,7 @@ mod issues;
 mod metadata_search;
 mod public;
 mod pull_requests;
+mod repository_settings;
 mod watches;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -15,7 +16,7 @@ use askama::Template;
 use axum::Router;
 use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{
-    ConnectInfo, DefaultBodyLimit, Extension, OriginalUri, RawQuery, Request, State,
+    ConnectInfo, DefaultBodyLimit, Extension, OriginalUri, Path, Query, RawQuery, Request, State,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -27,7 +28,7 @@ use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::account::{AccountError, AccountService};
+use crate::account::{AccountError, AccountKeyRequest, AccountService};
 use crate::auth::validate_username;
 use crate::domain::repository::validate_slug;
 use crate::feed_token::FeedTokenService;
@@ -52,6 +53,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONCURRENCY_WAIT: Duration = Duration::from_secs(1);
 const LOGIN_ATTEMPTS_PER_MINUTE: usize = 10;
 const MAX_LOGIN_CLIENTS: usize = 4096;
+const MAX_LOGIN_MULTIPART_FIELDS: usize = 4;
+const MAX_LOGIN_MULTIPART_FIELD_BYTES: usize = 48 * 1024;
+const MAX_LOGIN_MULTIPART_DECODED_BYTES: usize = 60 * 1024;
 const SESSION_COOKIE: &str = "tit-session";
 const CSRF_COOKIE: &str = "tit-csrf";
 const LOGIN_CSRF_COOKIE: &str = "tit-login-csrf";
@@ -82,12 +86,11 @@ mod filters {
             "issue-commented" => "added a comment",
             "issue-opened" | "issue-reopened" => "reopened the issue",
             "issue-closed" => "closed the issue",
-            "issue-labeled" => "added a label",
-            "issue-unlabeled" => "removed a label",
-            "issue-assigned" => "assigned the issue",
-            "issue-unassigned" => "removed an assignee",
             "pull-request-opened" => "opened the pull request",
             "pull-request-revised" => "recorded a new revision",
+            "pull-request-edited" => "edited the pull request",
+            "pull-request-closed" => "closed the pull request",
+            "pull-request-reopened" => "reopened the pull request",
             "pull-request-commented" => "added a review comment",
             "pull-request-approved" => "approved the pull request",
             "pull-request-changes-requested" => "requested changes",
@@ -98,6 +101,13 @@ mod filters {
     }
 }
 
+fn format_time(timestamp: i64) -> String {
+    jiff::Timestamp::from_second(timestamp).map_or_else(
+        |_| "Invalid time".to_owned(),
+        |timestamp| timestamp.strftime("%Y-%m-%d %H:%M UTC").to_string(),
+    )
+}
+
 #[derive(Clone)]
 struct WebState {
     public: Option<PublicWeb>,
@@ -105,6 +115,7 @@ struct WebState {
     jobs: Arc<Semaphore>,
     requests: Arc<Semaphore>,
     login_attempts: AttemptLimiter<IpAddr>,
+    account_attempts: AttemptLimiter<IpAddr>,
     max_request_bytes: usize,
     telemetry: Telemetry,
     key_reloader: Option<AccountKeyReloader>,
@@ -129,7 +140,7 @@ struct SshLoginTarget {
 impl SshLoginTarget {
     fn command(&self, secret: &str) -> String {
         format!(
-            "ssh -p {} {} login {}",
+            "ssh -p {} {} auth {}",
             self.port,
             shell_word(&self.host),
             secret
@@ -189,6 +200,7 @@ impl RunningWebServer {
                 jobs: Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS)),
                 requests: Arc::new(Semaphore::new(1024)),
                 login_attempts: login_attempt_limiter(),
+                account_attempts: login_attempt_limiter(),
                 max_request_bytes: 1024 * 1024,
                 telemetry: Telemetry::default(),
                 key_reloader: None,
@@ -276,6 +288,7 @@ impl RunningWebServer {
                 jobs,
                 requests,
                 login_attempts: login_attempt_limiter(),
+                account_attempts: login_attempt_limiter(),
                 max_request_bytes,
                 telemetry,
                 key_reloader,
@@ -348,6 +361,7 @@ pub(crate) fn router() -> Router {
         jobs: Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS)),
         requests: Arc::new(Semaphore::new(1024)),
         login_attempts: login_attempt_limiter(),
+        account_attempts: login_attempt_limiter(),
         max_request_bytes: 1024 * 1024,
         telemetry: Telemetry::default(),
         key_reloader: None,
@@ -370,6 +384,7 @@ fn router_with_state(state: WebState) -> Router {
         .merge(watches::routes())
         .merge(issues::routes())
         .merge(pull_requests::routes())
+        .merge(repository_settings::routes())
         .merge(public::routes());
     Router::new()
         .route("/", get(home))
@@ -416,8 +431,28 @@ fn router_with_state(state: WebState) -> Router {
         )
         .route("/account", get(account_page))
         .route(
+            "/account/profile",
+            axum::routing::post(update_profile).layer(DefaultBodyLimit::max(2048)),
+        )
+        .route(
             "/account/repositories",
             axum::routing::post(create_repository).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/account/keys/add",
+            axum::routing::post(begin_key_add).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
+        .route(
+            "/account/keys/add/complete",
+            axum::routing::post(complete_key_add).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
+        .route(
+            "/account/keys/revoke",
+            axum::routing::post(begin_key_revoke).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/account/keys/revoke/complete",
+            axum::routing::post(complete_key_revoke).layer(DefaultBodyLimit::max(4 * 1024)),
         )
         .route(
             "/logout",
@@ -428,6 +463,7 @@ fn router_with_state(state: WebState) -> Router {
         .route("/assets/style.css", get(style))
         .merge(feeds::routes())
         .merge(repository_routes)
+        .route("/{username}", get(public_profile))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(RequestBodyLimitLayer::new(max_request_bytes))
@@ -526,6 +562,10 @@ fn allow_login_attempt(state: &WebState, peer: ClientAddress) -> bool {
     state.login_attempts.allow(peer.0)
 }
 
+fn allow_account_attempt(state: &WebState, peer: ClientAddress) -> bool {
+    state.account_attempts.allow(peer.0)
+}
+
 async fn request_actor(
     State(state): State<WebState>,
     mut request: Request,
@@ -546,9 +586,11 @@ async fn home(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
     Extension(actor): Extension<RequestActor>,
+    headers: HeaderMap,
 ) -> Response {
     let signed_in = actor.0.is_some();
     let username = actor.0.clone().unwrap_or_default();
+    let csrf = cookie(&headers, CSRF_COOKIE).unwrap_or_default();
     if state.repositories.is_none() {
         return render_home(
             StatusCode::OK,
@@ -559,6 +601,7 @@ async fn home(
                 error: "",
                 signed_in,
                 username: &username,
+                csrf: &csrf,
                 repositories: &[],
             },
         );
@@ -577,6 +620,7 @@ async fn home(
                 error: "",
                 signed_in,
                 username: &username,
+                csrf: &csrf,
                 repositories: &repositories,
             },
         ),
@@ -631,6 +675,7 @@ async fn go_to_repository(
                 error: "Enter a valid lowercase owner and repository.",
                 signed_in: actor.0.is_some(),
                 username: actor.0.as_deref().unwrap_or_default(),
+                csrf: "",
                 repositories: &[],
             },
         ),
@@ -659,10 +704,17 @@ async fn recovery_form(
 
 async fn signup(
     State(state): State<WebState>,
+    Extension(peer): Extension<ClientAddress>,
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if !allow_account_attempt(&state, peer) {
+        return limit_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Account attempt limit exceeded.\n",
+        );
+    }
     let fields = match parse_account_form(&headers, &body, "invitation") {
         Ok(fields) => fields,
         Err(()) => {
@@ -691,10 +743,17 @@ async fn signup(
 
 async fn recover(
     State(state): State<WebState>,
+    Extension(peer): Extension<ClientAddress>,
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if !allow_account_attempt(&state, peer) {
+        return limit_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Account attempt limit exceeded.\n",
+        );
+    }
     let fields = match parse_account_form(&headers, &body, "recovery") {
         Ok(fields) => fields,
         Err(()) => {
@@ -1005,8 +1064,10 @@ async fn login_verify_file(
     let mut challenge = None;
     let mut signature = None;
     let mut login_csrf = None;
+    let mut field_count = 0_usize;
+    let mut decoded_bytes = 0_usize;
     loop {
-        let field = match multipart.next_field().await {
+        let mut field = match multipart.next_field().await {
             Ok(Some(field)) => field,
             Ok(None) => break,
             Err(_) => {
@@ -1019,11 +1080,28 @@ async fn login_verify_file(
                 .await;
             }
         };
+        field_count += 1;
+        if field_count > MAX_LOGIN_MULTIPART_FIELDS {
+            return rejected_login(state, &request_id.0, "", "The login response is not valid.")
+                .await;
+        }
+        let value = match read_login_field(&mut field, &mut decoded_bytes).await {
+            Ok(value) => value,
+            Err(()) => {
+                return rejected_login(
+                    state,
+                    &request_id.0,
+                    "",
+                    "The login response is not valid.",
+                )
+                .await;
+            }
+        };
         match field.name() {
-            Some("username") if username.is_none() => username = field.text().await.ok(),
-            Some("challenge") if challenge.is_none() => challenge = field.text().await.ok(),
-            Some("signature-file") if signature.is_none() => signature = field.text().await.ok(),
-            Some("login-csrf") if login_csrf.is_none() => login_csrf = field.text().await.ok(),
+            Some("username") if username.is_none() => username = Some(value),
+            Some("challenge") if challenge.is_none() => challenge = Some(value),
+            Some("signature-file") if signature.is_none() => signature = Some(value),
+            Some("login-csrf") if login_csrf.is_none() => login_csrf = Some(value),
             _ => {
                 return rejected_login(
                     state,
@@ -1058,6 +1136,28 @@ async fn login_verify_file(
         login_csrf,
     )
     .await
+}
+
+async fn read_login_field(
+    field: &mut multra::Field<'_>,
+    decoded_bytes: &mut usize,
+) -> Result<String, ()> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(|_| ())? {
+        if bytes
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|size| size > MAX_LOGIN_MULTIPART_FIELD_BYTES)
+        {
+            return Err(());
+        }
+        *decoded_bytes = decoded_bytes.checked_add(chunk.len()).ok_or(())?;
+        if *decoded_bytes > MAX_LOGIN_MULTIPART_DECODED_BYTES {
+            return Err(());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| ())
 }
 
 async fn complete_login(
@@ -1157,22 +1257,385 @@ async fn account_page(
         return login_redirect(true);
     };
     let csrf_for_auth = csrf.clone();
-    match login_job(state, move |login| {
+    match login_job(state.clone(), move |login| {
         login.authenticate(&session_token, Some(&csrf_for_auth))
     })
     .await
     {
-        Ok(session) => render(
+        Ok(session) => {
+            let username = session.username.clone();
+            let details = account_job(state, move |accounts| {
+                let profile = accounts.profile(&username)?;
+                let keys = accounts.keys(&username)?;
+                Ok((profile, keys))
+            })
+            .await;
+            match details {
+                Ok((profile, keys)) => render(
+                    StatusCode::OK,
+                    &AccountTemplate {
+                        request_id: &request_id.0,
+                        username: &session.username,
+                        administrator: session.is_administrator,
+                        csrf: &csrf,
+                        bio: &profile.bio,
+                        contact_email: &profile.contact_email,
+                        keys: keys
+                            .iter()
+                            .map(|key| AccountKeyView {
+                                label: &key.label,
+                                fingerprint: &key.fingerprint,
+                                created_at: format_time(key.created_at),
+                                last_used_at: key
+                                    .last_used_at
+                                    .map(format_time)
+                                    .unwrap_or_else(|| "Never".to_owned()),
+                                active: key.revoked_at.is_none(),
+                            })
+                            .collect(),
+                        active_key_count: keys
+                            .iter()
+                            .filter(|key| key.revoked_at.is_none())
+                            .count(),
+                        signed_in: true,
+                    },
+                ),
+                Err(_) => render_error_with_auth(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &request_id.0,
+                    "Account error",
+                    "The account profile could not be read.",
+                    true,
+                ),
+            }
+        }
+        Err(_) => login_redirect(true),
+    }
+}
+
+async fn begin_key_add(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "label", "public-key"]) {
+        Ok(fields) => fields,
+        Err(()) => return key_error(&request_id.0, "The key request is not valid."),
+    };
+    let username =
+        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
+            Ok(username) => username,
+            Err(response) => return response,
+        };
+    let Some(target) = state.ssh_login_target.clone() else {
+        return key_error(&request_id.0, "SSH authentication is not available.");
+    };
+    let csrf = fields[0].clone();
+    let approval = login_job(state, {
+        let username = username.clone();
+        let csrf = csrf.clone();
+        move |login| login.issue_account_approval(&username, &csrf)
+    })
+    .await;
+    match approval {
+        Ok(approval) => {
+            let command = target.command(&approval.secret);
+            render(
+                StatusCode::OK,
+                &AccountKeyAuthTemplate {
+                    request_id: &request_id.0,
+                    heading: "Add SSH key",
+                    action: "/account/keys/add/complete",
+                    command: &command,
+                    secret: &approval.secret,
+                    csrf: &csrf,
+                    label: &fields[1],
+                    public_key: &fields[2],
+                    fingerprint: "",
+                    adding: true,
+                    signed_in: true,
+                },
+            )
+        }
+        Err(_) => key_error(
+            &request_id.0,
+            "The authentication request could not be created.",
+        ),
+    }
+}
+
+async fn complete_key_add(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "secret", "label", "public-key"])
+    {
+        Ok(fields) => fields,
+        Err(()) => return key_error(&request_id.0, "The key request is not valid."),
+    };
+    let username =
+        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
+            Ok(username) => username,
+            Err(response) => return response,
+        };
+    let Some(session) = cookie(&headers, SESSION_COOKIE) else {
+        return login_redirect(false);
+    };
+    let correlation_id = request_id.0.clone();
+    let result = account_job(state, move |accounts| {
+        accounts.complete_key_add(
+            &AccountKeyRequest {
+                username: &username,
+                session: &session,
+                csrf: &fields[0],
+                secret: &fields[1],
+                correlation_id: &correlation_id,
+            },
+            &fields[2],
+            &fields[3],
+        )
+    })
+    .await;
+    key_change_result(result.map(|_| ()), &request_id.0)
+}
+
+async fn begin_key_revoke(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "fingerprint"]) {
+        Ok(fields) => fields,
+        Err(()) => return key_error(&request_id.0, "The key request is not valid."),
+    };
+    let username =
+        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
+            Ok(username) => username,
+            Err(response) => return response,
+        };
+    let Some(target) = state.ssh_login_target.clone() else {
+        return key_error(&request_id.0, "SSH authentication is not available.");
+    };
+    let csrf = fields[0].clone();
+    let approval = login_job(state, {
+        let username = username.clone();
+        let csrf = csrf.clone();
+        move |login| login.issue_account_approval(&username, &csrf)
+    })
+    .await;
+    match approval {
+        Ok(approval) => {
+            let command = target.command(&approval.secret);
+            render(
+                StatusCode::OK,
+                &AccountKeyAuthTemplate {
+                    request_id: &request_id.0,
+                    heading: "Revoke SSH key",
+                    action: "/account/keys/revoke/complete",
+                    command: &command,
+                    secret: &approval.secret,
+                    csrf: &csrf,
+                    label: "",
+                    public_key: "",
+                    fingerprint: &fields[1],
+                    adding: false,
+                    signed_in: true,
+                },
+            )
+        }
+        Err(_) => key_error(
+            &request_id.0,
+            "The authentication request could not be created.",
+        ),
+    }
+}
+
+async fn complete_key_revoke(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "secret", "fingerprint"]) {
+        Ok(fields) => fields,
+        Err(()) => return key_error(&request_id.0, "The key request is not valid."),
+    };
+    let username =
+        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
+            Ok(username) => username,
+            Err(response) => return response,
+        };
+    let Some(session) = cookie(&headers, SESSION_COOKIE) else {
+        return login_redirect(false);
+    };
+    let correlation_id = request_id.0.clone();
+    let result = account_job(state, move |accounts| {
+        accounts.complete_key_revoke(
+            &AccountKeyRequest {
+                username: &username,
+                session: &session,
+                csrf: &fields[0],
+                secret: &fields[1],
+                correlation_id: &correlation_id,
+            },
+            &fields[2],
+        )
+    })
+    .await;
+    key_change_result(result, &request_id.0)
+}
+
+fn key_change_result(result: Result<(), AccountError>, request_id: &str) -> Response {
+    match result {
+        Ok(()) => account_redirect(),
+        Err(AccountError::Store(StoreError::LastKey)) => key_error(
+            request_id,
+            "An account must keep at least one active SSH key.",
+        ),
+        Err(AccountError::Store(StoreError::KeyExists)) => {
+            key_error(request_id, "The key or active key label already exists.")
+        }
+        Err(
+            AccountError::Auth(_)
+            | AccountError::InvalidLabel
+            | AccountError::InvalidSecret
+            | AccountError::Store(StoreError::InvalidLoginApproval)
+            | AccountError::Store(StoreError::KeyNotFound),
+        ) => key_error(
+            request_id,
+            "The key request is invalid, expired, or already used.",
+        ),
+        Err(_) => key_error(request_id, "The key request could not be completed."),
+    }
+}
+
+fn key_error(request_id: &str, message: &str) -> Response {
+    render_error_with_auth(
+        StatusCode::BAD_REQUEST,
+        request_id,
+        "SSH key error",
+        message,
+        true,
+    )
+}
+
+async fn public_profile(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
+    Path(username): Path<String>,
+    Query(query): Query<ProfileQuery>,
+) -> Response {
+    let signed_in = actor.0.is_some();
+    if validate_username(&username).is_err() || state.accounts.is_none() {
+        return render_error_with_auth(
+            StatusCode::NOT_FOUND,
+            &request_id.0,
+            "Page not found",
+            "The requested page does not exist.",
+            signed_in,
+        );
+    }
+    let page_number = query.page.unwrap_or(1);
+    let result = account_job(state, move |accounts| {
+        accounts.profile_page(&username, page_number)
+    })
+    .await;
+    match result {
+        Ok(profile) => render(
             StatusCode::OK,
-            &AccountTemplate {
+            &PublicProfileTemplate {
                 request_id: &request_id.0,
-                username: &session.username,
-                administrator: session.is_administrator,
-                csrf: &csrf,
-                signed_in: true,
+                signed_in,
+                username: &profile.username,
+                bio: &profile.bio,
+                contact_email: &profile.contact_email,
+                repositories: profile
+                    .repositories
+                    .iter()
+                    .map(|repository| HomeRepositoryView {
+                        owner: &repository.owner,
+                        slug: &repository.slug,
+                        visibility: &repository.visibility,
+                        state: &repository.state,
+                        description: &repository.description,
+                        updated_at: repository.updated_at,
+                    })
+                    .collect(),
+                has_previous: profile.page > 1,
+                has_next: profile.has_next,
+                previous_page: profile.page.saturating_sub(1),
+                next_page: profile.page.saturating_add(1),
             },
         ),
-        Err(_) => login_redirect(true),
+        Err(AccountError::Auth(_) | AccountError::Store(StoreError::AccountNotFound(_))) => {
+            render_error_with_auth(
+                StatusCode::NOT_FOUND,
+                &request_id.0,
+                "Not found",
+                "The profile was not found.",
+                signed_in,
+            )
+        }
+        Err(_) => render_error_with_auth(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id.0,
+            "Profile error",
+            "The profile could not be read.",
+            signed_in,
+        ),
+    }
+}
+
+async fn update_profile(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "bio", "contact-email"]) {
+        Ok(fields) => fields,
+        Err(()) => {
+            return render_error_with_auth(
+                StatusCode::BAD_REQUEST,
+                &request_id.0,
+                "Profile error",
+                "The profile request is not valid.",
+                true,
+            );
+        }
+    };
+    let actor =
+        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
+            Ok(actor) => actor,
+            Err(response) => return response,
+        };
+    let bio = fields[1].clone();
+    let email = fields[2].clone();
+    match account_job(state, move |accounts| {
+        accounts.update_profile(&actor, &bio, &email)
+    })
+    .await
+    {
+        Ok(()) => account_redirect(),
+        Err(AccountError::InvalidProfile) => render_error_with_auth(
+            StatusCode::BAD_REQUEST,
+            &request_id.0,
+            "Profile error",
+            "The bio or contact email is not valid.",
+            true,
+        ),
+        Err(_) => render_error_with_auth(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id.0,
+            "Profile error",
+            "The profile could not be saved.",
+            true,
+        ),
     }
 }
 
@@ -1806,6 +2269,7 @@ fn render_home(status: StatusCode, request_id: &str, page: HomePage<'_>) -> Resp
             has_error: !page.error.is_empty(),
             signed_in: page.signed_in,
             username: page.username,
+            csrf: page.csrf,
             repositories: page
                 .repositories
                 .iter()
@@ -1813,6 +2277,8 @@ fn render_home(status: StatusCode, request_id: &str, page: HomePage<'_>) -> Resp
                     owner: &repository.owner,
                     slug: &repository.slug,
                     visibility: &repository.visibility,
+                    state: &repository.state,
+                    description: &repository.description,
                     updated_at: repository.updated_at,
                 })
                 .collect(),
@@ -1826,6 +2292,7 @@ struct HomePage<'a> {
     error: &'a str,
     signed_in: bool,
     username: &'a str,
+    csrf: &'a str,
     repositories: &'a [crate::store::HomeRepositoryRecord],
 }
 
@@ -1917,6 +2384,11 @@ struct LocationQueryError {
     repository: String,
 }
 
+#[derive(Default, serde::Deserialize)]
+struct ProfileQuery {
+    page: Option<usize>,
+}
+
 #[derive(Template)]
 #[template(path = "home.html")]
 struct HomeTemplate<'a> {
@@ -1927,6 +2399,7 @@ struct HomeTemplate<'a> {
     has_error: bool,
     signed_in: bool,
     username: &'a str,
+    csrf: &'a str,
     repositories: Vec<HomeRepositoryView<'a>>,
 }
 
@@ -1934,6 +2407,8 @@ struct HomeRepositoryView<'a> {
     owner: &'a str,
     slug: &'a str,
     visibility: &'a str,
+    state: &'a str,
+    description: &'a str,
     updated_at: i64,
 }
 
@@ -2006,7 +2481,50 @@ struct AccountTemplate<'a> {
     username: &'a str,
     administrator: bool,
     csrf: &'a str,
+    bio: &'a str,
+    contact_email: &'a str,
+    keys: Vec<AccountKeyView<'a>>,
+    active_key_count: usize,
     signed_in: bool,
+}
+
+struct AccountKeyView<'a> {
+    label: &'a str,
+    fingerprint: &'a str,
+    created_at: String,
+    last_used_at: String,
+    active: bool,
+}
+
+#[derive(Template)]
+#[template(path = "account-key-auth.html")]
+struct AccountKeyAuthTemplate<'a> {
+    request_id: &'a str,
+    heading: &'a str,
+    action: &'a str,
+    command: &'a str,
+    secret: &'a str,
+    csrf: &'a str,
+    label: &'a str,
+    public_key: &'a str,
+    fingerprint: &'a str,
+    adding: bool,
+    signed_in: bool,
+}
+
+#[derive(Template)]
+#[template(path = "profile.html")]
+struct PublicProfileTemplate<'a> {
+    request_id: &'a str,
+    signed_in: bool,
+    username: &'a str,
+    bio: &'a str,
+    contact_email: &'a str,
+    repositories: Vec<HomeRepositoryView<'a>>,
+    has_previous: bool,
+    has_next: bool,
+    previous_page: usize,
+    next_page: usize,
 }
 
 #[derive(Template)]

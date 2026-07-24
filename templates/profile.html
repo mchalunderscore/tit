@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}{{ username }} · tit{% endblock %}
+{% block content %}
+  <div class="two-column">
+    <section aria-labelledby="profile-heading">
+      <h1 id="profile-heading">{{ username }}</h1>
+{% if bio.is_empty() %}
+      <p>This user has not added a bio.</p>
+{% else %}
+      <p class="profile-bio">{{ bio }}</p>
+{% endif %}
+{% if contact_email.is_empty() %}{% else %}
+      <p>Contact: <a href="mailto:{{ contact_email }}">{{ contact_email }}</a></p>
+{% endif %}
+    </section>
+    <section aria-labelledby="repositories-heading">
+      <h2 id="repositories-heading">Public repositories</h2>
+{% if repositories.is_empty() %}
+      <p>This user has no public repositories.</p>
+{% else %}
+      <ul class="repository-list">
+{% for repository in repositories %}
+        <li><a href="/{{ repository.owner }}/{{ repository.slug }}">{{ repository.slug }}</a> · updated <time datetime="{{ repository.updated_at }}">{{ repository.updated_at|human_time }}</time>{% if repository.description.is_empty() %}{% else %}<br>{{ repository.description }}{% endif %}</li>
+{% endfor %}
+      </ul>
+{% if has_previous || has_next %}
+      <nav class="pagination" aria-label="Repository pages">
+{% if has_previous %}
+        <a href="/{{ username }}?page={{ previous_page }}">Newer repositories</a>
+{% endif %}
+{% if has_next %}
+        <a href="/{{ username }}?page={{ next_page }}">Older repositories</a>
+{% endif %}
+      </nav>
+{% endif %}
+{% endif %}
+    </section>
+  </div>
+{% endblock %}

@@ -24,6 +24,7 @@ pub(crate) struct ReadLimits {
     pub(crate) max_diff_bytes: usize,
     pub(crate) max_archive_entries: usize,
     pub(crate) max_archive_bytes: usize,
+    pub(crate) max_archive_depth: usize,
     pub(crate) max_search_files: usize,
     pub(crate) max_search_bytes: usize,
     pub(crate) max_search_results: usize,
@@ -45,6 +46,7 @@ impl Default for ReadLimits {
             max_diff_bytes: 64 * 1024 * 1024,
             max_archive_entries: 100_000,
             max_archive_bytes: 256 * 1024 * 1024,
+            max_archive_depth: 128,
             max_search_files: 10_000,
             max_search_bytes: 64 * 1024 * 1024,
             max_search_results: 500,
@@ -120,6 +122,8 @@ pub(crate) struct DiffFile {
     pub(crate) new_mode: Option<u16>,
     pub(crate) binary: bool,
     pub(crate) hunks: Vec<u8>,
+    pub(crate) old_data: Option<Vec<u8>>,
+    pub(crate) new_data: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -371,6 +375,23 @@ impl RepositoryReadService {
         self.diff_with_budget(old_commit, new_commit, &budget)
     }
 
+    pub(crate) fn commit_diff(
+        &self,
+        commit_id: ObjectId,
+        cancellation: &ReadCancellation,
+    ) -> Result<Vec<DiffFile>, ReadError> {
+        let budget = self.budget(cancellation);
+        let commit = self.read_commit(commit_id, &budget)?;
+        match commit.parents.first() {
+            Some(parent) => self.diff_with_budget(*parent, commit_id, &budget),
+            None => self.diff_trees_with_budget(
+                ObjectId::empty_tree(self.repository.object_hash()),
+                commit.tree,
+                &budget,
+            ),
+        }
+    }
+
     pub(crate) fn comparison(
         &self,
         base_commit: ObjectId,
@@ -521,6 +542,8 @@ impl RepositoryReadService {
                 new_mode: new.map(|file| file.mode.value()),
                 binary,
                 hunks,
+                old_data: old.map(|_| old_data),
+                new_data: new.map(|_| new_data),
             });
         }
         Ok(files)
@@ -596,7 +619,6 @@ impl RepositoryReadService {
         let mut entries = 0_usize;
         let result = self.archive_tree(
             commit.tree,
-            &[],
             commit.committed_at.max(0) as u64,
             &budget,
             &mut writer,
@@ -926,60 +948,63 @@ impl RepositoryReadService {
     fn archive_tree(
         &self,
         tree_id: ObjectId,
-        prefix: &[u8],
         modified_at: u64,
         budget: &ReadBudget<'_>,
         writer: &mut BoundedWriter<'_, impl Write>,
         entries: &mut usize,
     ) -> Result<(), ReadError> {
-        let tree = self.read_tree(tree_id, budget)?;
-        for entry in tree.entries {
+        let mut pending = vec![(tree_id, Vec::new(), 0_usize)];
+        while let Some((tree_id, prefix, depth)) = pending.pop() {
             budget.check()?;
-            *entries += 1;
-            if *entries > self.limits.max_archive_entries {
-                return Err(ReadError::Limit("archive entries"));
+            if depth > self.limits.max_archive_depth {
+                return Err(ReadError::Limit("archive tree depth"));
             }
-            let path = join_git_path(prefix, &entry.filename, self.limits.max_path_bytes)?;
-            if entry.mode.is_tree() {
-                let mut directory = path.clone();
-                directory.push(b'/');
-                write_tar_header(writer, &directory, 0o755, 0, modified_at, b'5')?;
-                self.archive_tree(
-                    entry.oid.to_owned(),
-                    &path,
-                    modified_at,
-                    budget,
-                    writer,
-                    entries,
-                )?;
-            } else if entry.mode.is_blob_or_symlink() {
-                let blob = self.read_blob(entry.oid.to_owned(), entry.mode, budget)?;
-                // Store symbolic-link content as a regular file. Extraction cannot create a link outside its destination.
-                let mode = if entry.mode.is_executable() {
-                    0o755
-                } else {
-                    0o644
-                };
-                write_tar_header(
-                    writer,
-                    &path,
-                    mode,
-                    u64::try_from(blob.data.len())
-                        .map_err(|_| ReadError::Limit("archive bytes"))?,
-                    modified_at,
-                    b'0',
-                )?;
-                writer.write_all(&blob.data).map_err(ReadError::Output)?;
-                let padding = (512 - blob.data.len() % 512) % 512;
-                if padding != 0 {
-                    writer
-                        .write_all(&[0_u8; 512][..padding])
-                        .map_err(ReadError::Output)?;
+            let tree = self.read_tree(tree_id, budget)?;
+            let mut child_trees = Vec::new();
+            for entry in tree.entries {
+                budget.check()?;
+                *entries += 1;
+                if *entries > self.limits.max_archive_entries {
+                    return Err(ReadError::Limit("archive entries"));
                 }
-            } else if entry.mode.is_commit() {
-                let mut directory = path;
-                directory.push(b'/');
-                write_tar_header(writer, &directory, 0o755, 0, modified_at, b'5')?;
+                let path = join_git_path(&prefix, &entry.filename, self.limits.max_path_bytes)?;
+                if entry.mode.is_tree() {
+                    let mut directory = path.clone();
+                    directory.push(b'/');
+                    write_tar_header(writer, &directory, 0o755, 0, modified_at, b'5')?;
+                    child_trees.push((entry.oid.to_owned(), path, depth + 1));
+                } else if entry.mode.is_blob_or_symlink() {
+                    let blob = self.read_blob(entry.oid.to_owned(), entry.mode, budget)?;
+                    // Store symbolic-link content as a regular file. Extraction cannot create a link outside its destination.
+                    let mode = if entry.mode.is_executable() {
+                        0o755
+                    } else {
+                        0o644
+                    };
+                    write_tar_header(
+                        writer,
+                        &path,
+                        mode,
+                        u64::try_from(blob.data.len())
+                            .map_err(|_| ReadError::Limit("archive bytes"))?,
+                        modified_at,
+                        b'0',
+                    )?;
+                    writer.write_all(&blob.data).map_err(ReadError::Output)?;
+                    let padding = (512 - blob.data.len() % 512) % 512;
+                    if padding != 0 {
+                        writer
+                            .write_all(&[0_u8; 512][..padding])
+                            .map_err(ReadError::Output)?;
+                    }
+                } else if entry.mode.is_commit() {
+                    let mut directory = path;
+                    directory.push(b'/');
+                    write_tar_header(writer, &directory, 0o755, 0, modified_at, b'5')?;
+                }
+            }
+            for child in child_trees.into_iter().rev() {
+                pending.push(child);
             }
         }
         Ok(())
@@ -1286,5 +1311,5 @@ pub(crate) enum ReadError {
     #[error("repository archive metadata is too large")]
     ArchiveMetadata,
     #[error("cannot write repository content: {0}")]
-    Output(std::io::Error),
+    Output(#[from] std::io::Error),
 }

@@ -2,10 +2,8 @@
 {% block title %}New feed token · tit{% endblock %}
 {% block content %}
   <h1>New feed token</h1>
-  <p>This token gives access to {{ scope }} for {{ target }}. Copy the URLs now. tit will not show them again.</p>
+  <p>This token gives access to {{ scope }}. Copy the URL now. tit will not show it again.</p>
   <dl>
-    <dt>Atom</dt>
-    <dd><code>/feeds/{{ token }}/atom.xml</code></dd>
     <dt>RSS</dt>
     <dd><code>/feeds/{{ token }}/rss.xml</code></dd>
   </dl>

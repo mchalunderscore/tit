@@ -36,6 +36,7 @@ fn enforces_the_repository_role_matrix() {
             owner: "owner",
             slug: "project",
             object_format: "sha1",
+            default_branch: "refs/heads/main",
             created_at: 2,
             origin: RepositoryOrigin::Created,
             initial_references: &[],
@@ -111,6 +112,7 @@ fn applies_role_visibility_and_archive_changes_immediately() {
             owner: "owner",
             slug: "project",
             object_format: "sha1",
+            default_branch: "refs/heads/main",
             created_at: 2,
             origin: RepositoryOrigin::Created,
             initial_references: &[],
@@ -182,6 +184,7 @@ fn applies_common_protected_ref_and_merge_rules() {
             owner: "owner",
             slug: "project",
             object_format: "sha1",
+            default_branch: "refs/heads/main",
             created_at: 2,
             origin: RepositoryOrigin::Created,
             initial_references: &[],
@@ -248,6 +251,45 @@ fn applies_common_protected_ref_and_merge_rules() {
             RefChange::Create,
         )
         .expect("allow a writer topic branch");
+    store
+        .update_repository_default_branch(
+            "owner",
+            "project",
+            "maintainer",
+            "refs/heads/trunk",
+            4,
+            "default-branch",
+        )
+        .expect("change the protected default branch");
+    policy
+        .authorize_ref_change(
+            "writer",
+            "owner",
+            "project",
+            b"refs/heads/main",
+            RefChange::FastForward,
+        )
+        .expect("allow a writer to update the former default branch");
+    assert!(matches!(
+        policy.authorize_ref_change(
+            "writer",
+            "owner",
+            "project",
+            b"refs/heads/trunk",
+            RefChange::FastForward,
+        ),
+        Err(PolicyError::Denied)
+    ));
+    assert!(matches!(
+        policy.authorize_ref_change(
+            "owner",
+            "owner",
+            "project",
+            b"refs/heads/trunk",
+            RefChange::Delete,
+        ),
+        Err(PolicyError::Denied)
+    ));
     policy
         .authorize_ref_change(
             "writer",

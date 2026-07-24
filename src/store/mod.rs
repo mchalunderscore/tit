@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -13,8 +14,8 @@ mod event;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
-const MAX_ACTIVE_FEED_TOKENS: i64 = 32;
-const SCHEMA_VERSION: i64 = 18;
+const MAX_ACTIVE_FEED_TOKENS: i64 = 1;
+const SCHEMA_VERSION: i64 = 23;
 #[allow(
     dead_code,
     reason = "the integration test imports this module without the CLI operation"
@@ -24,7 +25,7 @@ pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
     dead_code,
     reason = "M1A proves migrations before the M2 server calls them"
 )]
-const MIGRATIONS: [&str; 18] = [
+const MIGRATIONS: [&str; 23] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
@@ -43,6 +44,11 @@ const MIGRATIONS: [&str; 18] = [
     include_str!("migrations/016_pull_request_reviews.sql"),
     include_str!("migrations/017_pull_request_merges.sql"),
     include_str!("migrations/018_streamlined_login.sql"),
+    include_str!("migrations/019_product_reduction.sql"),
+    include_str!("migrations/020_repository_profiles.sql"),
+    include_str!("migrations/021_pull_request_lifecycle.sql"),
+    include_str!("migrations/022_account_key_management.sql"),
+    include_str!("migrations/023_default_branch.sql"),
 ];
 
 #[allow(
@@ -113,6 +119,8 @@ pub(crate) enum StoreError {
     RepositoryArchived(String, String),
     #[error("repository visibility is not valid")]
     InvalidRepositoryVisibility,
+    #[error("repository default branch is not valid")]
+    InvalidDefaultBranch,
     #[error("collaborator role is not valid")]
     InvalidCollaboratorRole,
     #[error("repository owner cannot be a collaborator")]
@@ -137,12 +145,6 @@ pub(crate) enum StoreError {
     IssueHidden,
     #[error("issue state is already {0}")]
     IssueState(String),
-    #[error("issue label already has the requested state")]
-    IssueLabelState,
-    #[error("issue assignee already has the requested state")]
-    IssueAssigneeState,
-    #[error("issue assignee does not exist or cannot read the repository: {0}")]
-    IssueAssigneeNotFound(String),
     #[error("pull request does not exist: {0}/{1}#{2}")]
     PullRequestNotFound(String, String, i64),
     #[error("pull-request access is not authorized")]
@@ -159,11 +161,9 @@ pub(crate) enum StoreError {
     PullRequestIntentState(String),
     #[error("repository watch access is not authorized")]
     WatchDenied,
-    #[error("feed token access is not authorized")]
-    FeedTokenDenied,
     #[error("feed token is invalid or revoked")]
     FeedTokenNotFound,
-    #[error("an account cannot have more than 32 active feed tokens")]
+    #[error("an account cannot have more than one active feed token")]
     FeedTokenLimit,
     #[error("feed token scope is not valid")]
     InvalidFeedScope,
@@ -279,7 +279,55 @@ impl Store {
             after_migration(version);
         }
         transaction.commit()?;
+        if current < 23 {
+            self.backfill_default_branches();
+        }
         Ok(())
+    }
+
+    fn backfill_default_branches(&self) {
+        let Some(database) = self.connection.path() else {
+            return;
+        };
+        let Some(instance) = Path::new(database).parent() else {
+            return;
+        };
+        let Ok(mut statement) = self.connection.prepare("SELECT id FROM repository") else {
+            return;
+        };
+        let Ok(ids) = statement.query_map([], |row| row.get::<_, String>(0)) else {
+            return;
+        };
+        for id in ids.flatten() {
+            let head = instance
+                .join("repositories")
+                .join(format!("{id}.git"))
+                .join("HEAD");
+            let Ok(contents) = fs::read(head) else {
+                continue;
+            };
+            let Some(name) = contents
+                .strip_suffix(b"\n")
+                .unwrap_or(&contents)
+                .strip_prefix(b"ref: ")
+            else {
+                continue;
+            };
+            let candidate = gix::bstr::BString::from(name);
+            if !name.starts_with(b"refs/heads/")
+                || gix::refs::FullName::try_from(candidate).is_err()
+            {
+                continue;
+            }
+            let Ok(name) = std::str::from_utf8(name) else {
+                continue;
+            };
+            let _ = self.connection.execute(
+                "UPDATE repository_default_branch SET ref_name = ?2
+                 WHERE repository_id = ?1",
+                rusqlite::params![id, name],
+            );
+        }
     }
 
     pub(crate) fn schema_version(&self) -> Result<i64, StoreError> {
@@ -315,20 +363,40 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "M1A proves maintenance before an operator command calls it"
-    )]
+    pub(crate) fn maintain(&mut self, cutoff: i64) -> Result<MaintenanceResult, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut deleted = 0_usize;
+        for statement in [
+            "DELETE FROM signup_invitation WHERE expires_at < ?1",
+            "DELETE FROM login_nonce WHERE expires_at < ?1",
+            "DELETE FROM ssh_login_approval WHERE expires_at < ?1",
+            "DELETE FROM web_session
+             WHERE expires_at < ?1 OR (ended_at IS NOT NULL AND ended_at < ?1)",
+            "DELETE FROM feed_token WHERE revoked_at IS NOT NULL AND revoked_at < ?1",
+            "DELETE FROM audit_event WHERE created_at < ?1",
+        ] {
+            deleted = deleted
+                .checked_add(transaction.execute(statement, [cutoff])?)
+                .ok_or(StoreError::EventLimit)?;
+        }
+        transaction.commit()?;
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        Ok(MaintenanceResult { deleted })
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code, reason = "integration storage tests use this test boundary")]
     pub(crate) fn checkpoint(&self) -> Result<(), StoreError> {
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "M1A proves maintenance before an operator command calls it"
-    )]
+    #[cfg(test)]
+    #[allow(dead_code, reason = "integration storage tests use this test boundary")]
     pub(crate) fn vacuum(&self) -> Result<(), StoreError> {
         self.connection.execute_batch("VACUUM")?;
         Ok(())
@@ -790,6 +858,7 @@ impl Store {
             rusqlite::params![account_id, recovery.new_recovery_hash, recovery.created_at],
         )?;
         end_sessions(&transaction, account_id, recovery.created_at)?;
+        revoke_feed_tokens(&transaction, account_id, recovery.created_at)?;
         insert_audit_event(
             &transaction,
             &NewAuditEvent {
@@ -888,6 +957,98 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn complete_account_key_add(
+        &mut self,
+        authorization: &AccountKeyAuthorization<'_>,
+        key: &NewSshKey<'_>,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (account_id, _) = consume_account_key_authorization(&transaction, authorization)?;
+        let duplicate_label: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM ssh_public_key
+                WHERE account_id = ?1 AND label = ?2 AND revoked_at IS NULL
+             )",
+            rusqlite::params![account_id, key.label],
+            |row| row.get(0),
+        )?;
+        if duplicate_label {
+            return Err(StoreError::KeyExists);
+        }
+        insert_ssh_key(&transaction, account_id, key, authorization.changed_at)?;
+        let target = format!("{}:{}", authorization.username, key.fingerprint);
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "key.add",
+                actor: authorization.username,
+                target: &target,
+                outcome: "success",
+                correlation_id: authorization.correlation_id,
+                created_at: authorization.changed_at,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_account_key_revoke(
+        &mut self,
+        authorization: &AccountKeyAuthorization<'_>,
+        fingerprint: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (account_id, session_key_id) =
+            consume_account_key_authorization(&transaction, authorization)?;
+        let active: i64 = transaction.query_row(
+            "SELECT count(*) FROM ssh_public_key
+             WHERE account_id = ?1 AND revoked_at IS NULL",
+            [account_id],
+            |row| row.get(0),
+        )?;
+        if active <= 1 {
+            return Err(StoreError::LastKey);
+        }
+        let key_id = transaction
+            .query_row(
+                "SELECT id FROM ssh_public_key
+                 WHERE account_id = ?1 AND fingerprint = ?2 AND revoked_at IS NULL",
+                rusqlite::params![account_id, fingerprint],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::KeyNotFound)?;
+        let changed = transaction.execute(
+            "UPDATE ssh_public_key SET revoked_at = ?3
+             WHERE id = ?1 AND account_id = ?2 AND revoked_at IS NULL",
+            rusqlite::params![key_id, account_id, authorization.changed_at],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::KeyNotFound);
+        }
+        if session_key_id.is_none() || session_key_id == Some(key_id) {
+            end_sessions(&transaction, account_id, authorization.changed_at)?;
+        }
+        let target = format!("{}:{fingerprint}", authorization.username);
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "key.revoke",
+                actor: authorization.username,
+                target: &target,
+                outcome: "success",
+                correlation_id: authorization.correlation_id,
+                created_at: authorization.changed_at,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     #[allow(
         dead_code,
         reason = "some integration tests compile storage without accounts"
@@ -917,6 +1078,9 @@ impl Store {
             |row| row.get(0),
         )?;
         end_sessions(&transaction, account_id, changed_at)?;
+        if suspended {
+            revoke_feed_tokens(&transaction, account_id, changed_at)?;
+        }
         insert_audit_event(
             &transaction,
             &NewAuditEvent {
@@ -993,9 +1157,9 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let account_id = transaction
+        let (account_id, key_id) = transaction
             .query_row(
-                "SELECT login_nonce.account_id
+                "SELECT login_nonce.account_id, ssh_public_key.id
                  FROM login_nonce
                  JOIN account ON account.id = login_nonce.account_id
                  JOIN ssh_public_key ON ssh_public_key.account_id = login_nonce.account_id
@@ -1013,7 +1177,7 @@ impl Store {
                     login.fingerprint,
                     login.login_csrf_hash,
                 ],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()?
             .ok_or(StoreError::InvalidLoginChallenge)?;
@@ -1027,14 +1191,16 @@ impl Store {
         }
         transaction.execute(
             "INSERT INTO web_session
-             (session_hash, csrf_hash, account_id, created_at, expires_at, ended_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+             (session_hash, csrf_hash, account_id, created_at, expires_at, ended_at,
+              ssh_public_key_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
             rusqlite::params![
                 login.session_hash,
                 login.csrf_hash,
                 account_id,
                 login.created_at,
                 login.expires_at,
+                key_id,
             ],
         )?;
         insert_audit_event(
@@ -1071,16 +1237,22 @@ impl Store {
         if active >= 1_024 {
             return Err(StoreError::LoginNonceLimit);
         }
+        let expected_account_id = approval
+            .expected_username
+            .map(|username| active_account_id(&transaction, username))
+            .transpose()?;
         transaction.execute(
             "INSERT INTO ssh_login_approval
              (secret_hash, csrf_hash, account_id, ssh_public_key_id,
-              created_at, expires_at, approved_at, consumed_at)
-             VALUES (?1, ?2, NULL, NULL, ?3, ?4, NULL, NULL)",
+              created_at, expires_at, approved_at, consumed_at, purpose, expected_account_id)
+             VALUES (?1, ?2, NULL, NULL, ?3, ?4, NULL, NULL, ?5, ?6)",
             rusqlite::params![
                 approval.secret_hash,
                 approval.csrf_hash,
                 approval.created_at,
                 approval.expires_at,
+                approval.purpose,
+                expected_account_id,
             ],
         )?;
         transaction.commit()?;
@@ -1108,7 +1280,8 @@ impl Store {
             "UPDATE ssh_login_approval
              SET account_id = ?2, ssh_public_key_id = ?3, approved_at = ?4
              WHERE secret_hash = ?1 AND account_id IS NULL
-               AND approved_at IS NULL AND consumed_at IS NULL AND expires_at >= ?4",
+               AND approved_at IS NULL AND consumed_at IS NULL AND expires_at >= ?4
+               AND (expected_account_id IS NULL OR expected_account_id = ?2)",
             rusqlite::params![
                 approval.secret_hash,
                 account_id,
@@ -1132,13 +1305,16 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let approval = transaction
             .query_row(
-                "SELECT account.id, account.username, ssh_login_approval.approved_at
+                "SELECT account.id, account.username, ssh_login_approval.approved_at,
+                        ssh_login_approval.ssh_public_key_id
                  FROM ssh_login_approval
                  LEFT JOIN account ON account.id = ssh_login_approval.account_id
                  LEFT JOIN ssh_public_key
                    ON ssh_public_key.id = ssh_login_approval.ssh_public_key_id
                  WHERE ssh_login_approval.secret_hash = ?1
                    AND ssh_login_approval.csrf_hash = ?2
+                   AND ssh_login_approval.purpose = 'login'
+                   AND ssh_login_approval.expected_account_id IS NULL
                    AND ssh_login_approval.consumed_at IS NULL
                    AND ssh_login_approval.expires_at >= ?3
                    AND (ssh_login_approval.account_id IS NULL
@@ -1149,12 +1325,13 @@ impl Store {
                         row.get::<_, Option<i64>>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
                     ))
                 },
             )
             .optional()?
             .ok_or(StoreError::InvalidLoginApproval)?;
-        let (Some(account_id), Some(username), Some(_)) = approval else {
+        let (Some(account_id), Some(username), Some(_), Some(key_id)) = approval else {
             return Err(StoreError::LoginApprovalPending);
         };
         let changed = transaction.execute(
@@ -1167,14 +1344,16 @@ impl Store {
         }
         transaction.execute(
             "INSERT INTO web_session
-             (session_hash, csrf_hash, account_id, created_at, expires_at, ended_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+             (session_hash, csrf_hash, account_id, created_at, expires_at, ended_at,
+              ssh_public_key_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
             rusqlite::params![
                 login.session_hash,
                 login.csrf_hash,
                 account_id,
                 login.created_at,
                 login.expires_at,
+                key_id,
             ],
         )?;
         insert_audit_event(
@@ -1204,7 +1383,8 @@ impl Store {
     ) -> Result<WebSessionRecord, StoreError> {
         self.connection
             .query_row(
-                "SELECT account.username, account.is_administrator, web_session.expires_at
+                "SELECT account.username, account.is_administrator, web_session.expires_at,
+                        web_session.ssh_public_key_id
                  FROM web_session
                  JOIN account ON account.id = web_session.account_id
                  WHERE web_session.session_hash = ?1 AND web_session.ended_at IS NULL
@@ -1216,6 +1396,7 @@ impl Store {
                         username: row.get(0)?,
                         is_administrator: row.get(1)?,
                         expires_at: row.get(2)?,
+                        ssh_public_key_id: row.get(3)?,
                     })
                 },
             )
@@ -1270,6 +1451,11 @@ impl Store {
         );
         match result {
             Ok(1) => {
+                transaction.execute(
+                    "INSERT INTO repository_default_branch (repository_id, ref_name)
+                     VALUES (?1, ?2)",
+                    rusqlite::params![repository.id, repository.default_branch],
+                )?;
                 let event = event::repository(
                     repository.origin.event_kind(),
                     repository.owner,
@@ -1640,6 +1826,372 @@ impl Store {
             )),
             Err(error) => Err(error.into()),
         }
+    }
+
+    pub(crate) fn repository_settings(
+        &self,
+        owner: &str,
+        slug: &str,
+        actor: &str,
+    ) -> Result<RepositorySettings, StoreError> {
+        let access = repository_issue_access(&self.connection, owner, slug, Some(actor))?;
+        if !access.can_maintain() {
+            return Err(StoreError::PullRequestDenied);
+        }
+        let description = self
+            .connection
+            .query_row(
+                "SELECT description FROM repository_profile WHERE repository_id = ?1",
+                [&access.repository.id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let mut statement = self.connection.prepare(
+            "SELECT account.username, repository_collaborator.role
+             FROM repository_collaborator
+             JOIN account ON account.id = repository_collaborator.account_id
+             WHERE repository_collaborator.repository_id = ?1
+             ORDER BY account.username",
+        )?;
+        let collaborators = statement
+            .query_map([&access.repository.id], |row| {
+                Ok(RepositoryCollaboratorRecord {
+                    username: row.get(0)?,
+                    role: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RepositorySettings {
+            repository: access.repository,
+            description,
+            collaborators,
+            default_branch: self.repository_default_branch(owner, slug)?,
+            branches: Vec::new(),
+        })
+    }
+
+    pub(crate) fn repository_default_branch(
+        &self,
+        owner: &str,
+        slug: &str,
+    ) -> Result<String, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT repository_default_branch.ref_name
+                 FROM repository_default_branch
+                 JOIN repository ON repository.id = repository_default_branch.repository_id
+                 JOIN account ON account.id = repository.owner_account_id
+                 WHERE account.username = ?1 AND repository.slug = ?2",
+                rusqlite::params![owner, slug],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::RepositoryNotFound(owner.to_owned(), slug.to_owned()))
+    }
+
+    pub(crate) fn update_repository_default_branch(
+        &mut self,
+        owner: &str,
+        slug: &str,
+        actor: &str,
+        default_branch: &str,
+        changed_at: i64,
+        correlation_id: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let access = repository_issue_access(&transaction, owner, slug, Some(actor))?;
+        if !access.can_maintain() {
+            return Err(StoreError::PullRequestDenied);
+        }
+        let changed = transaction.execute(
+            "UPDATE repository_default_branch SET ref_name = ?2
+             WHERE repository_id = ?1",
+            rusqlite::params![access.repository.id, default_branch],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidDefaultBranch);
+        }
+        let target = format!("{owner}/{slug}:{default_branch}");
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "repository.default-branch",
+                actor,
+                target: &target,
+                outcome: "success",
+                correlation_id,
+                created_at: changed_at,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn repository_description(&self, repository_id: &str) -> Result<String, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(repository_profile.description, '')
+                 FROM repository
+                 LEFT JOIN repository_profile
+                   ON repository_profile.repository_id = repository.id
+                 WHERE repository.id = ?1",
+                [repository_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::Integrity(format!("repository {repository_id} disappeared")))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "an audited repository settings change includes repository identity and audit context"
+    )]
+    pub(crate) fn update_repository_settings(
+        &mut self,
+        owner: &str,
+        slug: &str,
+        actor: &str,
+        description: &str,
+        visibility: &str,
+        changed_at: i64,
+        correlation_id: &str,
+    ) -> Result<(), StoreError> {
+        if !matches!(visibility, "public" | "private") {
+            return Err(StoreError::InvalidRepositoryVisibility);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let access = repository_issue_access(&transaction, owner, slug, Some(actor))?;
+        if !access.can_maintain() {
+            return Err(StoreError::PullRequestDenied);
+        }
+        transaction.execute(
+            "INSERT INTO repository_profile (repository_id, description)
+             VALUES (?1, ?2)
+             ON CONFLICT (repository_id) DO UPDATE SET description = excluded.description",
+            rusqlite::params![access.repository.id, description],
+        )?;
+        transaction.execute(
+            "UPDATE repository SET visibility = ?2 WHERE id = ?1",
+            rusqlite::params![access.repository.id, visibility],
+        )?;
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "repository.settings",
+                actor,
+                target: &format!("{owner}/{slug}"),
+                outcome: "success",
+                correlation_id,
+                created_at: changed_at,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "an audited collaborator change includes repository identity and audit context"
+    )]
+    pub(crate) fn update_repository_collaborator(
+        &mut self,
+        owner: &str,
+        slug: &str,
+        actor: &str,
+        username: &str,
+        role: Option<&str>,
+        changed_at: i64,
+        correlation_id: &str,
+    ) -> Result<(), StoreError> {
+        if role.is_some_and(|role| !matches!(role, "maintainer" | "writer" | "reader")) {
+            return Err(StoreError::InvalidCollaboratorRole);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let access = repository_issue_access(&transaction, owner, slug, Some(actor))?;
+        if !access.can_maintain() {
+            return Err(StoreError::PullRequestDenied);
+        }
+        let collaborator_id = match active_account_id(&transaction, username) {
+            Ok(id) => id,
+            Err(StoreError::AccountNotFound(_)) => {
+                return Err(StoreError::CollaboratorNotFound(username.to_owned()));
+            }
+            Err(error) => return Err(error),
+        };
+        if username == owner {
+            return Err(StoreError::OwnerCollaborator);
+        }
+        let changed = match role {
+            Some(role) => transaction.execute(
+                "INSERT INTO repository_collaborator
+                 (repository_id, account_id, role, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (repository_id, account_id) DO UPDATE SET role = excluded.role",
+                rusqlite::params![access.repository.id, collaborator_id, role, changed_at],
+            )?,
+            None => transaction.execute(
+                "DELETE FROM repository_collaborator
+                 WHERE repository_id = ?1 AND account_id = ?2",
+                rusqlite::params![access.repository.id, collaborator_id],
+            )?,
+        };
+        if changed == 0 {
+            return Err(StoreError::CollaboratorNotFound(username.to_owned()));
+        }
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: if role.is_some() {
+                    "collaborator.set"
+                } else {
+                    "collaborator.remove"
+                },
+                actor,
+                target: &format!("{owner}/{slug}:{username}"),
+                outcome: "success",
+                correlation_id,
+                created_at: changed_at,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn archive_repository_for_actor(
+        &mut self,
+        owner: &str,
+        slug: &str,
+        actor: &str,
+        changed_at: i64,
+        correlation_id: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let access = repository_issue_access(&transaction, owner, slug, Some(actor))?;
+        if !access.can_maintain() {
+            return Err(StoreError::PullRequestDenied);
+        }
+        transaction.execute(
+            "UPDATE repository SET state = 'archived', archived_at = ?2 WHERE id = ?1",
+            rusqlite::params![access.repository.id, changed_at],
+        )?;
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "repository.archive",
+                actor,
+                target: &format!("{owner}/{slug}"),
+                outcome: "success",
+                correlation_id,
+                created_at: changed_at,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn rename_repository_for_owner(
+        &mut self,
+        owner: &str,
+        old_slug: &str,
+        new_slug: &str,
+        actor: &str,
+        changed_at: i64,
+        correlation_id: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner_id = active_account_id(&transaction, owner)?;
+        let actor_id = active_account_id(&transaction, actor)?;
+        if actor_id != owner_id {
+            return Err(StoreError::PullRequestDenied);
+        }
+        let result = transaction.execute(
+            "UPDATE repository SET slug = ?3
+             WHERE owner_account_id = ?1 AND slug = ?2 AND state = 'active'",
+            rusqlite::params![owner_id, old_slug, new_slug],
+        );
+        match result {
+            Ok(1) => {}
+            Ok(0) => {
+                return Err(repository_state_error(
+                    &transaction,
+                    owner_id,
+                    owner,
+                    old_slug,
+                )?);
+            }
+            Ok(_) => unreachable!("an owner and slug identify one repository"),
+            Err(error) if is_unique_constraint(&error) => {
+                return Err(StoreError::RepositoryExists(
+                    owner.to_owned(),
+                    new_slug.to_owned(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "repository.rename",
+                actor,
+                target: &format!("{owner}/{old_slug}->{new_slug}"),
+                outcome: "success",
+                correlation_id,
+                created_at: changed_at,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn unarchive_repository_for_owner(
+        &mut self,
+        owner: &str,
+        slug: &str,
+        actor: &str,
+        changed_at: i64,
+        correlation_id: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner_id = active_account_id(&transaction, owner)?;
+        let actor_id = active_account_id(&transaction, actor)?;
+        if actor_id != owner_id {
+            return Err(StoreError::PullRequestDenied);
+        }
+        let changed = transaction.execute(
+            "UPDATE repository
+             SET state = 'active', archived_at = NULL
+             WHERE owner_account_id = ?1 AND slug = ?2 AND state = 'archived'",
+            rusqlite::params![owner_id, slug],
+        )?;
+        if changed != 1 {
+            return Err(repository_state_error(&transaction, owner_id, owner, slug)?);
+        }
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "repository.unarchive",
+                actor,
+                target: &format!("{owner}/{slug}"),
+                outcome: "success",
+                correlation_id,
+                created_at: changed_at,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     #[allow(
@@ -2051,6 +2603,40 @@ impl Store {
         number: i64,
         actor: Option<&str>,
     ) -> Result<PullRequestDetail, StoreError> {
+        self.pull_request_with_activity(owner, repository, number, actor, None)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the pull-request detail has independent review and timeline pages"
+    )]
+    pub(crate) fn pull_request_detail_page(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        actor: Option<&str>,
+        reviews_page: usize,
+        timeline_page: usize,
+        page_size: usize,
+    ) -> Result<PullRequestDetail, StoreError> {
+        self.pull_request_with_activity(
+            owner,
+            repository,
+            number,
+            actor,
+            Some((reviews_page, timeline_page, page_size)),
+        )
+    }
+
+    fn pull_request_with_activity(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        actor: Option<&str>,
+        activity: Option<(usize, usize, usize)>,
+    ) -> Result<PullRequestDetail, StoreError> {
         let access = repository_issue_access(&self.connection, owner, repository, actor)?;
         if !access.can_read() {
             return Err(StoreError::PullRequestHidden);
@@ -2094,7 +2680,7 @@ impl Store {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        let reviews = {
+        let (reviews, reviews_page, reviews_has_next) = {
             let mut statement = self.connection.prepare(
                 "SELECT pull_request_review.id, pull_request_revision.number,
                         author.username, pull_request_review.kind,
@@ -2107,20 +2693,47 @@ impl Store {
                  JOIN account AS author
                    ON author.id = pull_request_review.author_account_id
                  WHERE pull_request_review.pull_request_id = ?1
-                 ORDER BY pull_request_review.created_at, pull_request_review.id",
+                 ORDER BY pull_request_review.created_at DESC, pull_request_review.id DESC
+                 LIMIT ?2 OFFSET ?3",
             )?;
-            statement
-                .query_map([&pull_request.id], pull_request_review_from_row)?
-                .collect::<Result<Vec<_>, _>>()?
+            let (page, page_size) =
+                activity.map_or((1, usize::MAX - 1), |value| (value.0, value.2));
+            let limit = i64::try_from(page_size.saturating_add(1)).unwrap_or(i64::MAX);
+            let offset = if activity.is_some() {
+                page_offset(page, page_size)?
+            } else {
+                0
+            };
+            let mut records = statement
+                .query_map(
+                    rusqlite::params![pull_request.id, limit, offset],
+                    pull_request_review_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            let has_next = activity.is_some() && records.len() > page_size;
+            if activity.is_some() {
+                records.truncate(page_size);
+            }
+            records.reverse();
+            (records, page, has_next)
         };
-        let timeline = {
+        let (timeline, timeline_page, timeline_has_next) = {
             let mut statement = self.connection.prepare(
                 "SELECT sequence, kind, actor, payload, created_at
                  FROM repository_event
-                 WHERE pull_request_id = ?1 ORDER BY sequence",
+                 WHERE pull_request_id = ?1 ORDER BY sequence DESC
+                 LIMIT ?2 OFFSET ?3",
             )?;
-            statement
-                .query_map([&pull_request.id], |row| {
+            let (page, page_size) =
+                activity.map_or((1, usize::MAX - 1), |value| (value.1, value.2));
+            let limit = i64::try_from(page_size.saturating_add(1)).unwrap_or(i64::MAX);
+            let offset = if activity.is_some() {
+                page_offset(page, page_size)?
+            } else {
+                0
+            };
+            let mut records = statement
+                .query_map(rusqlite::params![pull_request.id, limit, offset], |row| {
                     Ok(PullRequestTimelineRecord {
                         sequence: row.get(0)?,
                         kind: row.get(1)?,
@@ -2129,9 +2742,21 @@ impl Store {
                         created_at: row.get(4)?,
                     })
                 })?
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, _>>()?;
+            let has_next = activity.is_some() && records.len() > page_size;
+            if activity.is_some() {
+                records.truncate(page_size);
+            }
+            records.reverse();
+            (records, page, has_next)
         };
         let is_open = pull_request.state == "open";
+        let author_account_id: i64 = self.connection.query_row(
+            "SELECT author_account_id FROM pull_request WHERE id = ?1",
+            [&pull_request.id],
+            |row| row.get(0),
+        )?;
+        let can_edit = pull_request.state != "merged" && access.can_write_issue(author_account_id);
         let can_revise = is_open && access.can_write_repository();
         let can_merge = access.can_maintain() && pull_request.state == "open";
         Ok(PullRequestDetail {
@@ -2141,6 +2766,12 @@ impl Store {
             revisions,
             reviews,
             timeline,
+            reviews_page,
+            reviews_has_next,
+            timeline_page,
+            timeline_has_next,
+            can_edit,
+            can_change_state: can_edit,
             can_revise,
             can_merge,
         })
@@ -2293,6 +2924,185 @@ impl Store {
         Ok((access.repository, pull_requests, can_create))
     }
 
+    pub(crate) fn pull_request_page(
+        &self,
+        owner: &str,
+        repository: &str,
+        actor: Option<&str>,
+        state: &str,
+        page: usize,
+        page_size: usize,
+    ) -> Result<(RepositoryRecord, RecordPage<PullRequestRecord>, bool), StoreError> {
+        let access = repository_issue_access(&self.connection, owner, repository, actor)?;
+        if !access.can_read() {
+            return Err(StoreError::PullRequestHidden);
+        }
+        let offset = page
+            .checked_sub(1)
+            .and_then(|page| page.checked_mul(page_size))
+            .ok_or(StoreError::EventLimit)?;
+        let limit = i64::try_from(page_size.checked_add(1).ok_or(StoreError::EventLimit)?)
+            .map_err(|_| StoreError::EventLimit)?;
+        let offset = i64::try_from(offset).map_err(|_| StoreError::EventLimit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT pull_request.id, pull_request.number, pull_request.title,
+                    pull_request.body, pull_request.state, author.username,
+                    pull_request.base_ref, pull_request.head_ref,
+                    pull_request.base_object_id, pull_request.head_object_id,
+                    pull_request.created_at, pull_request.updated_at
+             FROM pull_request
+             JOIN account AS author ON author.id = pull_request.author_account_id
+             WHERE pull_request.repository_id = ?1
+               AND (?2 = 'all' OR pull_request.state = ?2)
+             ORDER BY pull_request.number DESC
+             LIMIT ?3 OFFSET ?4",
+        )?;
+        let mut items = statement
+            .query_map(
+                rusqlite::params![access.repository.id, state, limit, offset],
+                pull_request_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_next = items.len() > page_size;
+        items.truncate(page_size);
+        let can_create = access.can_write_repository();
+        Ok((
+            access.repository,
+            RecordPage {
+                items,
+                page,
+                has_next,
+            },
+            can_create,
+        ))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a pull-request edit includes repository identity, content, actor, and time"
+    )]
+    pub(crate) fn edit_pull_request(
+        &mut self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        actor: &str,
+        title: &str,
+        body: &str,
+        changed_at: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let access = repository_issue_access(&transaction, owner, repository, Some(actor))?;
+        let current = transaction
+            .query_row(
+                "SELECT id, author_account_id, state
+                 FROM pull_request WHERE repository_id = ?1 AND number = ?2",
+                rusqlite::params![access.repository.id, number],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::PullRequestNotFound(owner.to_owned(), repository.to_owned(), number)
+            })?;
+        if !access.can_write_issue(current.1) {
+            return Err(StoreError::PullRequestDenied);
+        }
+        if current.2 == "merged" {
+            return Err(StoreError::PullRequestState);
+        }
+        transaction.execute(
+            "UPDATE pull_request SET title = ?2, body = ?3, updated_at = ?4 WHERE id = ?1",
+            rusqlite::params![current.0, title, body, changed_at],
+        )?;
+        let event = event::pull_request_change(
+            event::EventKind::PullRequestEdited,
+            &current.0,
+            number,
+            title,
+            body,
+            &current.2,
+        );
+        insert_pull_request_event(
+            &transaction,
+            &access.repository.id,
+            &current.0,
+            actor,
+            changed_at,
+            &event,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn set_pull_request_state(
+        &mut self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        actor: &str,
+        state: &str,
+        changed_at: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let access = repository_issue_access(&transaction, owner, repository, Some(actor))?;
+        let current = transaction
+            .query_row(
+                "SELECT id, author_account_id, title, body, state
+                 FROM pull_request WHERE repository_id = ?1 AND number = ?2",
+                rusqlite::params![access.repository.id, number],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::PullRequestNotFound(owner.to_owned(), repository.to_owned(), number)
+            })?;
+        if !access.can_write_issue(current.1) {
+            return Err(StoreError::PullRequestDenied);
+        }
+        if current.4 == "merged" || current.4 == state {
+            return Err(StoreError::PullRequestState);
+        }
+        transaction.execute(
+            "UPDATE pull_request SET state = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![current.0, state, changed_at],
+        )?;
+        let kind = if state == "closed" {
+            event::EventKind::PullRequestClosed
+        } else {
+            event::EventKind::PullRequestReopened
+        };
+        let event =
+            event::pull_request_change(kind, &current.0, number, &current.2, &current.3, state);
+        insert_pull_request_event(
+            &transaction,
+            &access.repository.id,
+            &current.0,
+            actor,
+            changed_at,
+            &event,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn edit_issue(
         &mut self,
         change: &IssueChange<'_>,
@@ -2422,161 +3232,6 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn set_issue_label(
-        &mut self,
-        change: &IssueChange<'_>,
-        label: &str,
-        present: bool,
-    ) -> Result<(), StoreError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (access, current) = issue_mutation_context(
-            &transaction,
-            change.owner,
-            change.repository,
-            change.number,
-            change.actor,
-        )?;
-        let actor_id = access.active_actor_id.ok_or(StoreError::IssueDenied)?;
-        if !access.can_maintain() {
-            return Err(StoreError::IssueDenied);
-        }
-        let (label_id, stored_label) = if present {
-            transaction.execute(
-                "INSERT INTO label (id, repository_id, name, created_at)
-                 VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3)
-                 ON CONFLICT DO NOTHING",
-                rusqlite::params![access.repository.id, label, change.changed_at],
-            )?;
-            transaction.query_row(
-                "SELECT id, name FROM label
-                 WHERE repository_id = ?1 AND name = ?2 COLLATE NOCASE",
-                rusqlite::params![access.repository.id, label],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )?
-        } else {
-            transaction
-                .query_row(
-                    "SELECT id, name FROM label
-                     WHERE repository_id = ?1 AND name = ?2 COLLATE NOCASE",
-                    rusqlite::params![access.repository.id, label],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()?
-                .ok_or(StoreError::IssueLabelState)?
-        };
-        let changed = if present {
-            transaction.execute(
-                "INSERT INTO issue_label (issue_id, label_id, actor_account_id, created_at)
-                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
-                rusqlite::params![current.issue.id, label_id, actor_id, change.changed_at],
-            )?
-        } else {
-            transaction.execute(
-                "DELETE FROM issue_label WHERE issue_id = ?1 AND label_id = ?2",
-                rusqlite::params![current.issue.id, label_id],
-            )?
-        };
-        if changed == 0 {
-            return Err(StoreError::IssueLabelState);
-        }
-        transaction.execute(
-            "UPDATE issue SET updated_at = ?2 WHERE id = ?1",
-            rusqlite::params![current.issue.id, change.changed_at],
-        )?;
-        let kind = if present {
-            event::EventKind::IssueLabeled
-        } else {
-            event::EventKind::IssueUnlabeled
-        };
-        let event = event::issue_label(
-            kind,
-            &current.issue.id,
-            change.number,
-            &label_id,
-            &stored_label,
-        );
-        insert_issue_event(
-            &transaction,
-            &access.repository.id,
-            &current.issue.id,
-            change.actor,
-            change.changed_at,
-            &event,
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn set_issue_assignee(
-        &mut self,
-        change: &IssueChange<'_>,
-        assignee: &str,
-        present: bool,
-    ) -> Result<(), StoreError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (access, current) = issue_mutation_context(
-            &transaction,
-            change.owner,
-            change.repository,
-            change.number,
-            change.actor,
-        )?;
-        let actor_id = access.active_actor_id.ok_or(StoreError::IssueDenied)?;
-        if !access.can_maintain() {
-            return Err(StoreError::IssueDenied);
-        }
-        let assignee_access = repository_issue_access(
-            &transaction,
-            change.owner,
-            change.repository,
-            Some(assignee),
-        )?;
-        let assignee_id = assignee_access
-            .active_actor_id
-            .filter(|_| assignee_access.can_read())
-            .ok_or_else(|| StoreError::IssueAssigneeNotFound(assignee.to_owned()))?;
-        let changed = if present {
-            transaction.execute(
-                "INSERT INTO issue_assignee
-                 (issue_id, account_id, actor_account_id, created_at)
-                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
-                rusqlite::params![current.issue.id, assignee_id, actor_id, change.changed_at],
-            )?
-        } else {
-            transaction.execute(
-                "DELETE FROM issue_assignee WHERE issue_id = ?1 AND account_id = ?2",
-                rusqlite::params![current.issue.id, assignee_id],
-            )?
-        };
-        if changed == 0 {
-            return Err(StoreError::IssueAssigneeState);
-        }
-        transaction.execute(
-            "UPDATE issue SET updated_at = ?2 WHERE id = ?1",
-            rusqlite::params![current.issue.id, change.changed_at],
-        )?;
-        let kind = if present {
-            event::EventKind::IssueAssigned
-        } else {
-            event::EventKind::IssueUnassigned
-        };
-        let event = event::issue_assignee(kind, &current.issue.id, change.number, assignee);
-        insert_issue_event(
-            &transaction,
-            &access.repository.id,
-            &current.issue.id,
-            change.actor,
-            change.changed_at,
-            &event,
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
     pub(crate) fn issues(
         &self,
         owner: &str,
@@ -2602,12 +3257,67 @@ impl Store {
         Ok((access.repository, issues))
     }
 
+    pub(crate) fn issue_page(
+        &self,
+        owner: &str,
+        repository: &str,
+        actor: Option<&str>,
+        state: &str,
+        page: usize,
+        page_size: usize,
+    ) -> Result<(RepositoryRecord, RecordPage<IssueRecord>), StoreError> {
+        let access = repository_issue_access(&self.connection, owner, repository, actor)?;
+        if !access.can_read() {
+            return Err(StoreError::IssueHidden);
+        }
+        let offset = page
+            .checked_sub(1)
+            .and_then(|page| page.checked_mul(page_size))
+            .ok_or(StoreError::EventLimit)?;
+        let limit = i64::try_from(page_size.checked_add(1).ok_or(StoreError::EventLimit)?)
+            .map_err(|_| StoreError::EventLimit)?;
+        let offset = i64::try_from(offset).map_err(|_| StoreError::EventLimit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT issue.id, issue.number, issue.title, issue.body, issue.state,
+                    account.username, issue.created_at, issue.updated_at, issue.closed_at
+             FROM issue
+             JOIN account ON account.id = issue.author_account_id
+             WHERE issue.repository_id = ?1
+               AND (?2 = 'all' OR issue.state = ?2)
+             ORDER BY issue.number DESC
+             LIMIT ?3 OFFSET ?4",
+        )?;
+        let mut items = statement
+            .query_map(
+                rusqlite::params![access.repository.id, state, limit, offset],
+                issue_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_next = items.len() > page_size;
+        items.truncate(page_size);
+        Ok((
+            access.repository,
+            RecordPage {
+                items,
+                page,
+                has_next,
+            },
+        ))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the issue detail has independent comment and timeline pages"
+    )]
     pub(crate) fn issue_detail(
         &self,
         owner: &str,
         repository: &str,
         number: i64,
         actor: Option<&str>,
+        comments_page: usize,
+        timeline_page: usize,
+        page_size: usize,
     ) -> Result<IssueDetail, StoreError> {
         let access = repository_issue_access(&self.connection, owner, repository, actor)?;
         if !access.can_read() {
@@ -2620,67 +3330,74 @@ impl Store {
             repository,
             number,
         )?;
-        let comments = {
+        let limit = i64::try_from(page_size.checked_add(1).ok_or(StoreError::EventLimit)?)
+            .map_err(|_| StoreError::EventLimit)?;
+        let comments_offset = page_offset(comments_page, page_size)?;
+        let timeline_offset = page_offset(timeline_page, page_size)?;
+        let (comments, comments_has_next) = {
             let mut statement = self.connection.prepare(
                 "SELECT issue_comment.id, account.username, issue_comment.body,
                         issue_comment.created_at
                  FROM issue_comment
                  JOIN account ON account.id = issue_comment.author_account_id
                  WHERE issue_comment.issue_id = ?1
-                 ORDER BY issue_comment.created_at, issue_comment.id",
+                 ORDER BY issue_comment.created_at DESC, issue_comment.id DESC
+                 LIMIT ?2 OFFSET ?3",
             )?;
-            statement
-                .query_map([&issue.issue.id], |row| {
-                    Ok(IssueCommentRecord {
-                        id: row.get(0)?,
-                        author: row.get(1)?,
-                        body: row.get(2)?,
-                        created_at: row.get(3)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?
+            let mut records = statement
+                .query_map(
+                    rusqlite::params![issue.issue.id, limit, comments_offset],
+                    |row| {
+                        Ok(IssueCommentRecord {
+                            id: row.get(0)?,
+                            author: row.get(1)?,
+                            body: row.get(2)?,
+                            created_at: row.get(3)?,
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            let has_next = records.len() > page_size;
+            records.truncate(page_size);
+            records.reverse();
+            (records, has_next)
         };
-        let labels = issue_names(
-            &self.connection,
-            "SELECT label.name FROM issue_label
-             JOIN label ON label.id = issue_label.label_id
-             WHERE issue_label.issue_id = ?1 ORDER BY label.name COLLATE NOCASE",
-            &issue.issue.id,
-        )?;
-        let assignees = issue_names(
-            &self.connection,
-            "SELECT account.username FROM issue_assignee
-             JOIN account ON account.id = issue_assignee.account_id
-             WHERE issue_assignee.issue_id = ?1 ORDER BY account.username",
-            &issue.issue.id,
-        )?;
-        let timeline = {
+        let (timeline, timeline_has_next) = {
             let mut statement = self.connection.prepare(
                 "SELECT sequence, kind, actor, payload, created_at
-                 FROM repository_event WHERE issue_id = ?1 ORDER BY sequence",
+                 FROM repository_event WHERE issue_id = ?1 ORDER BY sequence DESC
+                 LIMIT ?2 OFFSET ?3",
             )?;
-            statement
-                .query_map([&issue.issue.id], |row| {
-                    Ok(IssueTimelineRecord {
-                        sequence: row.get(0)?,
-                        kind: row.get(1)?,
-                        actor: row.get(2)?,
-                        payload: row.get(3)?,
-                        created_at: row.get(4)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?
+            let mut records = statement
+                .query_map(
+                    rusqlite::params![issue.issue.id, limit, timeline_offset],
+                    |row| {
+                        Ok(IssueTimelineRecord {
+                            sequence: row.get(0)?,
+                            kind: row.get(1)?,
+                            actor: row.get(2)?,
+                            payload: row.get(3)?,
+                            created_at: row.get(4)?,
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            let has_next = records.len() > page_size;
+            records.truncate(page_size);
+            records.reverse();
+            (records, has_next)
         };
         Ok(IssueDetail {
             can_comment: access.active_actor_id.is_some() && access.can_read(),
             can_edit: access.can_write_issue(issue.author_account_id),
-            can_maintain: access.can_maintain(),
             repository: access.repository,
             issue: issue.issue,
             comments,
-            labels,
-            assignees,
             timeline,
+            comments_page,
+            comments_has_next,
+            timeline_page,
+            timeline_has_next,
         })
     }
 
@@ -2698,17 +3415,14 @@ impl Store {
             Some(actor_id) => self
                 .connection
                 .query_row(
-                    "SELECT id, pushes, issues, pull_requests, created_at, updated_at
+                    "SELECT id, created_at, updated_at
                  FROM watch WHERE repository_id = ?1 AND account_id = ?2",
                     rusqlite::params![access.repository.id, actor_id],
                     |row| {
                         Ok(WatchRecord {
                             id: row.get(0)?,
-                            pushes: row.get(1)?,
-                            issues: row.get(2)?,
-                            pull_requests: row.get(3)?,
-                            created_at: row.get(4)?,
-                            updated_at: row.get(5)?,
+                            created_at: row.get(1)?,
+                            updated_at: row.get(2)?,
                         })
                     },
                 )
@@ -2723,7 +3437,7 @@ impl Store {
         owner: &str,
         repository: &str,
         actor: &str,
-        preferences: WatchPreferences,
+        watching: bool,
         changed_at: i64,
     ) -> Result<Option<WatchRecord>, StoreError> {
         let transaction = self
@@ -2734,7 +3448,7 @@ impl Store {
         if !access.can_read() {
             return Err(StoreError::WatchDenied);
         }
-        if !preferences.any() {
+        if !watching {
             transaction.execute(
                 "DELETE FROM watch WHERE repository_id = ?1 AND account_id = ?2",
                 rusqlite::params![access.repository.id, actor_id],
@@ -2744,35 +3458,21 @@ impl Store {
         }
         transaction.execute(
             "INSERT INTO watch
-             (id, repository_id, account_id, pushes, issues, pull_requests,
-              created_at, updated_at)
-             VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?6)
+             (id, repository_id, account_id, created_at, updated_at)
+             VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?3)
              ON CONFLICT (repository_id, account_id) DO UPDATE SET
-                 pushes = excluded.pushes,
-                 issues = excluded.issues,
-                 pull_requests = excluded.pull_requests,
                  updated_at = excluded.updated_at",
-            rusqlite::params![
-                access.repository.id,
-                actor_id,
-                preferences.pushes,
-                preferences.issues,
-                preferences.pull_requests,
-                changed_at,
-            ],
+            rusqlite::params![access.repository.id, actor_id, changed_at],
         )?;
         let record = transaction.query_row(
-            "SELECT id, pushes, issues, pull_requests, created_at, updated_at
+            "SELECT id, created_at, updated_at
              FROM watch WHERE repository_id = ?1 AND account_id = ?2",
             rusqlite::params![access.repository.id, actor_id],
             |row| {
                 Ok(WatchRecord {
                     id: row.get(0)?,
-                    pushes: row.get(1)?,
-                    issues: row.get(2)?,
-                    pull_requests: row.get(3)?,
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
+                    created_at: row.get(1)?,
+                    updated_at: row.get(2)?,
                 })
             },
         )?;
@@ -2783,12 +3483,9 @@ impl Store {
     pub(crate) fn create_feed_token(
         &mut self,
         actor: &str,
-        scope: &str,
-        repository: Option<(&str, &str)>,
         token_hash: &[u8; 32],
         created_at: i64,
     ) -> Result<FeedTokenRecord, StoreError> {
-        validate_feed_scope(scope, repository)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2802,35 +3499,16 @@ impl Store {
         if active_tokens >= MAX_ACTIVE_FEED_TOKENS {
             return Err(StoreError::FeedTokenLimit);
         }
-        let repository_id = match repository {
-            Some((owner, repository)) => {
-                let access = repository_issue_access(&transaction, owner, repository, Some(actor))?;
-                if !access.can_read() {
-                    return Err(StoreError::FeedTokenDenied);
-                }
-                Some(access.repository.id)
-            }
-            None => None,
-        };
         transaction.execute(
             "INSERT INTO feed_token
              (id, token_hash, account_id, scope, repository_id, created_at, revoked_at)
-             VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, NULL)",
-            rusqlite::params![
-                token_hash.as_slice(),
-                account_id,
-                scope,
-                repository_id,
-                created_at
-            ],
+             VALUES (lower(hex(randomblob(16))), ?1, ?2, 'watched', NULL, ?3, NULL)",
+            rusqlite::params![token_hash.as_slice(), account_id, created_at],
         )?;
         let record = transaction.query_row(
-            "SELECT feed_token.id, feed_token.scope, owner.username, repository.slug,
-                    feed_token.created_at, feed_token.revoked_at
+            "SELECT id, scope, created_at, revoked_at
              FROM feed_token
-             LEFT JOIN repository ON repository.id = feed_token.repository_id
-             LEFT JOIN account AS owner ON owner.id = repository.owner_account_id
-             WHERE feed_token.rowid = last_insert_rowid()",
+             WHERE rowid = last_insert_rowid()",
             [],
             feed_token_from_row,
         )?;
@@ -2841,13 +3519,10 @@ impl Store {
     pub(crate) fn feed_tokens(&self, actor: &str) -> Result<Vec<FeedTokenRecord>, StoreError> {
         let account_id = active_account_id(&self.connection, actor)?;
         let mut statement = self.connection.prepare(
-            "SELECT feed_token.id, feed_token.scope, owner.username, repository.slug,
-                    feed_token.created_at, feed_token.revoked_at
+            "SELECT id, scope, created_at, revoked_at
              FROM feed_token
-             LEFT JOIN repository ON repository.id = feed_token.repository_id
-             LEFT JOIN account AS owner ON owner.id = repository.owner_account_id
-             WHERE feed_token.account_id = ?1
-             ORDER BY feed_token.created_at DESC, feed_token.id
+             WHERE account_id = ?1
+             ORDER BY created_at DESC, id
              LIMIT 100",
         )?;
         statement
@@ -2867,12 +3542,12 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let account_id = active_account_id(&transaction, actor)?;
-        let current = transaction
+        transaction
             .query_row(
-                "SELECT scope, repository_id FROM feed_token
+                "SELECT 1 FROM feed_token
                  WHERE id = ?1 AND account_id = ?2 AND revoked_at IS NULL",
                 rusqlite::params![id, account_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                |_| Ok(()),
             )
             .optional()?
             .ok_or(StoreError::FeedTokenNotFound)?;
@@ -2884,22 +3559,13 @@ impl Store {
         transaction.execute(
             "INSERT INTO feed_token
              (id, token_hash, account_id, scope, repository_id, created_at, revoked_at)
-             VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, NULL)",
-            rusqlite::params![
-                token_hash.as_slice(),
-                account_id,
-                current.0,
-                current.1,
-                changed_at
-            ],
+             VALUES (lower(hex(randomblob(16))), ?1, ?2, 'watched', NULL, ?3, NULL)",
+            rusqlite::params![token_hash.as_slice(), account_id, changed_at],
         )?;
         let record = transaction.query_row(
-            "SELECT feed_token.id, feed_token.scope, owner.username, repository.slug,
-                    feed_token.created_at, feed_token.revoked_at
+            "SELECT id, scope, created_at, revoked_at
              FROM feed_token
-             LEFT JOIN repository ON repository.id = feed_token.repository_id
-             LEFT JOIN account AS owner ON owner.id = repository.owner_account_id
-             WHERE feed_token.rowid = last_insert_rowid()",
+             WHERE rowid = last_insert_rowid()",
             [],
             feed_token_from_row,
         )?;
@@ -2934,8 +3600,7 @@ impl Store {
         let grant = self
             .connection
             .query_row(
-                "SELECT feed_token.scope, feed_token.repository_id,
-                        account.id, account.username
+                "SELECT feed_token.scope, account.id, account.username
                  FROM feed_token
                  JOIN account ON account.id = feed_token.account_id
                  WHERE feed_token.token_hash = ?1 AND feed_token.revoked_at IS NULL
@@ -2944,31 +3609,49 @@ impl Store {
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
                     ))
                 },
             )
             .optional()?
             .ok_or(StoreError::FeedTokenNotFound)?;
-        let events = match grant.0.as_str() {
-            "repository" => token_repository_events(
-                &self.connection,
-                grant.1.as_deref().ok_or(StoreError::InvalidFeedScope)?,
-                grant.2,
-                limit,
-            )?,
-            "watched" => watched_feed_events(&self.connection, grant.2, limit)?,
-            "assignments" => assignment_feed_events(&self.connection, grant.2, &grant.3, limit)?,
-            "mentions" => mention_feed_events(&self.connection, grant.2, &grant.3, limit)?,
-            _ => return Err(StoreError::InvalidFeedScope),
-        };
+        if grant.0 != "watched" {
+            return Err(StoreError::InvalidFeedScope);
+        }
+        let events = watched_activity_events(&self.connection, grant.1, None, limit)?;
         Ok(TokenFeedPage {
-            scope: grant.0,
-            username: grant.3,
-            target: grant.1,
+            username: grant.2,
             events,
+        })
+    }
+
+    pub(crate) fn watched_activity_page(
+        &self,
+        actor: &str,
+        before: Option<&ActivityCursor>,
+        limit: usize,
+    ) -> Result<ActivityPage, StoreError> {
+        if limit == 0 || limit > 100 {
+            return Err(StoreError::EventLimit);
+        }
+        let account_id = active_account_id(&self.connection, actor)?;
+        let query_limit = limit.checked_add(1).ok_or(StoreError::EventLimit)?;
+        let query_limit = i64::try_from(query_limit).map_err(|_| StoreError::EventLimit)?;
+        let mut events =
+            watched_activity_events(&self.connection, account_id, before, query_limit)?;
+        let has_next = events.len() > limit;
+        events.truncate(limit);
+        let next_before = has_next.then(|| {
+            let event = &events[events.len() - 1].event;
+            ActivityCursor {
+                created_at: event.created_at,
+                event_id: event.event_id.clone(),
+            }
+        });
+        Ok(ActivityPage {
+            events,
+            next_before,
         })
     }
 
@@ -2976,15 +3659,10 @@ impl Store {
         &self,
         actor: Option<&str>,
         limit: usize,
-        max_field_bytes: usize,
         mut visit: impl FnMut(MetadataSearchCandidate) -> bool,
     ) -> Result<bool, StoreError> {
         let query_limit = limit.checked_add(1).ok_or(StoreError::EventLimit)?;
         let query_limit = i64::try_from(query_limit).map_err(|_| StoreError::EventLimit)?;
-        let max_field_bytes = max_field_bytes
-            .checked_add(1)
-            .and_then(|value| i64::try_from(value).ok())
-            .ok_or(StoreError::EventLimit)?;
         let mut statement = self.connection.prepare(
             "WITH visible_repository AS (
                  SELECT repository.id, owner.username AS owner, repository.slug
@@ -3000,36 +3678,14 @@ impl Store {
                             WHERE repository_collaborator.repository_id = repository.id
                               AND repository_collaborator.account_id = actor.id
                         ))
-             ), candidates AS (
-                 SELECT 'repository' AS kind, visible_repository.id AS record_id,
-                        visible_repository.owner, visible_repository.slug,
-                        NULL AS issue_number,
-                        CAST(visible_repository.owner || '/' || visible_repository.slug AS BLOB)
-                            AS title,
-                        X'' AS body
-                 FROM visible_repository
-                 UNION ALL
-                 SELECT 'issue', issue.id, visible_repository.owner,
-                        visible_repository.slug, issue.number,
-                        COALESCE(substr(CAST(issue.title AS BLOB), 1, ?3), X''),
-                        COALESCE(substr(CAST(issue.body AS BLOB), 1, ?3), X'')
-                 FROM issue
-                 JOIN visible_repository ON visible_repository.id = issue.repository_id
-                 UNION ALL
-                 SELECT 'issue-comment', issue_comment.id, visible_repository.owner,
-                        visible_repository.slug, issue.number,
-                        COALESCE(substr(CAST(issue.title AS BLOB), 1, ?3), X''),
-                        COALESCE(substr(CAST(issue_comment.body AS BLOB), 1, ?3), X'')
-                 FROM issue_comment
-                 JOIN issue ON issue.id = issue_comment.issue_id
-                 JOIN visible_repository ON visible_repository.id = issue.repository_id
              )
-             SELECT kind, record_id, owner, slug, issue_number, title, body
-             FROM candidates
-             ORDER BY owner, slug, kind, issue_number, record_id
+             SELECT 'repository', id, owner, slug,
+                    CAST(owner || '/' || slug AS BLOB), X''
+             FROM visible_repository
+             ORDER BY owner, slug
              LIMIT ?2",
         )?;
-        let mut rows = statement.query(rusqlite::params![actor, query_limit, max_field_bytes])?;
+        let mut rows = statement.query(rusqlite::params![actor, query_limit])?;
         let mut visited = 0_usize;
         while let Some(row) = rows.next()? {
             if visited == limit {
@@ -3041,9 +3697,8 @@ impl Store {
                 record_id: row.get(1)?,
                 owner: row.get(2)?,
                 repository: row.get(3)?,
-                issue_number: row.get(4)?,
-                title: row.get(5)?,
-                body: row.get(6)?,
+                title: row.get(4)?,
+                body: row.get(5)?,
             };
             if !visit(candidate) {
                 return Ok(true);
@@ -3339,17 +3994,20 @@ impl Store {
     ) -> Result<Vec<HomeRepositoryRecord>, StoreError> {
         let limit = i64::try_from(limit).expect("the home repository limit fits in SQLite");
         let mut statement = self.connection.prepare(
-            "SELECT account.username, repository.slug, repository.visibility,
+            "SELECT account.username, repository.slug, repository.visibility, repository.state,
+                    COALESCE(repository_profile.description, ''),
                     COALESCE(MAX(repository_event.created_at), repository.created_at)
              FROM repository
              JOIN account ON account.id = repository.owner_account_id
+             LEFT JOIN repository_profile ON repository_profile.repository_id = repository.id
              LEFT JOIN repository_event ON repository_event.repository_id = repository.id
-             WHERE repository.state = 'active'
-               AND ((?1 IS NULL AND repository.visibility = 'public')
+             WHERE ((?1 IS NULL AND repository.visibility = 'public'
+                     AND repository.state = 'active')
                     OR account.username = ?1)
              GROUP BY repository.id, account.username, repository.slug,
-                      repository.visibility, repository.created_at
-             ORDER BY 4 DESC, account.username, repository.slug
+                      repository.visibility, repository.state, repository_profile.description,
+                      repository.created_at
+             ORDER BY 6 DESC, account.username, repository.slug
              LIMIT ?2",
         )?;
         statement
@@ -3358,11 +4016,137 @@ impl Store {
                     owner: row.get(0)?,
                     slug: row.get(1)?,
                     visibility: row.get(2)?,
-                    updated_at: row.get(3)?,
+                    state: row.get(3)?,
+                    description: row.get(4)?,
+                    updated_at: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub(crate) fn public_profile(&self, username: &str) -> Result<PublicProfile, StoreError> {
+        let profile = self.connection.query_row(
+            "SELECT username, bio, contact_email
+             FROM account
+             WHERE username = ?1 AND state = 'active'",
+            [username],
+            |row| {
+                Ok(PublicProfile {
+                    username: row.get(0)?,
+                    bio: row.get(1)?,
+                    contact_email: row.get(2)?,
+                    repositories: Vec::new(),
+                    page: 1,
+                    has_next: false,
+                })
+            },
+        );
+        let mut profile = match profile {
+            Ok(profile) => profile,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(StoreError::AccountNotFound(username.to_owned()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT account.username, repository.slug, repository.visibility, repository.state,
+                    COALESCE(repository_profile.description, ''),
+                    COALESCE(MAX(repository_event.created_at), repository.created_at)
+             FROM repository
+             JOIN account ON account.id = repository.owner_account_id
+             LEFT JOIN repository_profile ON repository_profile.repository_id = repository.id
+             LEFT JOIN repository_event ON repository_event.repository_id = repository.id
+             WHERE account.username = ?1
+               AND repository.state = 'active'
+               AND repository.visibility = 'public'
+             GROUP BY repository.id, account.username, repository.slug,
+                      repository.visibility, repository.state, repository_profile.description,
+                      repository.created_at
+             ORDER BY 6 DESC, repository.slug
+             LIMIT 100",
+        )?;
+        profile.repositories = statement
+            .query_map([username], |row| {
+                Ok(HomeRepositoryRecord {
+                    owner: row.get(0)?,
+                    slug: row.get(1)?,
+                    visibility: row.get(2)?,
+                    state: row.get(3)?,
+                    description: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(profile)
+    }
+
+    pub(crate) fn public_profile_page(
+        &self,
+        username: &str,
+        page: usize,
+        page_size: usize,
+    ) -> Result<PublicProfile, StoreError> {
+        let mut profile = self.public_profile(username)?;
+        let offset = page
+            .checked_sub(1)
+            .and_then(|page| page.checked_mul(page_size))
+            .ok_or(StoreError::EventLimit)?;
+        let limit = i64::try_from(page_size.checked_add(1).ok_or(StoreError::EventLimit)?)
+            .map_err(|_| StoreError::EventLimit)?;
+        let offset = i64::try_from(offset).map_err(|_| StoreError::EventLimit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT account.username, repository.slug, repository.visibility, repository.state,
+                    COALESCE(repository_profile.description, ''),
+                    COALESCE(MAX(repository_event.created_at), repository.created_at)
+             FROM repository
+             JOIN account ON account.id = repository.owner_account_id
+             LEFT JOIN repository_profile ON repository_profile.repository_id = repository.id
+             LEFT JOIN repository_event ON repository_event.repository_id = repository.id
+             WHERE account.username = ?1
+               AND repository.state = 'active'
+               AND repository.visibility = 'public'
+             GROUP BY repository.id, account.username, repository.slug,
+                      repository.visibility, repository.state, repository_profile.description,
+                      repository.created_at
+             ORDER BY 6 DESC, repository.slug
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let mut repositories = statement
+            .query_map(rusqlite::params![username, limit, offset], |row| {
+                Ok(HomeRepositoryRecord {
+                    owner: row.get(0)?,
+                    slug: row.get(1)?,
+                    visibility: row.get(2)?,
+                    state: row.get(3)?,
+                    description: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        profile.has_next = repositories.len() > page_size;
+        repositories.truncate(page_size);
+        profile.repositories = repositories;
+        profile.page = page;
+        Ok(profile)
+    }
+
+    pub(crate) fn update_profile(
+        &mut self,
+        username: &str,
+        bio: &str,
+        contact_email: &str,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE account SET bio = ?2, contact_email = ?3
+             WHERE username = ?1 AND state = 'active'",
+            rusqlite::params![username, bio, contact_email],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::AccountNotFound(username.to_owned()))
+        }
     }
 
     #[allow(
@@ -3505,8 +4289,19 @@ pub(crate) struct NewLoginNonce<'a> {
 pub(crate) struct NewLoginApproval<'a> {
     pub(crate) secret_hash: &'a [u8; 32],
     pub(crate) csrf_hash: &'a [u8; 32],
+    pub(crate) purpose: &'a str,
+    pub(crate) expected_username: Option<&'a str>,
     pub(crate) created_at: i64,
     pub(crate) expires_at: i64,
+}
+
+pub(crate) struct AccountKeyAuthorization<'a> {
+    pub(crate) username: &'a str,
+    pub(crate) session_hash: &'a [u8; 32],
+    pub(crate) csrf_hash: &'a [u8; 32],
+    pub(crate) secret_hash: &'a [u8; 32],
+    pub(crate) changed_at: i64,
+    pub(crate) correlation_id: &'a str,
 }
 
 pub(crate) struct ApproveLogin<'a> {
@@ -3550,6 +4345,7 @@ pub(crate) struct WebSessionRecord {
     pub(crate) username: String,
     pub(crate) is_administrator: bool,
     pub(crate) expires_at: i64,
+    pub(crate) ssh_public_key_id: Option<i64>,
 }
 
 pub(crate) struct NewRepository<'a> {
@@ -3557,11 +4353,22 @@ pub(crate) struct NewRepository<'a> {
     pub(crate) owner: &'a str,
     pub(crate) slug: &'a str,
     pub(crate) object_format: &'a str,
+    pub(crate) default_branch: &'a str,
     pub(crate) created_at: i64,
     pub(crate) origin: RepositoryOrigin,
     pub(crate) initial_references: &'a [NewRepositoryReference],
     pub(crate) actor: &'a str,
     pub(crate) correlation_id: &'a str,
+}
+
+pub(crate) struct MaintenanceResult {
+    pub(crate) deleted: usize,
+}
+
+pub(crate) struct RecordPage<T> {
+    pub(crate) items: Vec<T>,
+    pub(crate) page: usize,
+    pub(crate) has_next: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -3612,7 +4419,32 @@ pub(crate) struct HomeRepositoryRecord {
     pub(crate) owner: String,
     pub(crate) slug: String,
     pub(crate) visibility: String,
+    pub(crate) state: String,
+    pub(crate) description: String,
     pub(crate) updated_at: i64,
+}
+
+pub(crate) struct RepositorySettings {
+    pub(crate) repository: RepositoryRecord,
+    pub(crate) description: String,
+    pub(crate) collaborators: Vec<RepositoryCollaboratorRecord>,
+    pub(crate) default_branch: String,
+    pub(crate) branches: Vec<String>,
+}
+
+pub(crate) struct RepositoryCollaboratorRecord {
+    pub(crate) username: String,
+    pub(crate) role: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct PublicProfile {
+    pub(crate) username: String,
+    pub(crate) bio: String,
+    pub(crate) contact_email: String,
+    pub(crate) repositories: Vec<HomeRepositoryRecord>,
+    pub(crate) page: usize,
+    pub(crate) has_next: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -3778,12 +4610,13 @@ pub(crate) struct IssueDetail {
     pub(crate) repository: RepositoryRecord,
     pub(crate) issue: IssueRecord,
     pub(crate) comments: Vec<IssueCommentRecord>,
-    pub(crate) labels: Vec<String>,
-    pub(crate) assignees: Vec<String>,
     pub(crate) timeline: Vec<IssueTimelineRecord>,
     pub(crate) can_comment: bool,
     pub(crate) can_edit: bool,
-    pub(crate) can_maintain: bool,
+    pub(crate) comments_page: usize,
+    pub(crate) comments_has_next: bool,
+    pub(crate) timeline_page: usize,
+    pub(crate) timeline_has_next: bool,
 }
 
 pub(crate) struct NewIssue<'a> {
@@ -3850,6 +4683,12 @@ pub(crate) struct PullRequestDetail {
     pub(crate) revisions: Vec<PullRequestRevisionRecord>,
     pub(crate) reviews: Vec<PullRequestReviewRecord>,
     pub(crate) timeline: Vec<PullRequestTimelineRecord>,
+    pub(crate) reviews_page: usize,
+    pub(crate) reviews_has_next: bool,
+    pub(crate) timeline_page: usize,
+    pub(crate) timeline_has_next: bool,
+    pub(crate) can_edit: bool,
+    pub(crate) can_change_state: bool,
     pub(crate) can_revise: bool,
     pub(crate) can_review: bool,
     pub(crate) can_merge: bool,
@@ -3947,25 +4786,9 @@ pub(crate) struct IssueChange<'a> {
     pub(crate) changed_at: i64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct WatchPreferences {
-    pub(crate) pushes: bool,
-    pub(crate) issues: bool,
-    pub(crate) pull_requests: bool,
-}
-
-impl WatchPreferences {
-    pub(crate) fn any(self) -> bool {
-        self.pushes || self.issues || self.pull_requests
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WatchRecord {
     pub(crate) id: String,
-    pub(crate) pushes: bool,
-    pub(crate) issues: bool,
-    pub(crate) pull_requests: bool,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
 }
@@ -3974,8 +4797,6 @@ pub(crate) struct WatchRecord {
 pub(crate) struct FeedTokenRecord {
     pub(crate) id: String,
     pub(crate) scope: String,
-    pub(crate) owner: Option<String>,
-    pub(crate) repository: Option<String>,
     pub(crate) created_at: i64,
     pub(crate) revoked_at: Option<i64>,
 }
@@ -3985,10 +4806,18 @@ pub(crate) struct ActivityEventRecord {
     pub(crate) event: RepositoryEventRecord,
 }
 
+pub(crate) struct ActivityCursor {
+    pub(crate) created_at: i64,
+    pub(crate) event_id: String,
+}
+
+pub(crate) struct ActivityPage {
+    pub(crate) events: Vec<ActivityEventRecord>,
+    pub(crate) next_before: Option<ActivityCursor>,
+}
+
 pub(crate) struct TokenFeedPage {
-    pub(crate) scope: String,
     pub(crate) username: String,
-    pub(crate) target: Option<String>,
     pub(crate) events: Vec<ActivityEventRecord>,
 }
 
@@ -3997,7 +4826,6 @@ pub(crate) struct MetadataSearchCandidate {
     pub(crate) record_id: String,
     pub(crate) owner: String,
     pub(crate) repository: String,
-    pub(crate) issue_number: Option<i64>,
     pub(crate) title: Vec<u8>,
     pub(crate) body: Vec<u8>,
 }
@@ -4093,6 +4921,63 @@ fn insert_ssh_key(
         Err(error) => Err(error.into()),
         Ok(_) => unreachable!("an INSERT changes one row"),
     }
+}
+
+fn consume_account_key_authorization(
+    transaction: &rusqlite::Transaction<'_>,
+    authorization: &AccountKeyAuthorization<'_>,
+) -> Result<(i64, Option<i64>), StoreError> {
+    let session = transaction
+        .query_row(
+            "SELECT web_session.account_id, web_session.ssh_public_key_id
+             FROM web_session
+             JOIN account ON account.id = web_session.account_id
+             WHERE web_session.session_hash = ?1 AND web_session.csrf_hash = ?2
+               AND web_session.ended_at IS NULL AND web_session.expires_at >= ?3
+               AND account.username = ?4 AND account.state = 'active'",
+            rusqlite::params![
+                authorization.session_hash,
+                authorization.csrf_hash,
+                authorization.changed_at,
+                authorization.username,
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?
+        .ok_or(StoreError::InvalidSession)?;
+    let approval = transaction
+        .query_row(
+            "SELECT ssh_login_approval.account_id
+             FROM ssh_login_approval
+             JOIN ssh_public_key
+               ON ssh_public_key.id = ssh_login_approval.ssh_public_key_id
+             WHERE secret_hash = ?1 AND csrf_hash = ?2
+               AND purpose = 'account-key' AND expected_account_id = ?3
+               AND ssh_login_approval.account_id = ?3 AND approved_at IS NOT NULL
+               AND consumed_at IS NULL AND expires_at >= ?4
+               AND ssh_public_key.revoked_at IS NULL",
+            rusqlite::params![
+                authorization.secret_hash,
+                authorization.csrf_hash,
+                session.0,
+                authorization.changed_at,
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or(StoreError::InvalidLoginApproval)?;
+    if approval != session.0 {
+        return Err(StoreError::InvalidLoginApproval);
+    }
+    let changed = transaction.execute(
+        "UPDATE ssh_login_approval SET consumed_at = ?2
+         WHERE secret_hash = ?1 AND consumed_at IS NULL",
+        rusqlite::params![authorization.secret_hash, authorization.changed_at],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidLoginApproval);
+    }
+    Ok(session)
 }
 
 fn insert_audit_event(
@@ -4312,21 +5197,12 @@ fn pull_request_review_from_row(
     })
 }
 
-fn validate_feed_scope(scope: &str, repository: Option<(&str, &str)>) -> Result<(), StoreError> {
-    match (scope, repository) {
-        ("repository", Some(_)) | ("watched" | "assignments" | "mentions", None) => Ok(()),
-        _ => Err(StoreError::InvalidFeedScope),
-    }
-}
-
 fn feed_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedTokenRecord> {
     Ok(FeedTokenRecord {
         id: row.get(0)?,
         scope: row.get(1)?,
-        owner: row.get(2)?,
-        repository: row.get(3)?,
-        created_at: row.get(4)?,
-        revoked_at: row.get(5)?,
+        created_at: row.get(2)?,
+        revoked_at: row.get(3)?,
     })
 }
 
@@ -4369,41 +5245,13 @@ const ACTIVITY_SELECT: &str = "SELECT repository.id, owner.username, repository.
      JOIN repository ON repository.id = repository_event.repository_id
      JOIN account AS owner ON owner.id = repository.owner_account_id";
 
-fn token_repository_events(
-    connection: &Connection,
-    repository_id: &str,
-    account_id: i64,
-    limit: i64,
-) -> Result<Vec<ActivityEventRecord>, StoreError> {
-    let sql = format!(
-        "{ACTIVITY_SELECT}
-         WHERE repository.id = ?1 AND repository.state = 'active'
-           AND (repository.visibility = 'public'
-                OR repository.owner_account_id = ?2
-                OR EXISTS (
-                    SELECT 1 FROM repository_collaborator
-                    WHERE repository_collaborator.repository_id = repository.id
-                      AND repository_collaborator.account_id = ?2
-                ))
-         ORDER BY repository_event.sequence DESC LIMIT ?3"
-    );
-    let mut statement = connection.prepare(&sql)?;
-    statement
-        .query_map(
-            rusqlite::params![repository_id, account_id, limit],
-            activity_from_row,
-        )?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
-fn watched_feed_events(
+fn watched_activity_events(
     connection: &Connection,
     account_id: i64,
+    before: Option<&ActivityCursor>,
     limit: i64,
 ) -> Result<Vec<ActivityEventRecord>, StoreError> {
-    let sql = format!(
-        "{ACTIVITY_SELECT}
+    let visibility = "
          JOIN watch
            ON watch.repository_id = repository.id AND watch.account_id = ?1
          WHERE repository.state = 'active'
@@ -4413,108 +5261,39 @@ fn watched_feed_events(
                     SELECT 1 FROM repository_collaborator
                     WHERE repository_collaborator.repository_id = repository.id
                       AND repository_collaborator.account_id = ?1
-                ))
-           AND ((watch.pushes = 1 AND repository_event.kind IN
-                    ('push', 'ref-created', 'ref-updated', 'ref-deleted',
-                     'tag-created', 'tag-updated', 'tag-deleted'))
-                OR (watch.issues = 1 AND repository_event.kind LIKE 'issue-%')
-                OR (watch.pull_requests = 1
-                    AND repository_event.kind LIKE 'pull-request-%'))
-         ORDER BY repository_event.created_at DESC, repository_event.event_id DESC
-         LIMIT ?2"
-    );
-    let mut statement = connection.prepare(&sql)?;
-    statement
-        .query_map(rusqlite::params![account_id, limit], activity_from_row)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
-fn assignment_feed_events(
-    connection: &Connection,
-    account_id: i64,
-    username: &str,
-    limit: i64,
-) -> Result<Vec<ActivityEventRecord>, StoreError> {
-    let sql = format!(
-        "{ACTIVITY_SELECT}
-         WHERE repository.state = 'active'
-           AND repository_event.kind = 'issue-assigned'
-           AND json_extract(repository_event.payload, '$.assignee') = ?2
-           AND (repository.visibility = 'public'
-                OR repository.owner_account_id = ?1
-                OR EXISTS (
-                    SELECT 1 FROM repository_collaborator
-                    WHERE repository_collaborator.repository_id = repository.id
-                      AND repository_collaborator.account_id = ?1
-                ))
-         ORDER BY repository_event.created_at DESC, repository_event.event_id DESC
-         LIMIT ?3"
-    );
-    let mut statement = connection.prepare(&sql)?;
-    statement
-        .query_map(
-            rusqlite::params![account_id, username, limit],
-            activity_from_row,
-        )?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
-fn mention_feed_events(
-    connection: &Connection,
-    account_id: i64,
-    username: &str,
-    limit: i64,
-) -> Result<Vec<ActivityEventRecord>, StoreError> {
-    let scan_limit = limit.saturating_mul(50).min(1_000);
-    let sql = format!(
-        "{ACTIVITY_SELECT}
-         WHERE repository.state = 'active'
-           AND repository_event.kind IN
-               ('issue-created', 'issue-edited', 'issue-commented')
-           AND (repository.visibility = 'public'
-                OR repository.owner_account_id = ?1
-                OR EXISTS (
-                    SELECT 1 FROM repository_collaborator
-                    WHERE repository_collaborator.repository_id = repository.id
-                      AND repository_collaborator.account_id = ?1
-                ))
-         ORDER BY repository_event.created_at DESC, repository_event.event_id DESC
-         LIMIT ?2"
-    );
-    let mut statement = connection.prepare(&sql)?;
-    let candidates = statement
-        .query_map(rusqlite::params![account_id, scan_limit], activity_from_row)?
-        .collect::<Result<Vec<_>, _>>()?;
-    let limit = usize::try_from(limit).map_err(|_| StoreError::EventLimit)?;
-    Ok(candidates
-        .into_iter()
-        .filter(|record| event_mentions(&record.event, username))
-        .take(limit)
-        .collect())
-}
-
-fn event_mentions(event: &RepositoryEventRecord, username: &str) -> bool {
-    if event.payload_version != event::PAYLOAD_VERSION {
-        return false;
+                ))";
+    match before {
+        Some(before) => {
+            let sql = format!(
+                "{ACTIVITY_SELECT}{visibility}
+                 AND (repository_event.created_at < ?2
+                      OR (repository_event.created_at = ?2
+                          AND repository_event.event_id < ?3))
+                 ORDER BY repository_event.created_at DESC, repository_event.event_id DESC
+                 LIMIT ?4"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            statement
+                .query_map(
+                    rusqlite::params![account_id, before.created_at, before.event_id, limit],
+                    activity_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        }
+        None => {
+            let sql = format!(
+                "{ACTIVITY_SELECT}{visibility}
+                 ORDER BY repository_event.created_at DESC, repository_event.event_id DESC
+                 LIMIT ?2"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            statement
+                .query_map(rusqlite::params![account_id, limit], activity_from_row)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        }
     }
-    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload) else {
-        return false;
-    };
-    let Some(body) = payload.get("body").and_then(serde_json::Value::as_str) else {
-        return false;
-    };
-    let mention = format!("@{username}");
-    body.match_indices(&mention).any(|(start, _)| {
-        let before = body[..start].chars().next_back();
-        let after = body[start + mention.len()..].chars().next();
-        !before.is_some_and(is_username_character) && !after.is_some_and(is_username_character)
-    })
-}
-
-fn is_username_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || character == '-'
 }
 
 fn find_issue(
@@ -4580,18 +5359,6 @@ fn issue_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IssueRecord> {
         updated_at: row.get(7)?,
         closed_at: row.get(8)?,
     })
-}
-
-fn issue_names(
-    connection: &Connection,
-    sql: &str,
-    issue_id: &str,
-) -> Result<Vec<String>, StoreError> {
-    let mut statement = connection.prepare(sql)?;
-    statement
-        .query_map([issue_id], |row| row.get(0))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
 }
 
 fn insert_issue_event(
@@ -4789,6 +5556,19 @@ fn end_sessions(
         "UPDATE web_session SET ended_at = ?2
          WHERE account_id = ?1 AND ended_at IS NULL",
         rusqlite::params![account_id, ended_at],
+    )?;
+    Ok(())
+}
+
+fn revoke_feed_tokens(
+    transaction: &rusqlite::Transaction<'_>,
+    account_id: i64,
+    revoked_at: i64,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "UPDATE feed_token SET revoked_at = ?2
+         WHERE account_id = ?1 AND revoked_at IS NULL",
+        rusqlite::params![account_id, revoked_at],
     )?;
     Ok(())
 }
@@ -5034,6 +5814,13 @@ fn is_unique_constraint(error: &rusqlite::Error) -> bool {
             if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                 || code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
     )
+}
+
+fn page_offset(page: usize, page_size: usize) -> Result<i64, StoreError> {
+    page.checked_sub(1)
+        .and_then(|page| page.checked_mul(page_size))
+        .and_then(|offset| i64::try_from(offset).ok())
+        .ok_or(StoreError::EventLimit)
 }
 
 #[allow(

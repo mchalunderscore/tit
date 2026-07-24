@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
@@ -27,7 +26,6 @@ pub(crate) struct Config {
     pub(crate) signup_policy: SignupPolicy,
     pub(crate) max_request_bytes: u64,
     pub(crate) max_connections: u32,
-    pub(crate) trusted_addresses: Vec<IpAddr>,
 }
 
 impl Config {
@@ -72,15 +70,6 @@ impl Config {
             return Err(ConfigError::UnsupportedSignupPolicy);
         }
 
-        let mut addresses = HashSet::new();
-        for address in &self.trusted_addresses {
-            if address.is_unspecified() || address.is_multicast() {
-                return Err(ConfigError::InvalidTrustedAddress(*address));
-            }
-            if !addresses.insert(address) {
-                return Err(ConfigError::DuplicateTrustedAddress(*address));
-            }
-        }
         self.clone_urls("owner", "repository")?;
         Ok(())
     }
@@ -127,8 +116,6 @@ struct ConfigFile {
     signup: SignupConfig,
     #[serde(default)]
     limits: LimitsConfig,
-    #[serde(default)]
-    proxy: ProxyConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,12 +184,6 @@ impl Default for LimitsConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ProxyConfig {
-    trusted_addresses: Vec<IpAddr>,
-}
-
 #[derive(Debug, Error)]
 pub(crate) enum ConfigError {
     #[error("cannot determine the user data directory")]
@@ -254,10 +235,6 @@ pub(crate) enum ConfigError {
     LimitTooLarge(&'static str),
     #[error("signup policy is not supported")]
     UnsupportedSignupPolicy,
-    #[error("trusted proxy address is not a unicast address: {0}")]
-    InvalidTrustedAddress(IpAddr),
-    #[error("trusted proxy address occurs more than once: {0}")]
-    DuplicateTrustedAddress(IpAddr),
     #[error("advertised endpoint cannot be a base URL")]
     CloneUrlBase,
     #[error("cannot generate an SSH clone URL: {0}")]
@@ -312,7 +289,6 @@ pub(crate) fn load(cli: &Cli) -> Result<Config, ConfigError> {
         signup_policy: file.signup.policy,
         max_request_bytes: file.limits.max_request_bytes,
         max_connections: file.limits.max_connections,
-        trusted_addresses: file.proxy.trusted_addresses,
     };
     config.validate(&path)?;
     Ok(config)
@@ -421,8 +397,6 @@ public_url = "https://tit.example/"
 [signup]
 policy = "invite"
 
-[proxy]
-trusted_addresses = []
 "#,
         );
 
@@ -440,7 +414,6 @@ trusted_addresses = []
         assert_eq!(config.signup_policy, SignupPolicy::Invite);
         assert_eq!(config.max_request_bytes, 1_048_576);
         assert_eq!(config.max_connections, 1_024);
-        assert!(config.trusted_addresses.is_empty());
     }
 
     #[test]
@@ -618,24 +591,6 @@ max_connections = 100001
         assert!(matches!(
             load(&cli(&path)),
             Err(ConfigError::LimitTooLarge("max_connections"))
-        ));
-    }
-
-    #[test]
-    fn rejects_an_unspecified_trusted_proxy() {
-        let (_directory, path) = write_config(
-            r#"
-version = 1
-public_url = "https://tit.example/"
-
-[proxy]
-trusted_addresses = ["0.0.0.0"]
-"#,
-        );
-
-        assert!(matches!(
-            load(&cli(&path)),
-            Err(ConfigError::InvalidTrustedAddress(address)) if address.is_unspecified()
         ));
     }
 }

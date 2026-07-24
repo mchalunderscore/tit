@@ -7,7 +7,16 @@
   </header>
 
   <h2>Issues</h2>
-  <p><a href="/{{ owner }}/{{ repository }}/issues/atom.xml">Issue Atom</a> · <a href="/{{ owner }}/{{ repository }}/issues/rss.xml">Issue RSS</a></p>
+  <p><a href="/{{ owner }}/{{ repository }}/issues/rss.xml">Issue RSS</a></p>
+  <form method="get" action="/{{ owner }}/{{ repository }}/issues">
+    <label for="issue-state">State</label>
+    <select id="issue-state" name="state">
+      <option value="open"{% if state_open %} selected{% endif %}>Open</option>
+      <option value="closed"{% if state_closed %} selected{% endif %}>Closed</option>
+      <option value="all"{% if state_all %} selected{% endif %}>All</option>
+    </select>
+    <button type="submit">Filter</button>
+  </form>
 {% if issues.is_empty() %}
   <p>This repository has no issues.</p>
 {% else %}
@@ -16,6 +25,16 @@
     <li><a href="/{{ owner }}/{{ repository }}/issues/{{ issue.number }}">#{{ issue.number }} {{ issue.title }}</a> — {{ issue.state }}, opened by {{ issue.author }}, updated <time datetime="{{ issue.updated_at }}">{{ issue.updated_at|human_time }}</time></li>
 {% endfor %}
   </ol>
+{% if has_previous || has_next %}
+  <nav class="pagination" aria-label="Issue pages">
+{% if has_previous %}
+    <a href="/{{ owner }}/{{ repository }}/issues?state={{ state }}&page={{ previous_page }}">Newer issues</a>
+{% endif %}
+{% if has_next %}
+    <a href="/{{ owner }}/{{ repository }}/issues?state={{ state }}&page={{ next_page }}">Older issues</a>
+{% endif %}
+  </nav>
+{% endif %}
 {% endif %}
 
 {% if can_create %}

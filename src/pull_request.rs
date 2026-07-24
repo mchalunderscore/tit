@@ -18,12 +18,13 @@ use crate::policy::{PolicyError, RepositoryPolicy};
 use crate::store::{
     GitOperationIntent, NewPullRequestMerge, NewPullRequestRefIntent, NewPullRequestReview,
     PullRequestDetail, PullRequestRecord, PullRequestRefIntentRecord, PullRequestRevisionRecord,
-    Store, StoreError,
+    RecordPage, RepositoryRecord, Store, StoreError,
 };
 
 pub(crate) const MAX_TITLE_BYTES: usize = 200;
 pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_REVIEW_BODY_BYTES: usize = 256 * 1024;
+pub(crate) const PAGE_SIZE: usize = 50;
 
 #[derive(Clone)]
 pub(crate) struct PullRequestService {
@@ -137,6 +138,9 @@ impl PullRequestService {
         let current = Store::open(&self.database)?
             .pull_request(owner, repository, number, Some(actor))?
             .pull_request;
+        if current.state != "open" {
+            return Err(StoreError::PullRequestState.into());
+        }
         let authorization = Store::open(&self.database)?.repository_authorization(
             owner,
             repository,
@@ -180,6 +184,88 @@ impl PullRequestService {
 
     #[allow(
         dead_code,
+        reason = "the pull-request integration test imports this module without the Web list route"
+    )]
+    pub(crate) fn list_page(
+        &self,
+        owner: &str,
+        repository: &str,
+        actor: Option<&str>,
+        state: &str,
+        page: usize,
+    ) -> Result<(RepositoryRecord, RecordPage<PullRequestRecord>, bool), PullRequestError> {
+        validate_username(owner)?;
+        validate_slug(repository)?;
+        if let Some(actor) = actor {
+            validate_username(actor)?;
+        }
+        if !matches!(state, "all" | "open" | "closed" | "merged") || page == 0 || page > 10_000 {
+            return Err(PullRequestError::State);
+        }
+        let _maintenance = self.maintenance.mutation();
+        let _operation = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.recover_inner()?;
+        let result = Store::open(&self.database)?
+            .pull_request_page(owner, repository, actor, state, page, PAGE_SIZE)
+            .map_err(PullRequestError::from)?;
+        if page > 1 && result.1.items.is_empty() {
+            return Err(PullRequestError::State);
+        }
+        Ok(result)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the pull-request integration test imports this module without the Web edit route"
+    )]
+    pub(crate) fn edit(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        actor: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<(), PullRequestError> {
+        validate_context(owner, repository, actor)?;
+        if number < 1 {
+            return Err(PullRequestError::Number);
+        }
+        validate_content(title, body)?;
+        Store::open(&self.database)?
+            .edit_pull_request(owner, repository, number, actor, title, body, timestamp()?)
+            .map_err(Into::into)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the pull-request integration test imports this module without the Web state route"
+    )]
+    pub(crate) fn set_state(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        actor: &str,
+        state: &str,
+    ) -> Result<(), PullRequestError> {
+        validate_context(owner, repository, actor)?;
+        if number < 1 {
+            return Err(PullRequestError::Number);
+        }
+        if !matches!(state, "open" | "closed") {
+            return Err(PullRequestError::State);
+        }
+        Store::open(&self.database)?
+            .set_pull_request_state(owner, repository, number, actor, state, timestamp()?)
+            .map_err(Into::into)
+    }
+
+    #[allow(
+        dead_code,
         reason = "integration tests and later non-Web callers read pull requests without comparison"
     )]
     pub(crate) fn get(
@@ -208,6 +294,10 @@ impl PullRequestService {
             .map_err(Into::into)
     }
 
+    #[allow(
+        dead_code,
+        reason = "the binary uses the paged Web comparison and integration tests use the full comparison"
+    )]
     pub(crate) fn compare(
         &self,
         owner: &str,
@@ -216,12 +306,58 @@ impl PullRequestService {
         revision: Option<i64>,
         actor: Option<&str>,
     ) -> Result<PullRequestComparison, PullRequestError> {
+        self.compare_with_activity(owner, repository, number, revision, actor, None)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        dead_code,
+        reason = "the pull-request integration test imports this module without the Web detail route"
+    )]
+    pub(crate) fn compare_page(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        revision: Option<i64>,
+        actor: Option<&str>,
+        reviews_page: usize,
+        timeline_page: usize,
+    ) -> Result<PullRequestComparison, PullRequestError> {
+        self.compare_with_activity(
+            owner,
+            repository,
+            number,
+            revision,
+            actor,
+            Some((reviews_page, timeline_page)),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the paged comparison includes repository identity and independent activity pages"
+    )]
+    fn compare_with_activity(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: i64,
+        revision: Option<i64>,
+        actor: Option<&str>,
+        activity: Option<(usize, usize)>,
+    ) -> Result<PullRequestComparison, PullRequestError> {
         validate_username(owner)?;
         validate_slug(repository)?;
         if let Some(actor) = actor {
             validate_username(actor)?;
         }
-        if number < 1 || revision.is_some_and(|number| number < 1) {
+        if number < 1
+            || revision.is_some_and(|number| number < 1)
+            || activity.is_some_and(|(reviews, timeline)| {
+                reviews == 0 || reviews > 10_000 || timeline == 0 || timeline > 10_000
+            })
+        {
             return Err(PullRequestError::Number);
         }
         let _maintenance = self.maintenance.mutation();
@@ -230,7 +366,25 @@ impl PullRequestService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.recover_inner()?;
-        let detail = Store::open(&self.database)?.pull_request(owner, repository, number, actor)?;
+        let store = Store::open(&self.database)?;
+        let detail = match activity {
+            Some((reviews_page, timeline_page)) => store.pull_request_detail_page(
+                owner,
+                repository,
+                number,
+                actor,
+                reviews_page,
+                timeline_page,
+                PAGE_SIZE,
+            )?,
+            None => store.pull_request(owner, repository, number, actor)?,
+        };
+        if activity.is_some_and(|(reviews_page, timeline_page)| {
+            (reviews_page > 1 && detail.reviews.is_empty())
+                || (timeline_page > 1 && detail.timeline.is_empty())
+        }) {
+            return Err(PullRequestError::Number);
+        }
         let revision = match revision {
             Some(number) => detail
                 .revisions
@@ -710,6 +864,12 @@ pub(crate) enum PullRequestError {
     Branch,
     #[error("pull-request number is not valid")]
     Number,
+    #[error("pull-request list state is not valid")]
+    #[allow(
+        dead_code,
+        reason = "the pull-request integration test imports this module without Web list state"
+    )]
+    State,
     #[error("pull-request revision does not exist")]
     Revision,
     #[error("pull-request review kind is not valid")]

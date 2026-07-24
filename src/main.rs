@@ -42,8 +42,8 @@ use std::{io, io::Write};
 use clap::Parser;
 
 use crate::cli::{
-    AccountCommand, AdminCommand, Cli, CollaboratorRole, Command, InspectCommand, ObjectFormat,
-    RepairCommand, RepositoryCommand, RepositoryVisibility, SetupCommand,
+    AccountCommand, AdminCommand, Cli, CollaboratorRole, Command, InspectCommand, RepairCommand,
+    RepositoryCommand, RepositoryVisibility, SetupCommand,
 };
 
 #[tokio::main]
@@ -102,6 +102,25 @@ async fn main() -> ExitCode {
                 };
                 match result {
                     Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("tit: {error}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            Some(Command::Maintenance { retention_days }) => {
+                match admin::maintain(&config.instance_dir, retention_days) {
+                    Ok(result) => match writeln!(
+                        io::stdout().lock(),
+                        "Pruned {} terminal records.",
+                        result.deleted
+                    ) {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(error) => {
+                            eprintln!("tit: cannot write maintenance information: {error}");
+                            ExitCode::FAILURE
+                        }
+                    },
                     Err(error) => {
                         eprintln!("tit: {error}");
                         ExitCode::FAILURE
@@ -352,19 +371,9 @@ fn run_account_command(instance_dir: &std::path::Path, command: AccountCommand) 
 
 fn run_repository_command(instance_dir: &std::path::Path, command: RepositoryCommand) -> ExitCode {
     let result = match command {
-        RepositoryCommand::Create {
-            owner,
-            slug,
-            object_format,
-        } => admin::create_repository(
-            instance_dir,
-            &owner,
-            &slug,
-            match object_format {
-                ObjectFormat::Sha1 => gix::hash::Kind::Sha1,
-                ObjectFormat::Sha256 => gix::hash::Kind::Sha256,
-            },
-        ),
+        RepositoryCommand::Create { owner, slug } => {
+            admin::create_repository(instance_dir, &owner, &slug, gix::hash::Kind::Sha1)
+        }
         RepositoryCommand::Import {
             owner,
             slug,
@@ -435,7 +444,6 @@ fn run_repository_command(instance_dir: &std::path::Path, command: RepositoryCom
                 .and_then(|()| writeln!(output, "slug={}", repository.slug))
                 .and_then(|()| writeln!(output, "visibility={}", repository.visibility))
                 .and_then(|()| writeln!(output, "state={}", repository.state))
-                .and_then(|()| writeln!(output, "object-format={}", repository.object_format))
                 .and_then(|()| writeln!(output, "created-at={}", repository.created_at))
                 .and_then(|()| writeln!(output, "archived-at={archived_at}"))
                 .and_then(|()| writeln!(output, "path={}", path.display()));

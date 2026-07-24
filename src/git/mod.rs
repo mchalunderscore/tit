@@ -1,5 +1,6 @@
 pub(crate) mod http;
 pub(crate) mod packetline;
+pub(crate) mod patch;
 #[allow(
     dead_code,
     reason = "some protocol tests import Git without the public HTTP routes"

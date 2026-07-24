@@ -18,6 +18,24 @@ use crate::store::{
 
 const ADMIN_ACTOR: &str = "admin-cli";
 
+pub(crate) fn maintain(
+    instance_dir: &Path,
+    retention_days: u32,
+) -> Result<crate::store::MaintenanceResult, AdminError> {
+    if retention_days == 0 {
+        return Err(AdminError::Retention);
+    }
+    let _lock = InstanceLock::acquire(instance_dir)?;
+    let database = prepare_database(instance_dir)?;
+    let retention_seconds = i64::from(retention_days)
+        .checked_mul(24 * 60 * 60)
+        .ok_or(AdminError::Retention)?;
+    let cutoff = timestamp()?
+        .checked_sub(retention_seconds)
+        .ok_or(AdminError::Retention)?;
+    Store::open(&database)?.maintain(cutoff).map_err(Into::into)
+}
+
 pub(crate) fn create_repository(
     instance_dir: &Path,
     owner: &str,
@@ -277,20 +295,29 @@ fn administer_repository(
         path: final_path.clone(),
         source,
     })?;
+    let mut cleanup = RepositoryCleanup::new(final_path.clone());
+    import_fault("after-rename")?;
     let canonical_path =
         fs::canonicalize(&final_path).map_err(|source| AdminError::Canonicalize {
             path: final_path.clone(),
             source,
         })?;
+    cleanup.path = canonical_path.clone();
+    import_fault("after-canonicalize")?;
     if canonical_path.parent() != Some(root.as_path()) {
         remove_created_repository(&canonical_path)?;
         return Err(AdminError::PathEscape(canonical_path));
     }
 
     let object_format = object_format_name(object_format)?;
+    import_fault("after-object-format")?;
     let git = GitRepository::open(&canonical_path)?;
-    let initial_references = git
-        .references()?
+    import_fault("after-open")?;
+    let default_branch = git
+        .default_branch()?
+        .unwrap_or_else(|| "refs/heads/main".to_owned());
+    let references = git.references()?;
+    let initial_references = references
         .into_iter()
         .filter(|reference| {
             reference.name.starts_with(b"refs/heads/") || reference.name.starts_with(b"refs/tags/")
@@ -300,11 +327,13 @@ fn administer_repository(
             target: reference.target.to_string(),
         })
         .collect::<Vec<_>>();
+    import_fault("after-references")?;
     if let Err(error) = store.create_repository(&NewRepository {
         id: &id,
         owner,
         slug,
         object_format,
+        default_branch: &default_branch,
         created_at,
         origin,
         initial_references: &initial_references,
@@ -315,7 +344,45 @@ fn administer_repository(
         record_failure(&store, action, &audit_target, &correlation_id, created_at)?;
         return Err(error.into());
     }
+    cleanup.disarm();
     store.repository(owner, slug).map_err(Into::into)
+}
+
+struct RepositoryCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl RepositoryCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RepositoryCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn import_fault(point: &'static str) -> Result<(), AdminError> {
+    if std::env::var("TIT_TEST_IMPORT_FAIL").as_deref() == Ok(point) {
+        Err(AdminError::InjectedFailure(point))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn import_fault(_: &'static str) -> Result<(), AdminError> {
+    Ok(())
 }
 
 fn inspect_with_store(
@@ -427,8 +494,13 @@ pub(crate) enum AdminError {
     Random,
     #[error("system clock is before the Unix epoch")]
     Clock,
+    #[error("retention days must be greater than zero")]
+    Retention,
     #[error("repository object format does not match the database")]
     ObjectFormatMismatch,
     #[error("repository object format is not supported")]
     UnsupportedObjectFormat,
+    #[cfg(debug_assertions)]
+    #[error("injected repository import failure after {0}")]
+    InjectedFailure(&'static str),
 }

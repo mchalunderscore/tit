@@ -31,7 +31,7 @@ use support::create_ssh_key_fixture;
 use tempfile::TempDir;
 use url::Url;
 
-use account::AccountService;
+use account::{AccountError, AccountKeyRequest, AccountService};
 use auth::SshPublicKey;
 use session::{SessionError, WebLoginService};
 use store::{InitialAdministrator, Store, StoreError};
@@ -291,6 +291,207 @@ fn binds_ssh_approval_to_one_browser_and_consumes_it_once() {
         login.approve(&expired.secret, "alice", parsed.fingerprint()),
         Err(SessionError::Store(StoreError::InvalidLoginApproval))
     ));
+}
+
+#[test]
+fn account_key_changes_require_durable_one_time_ssh_approval() {
+    let directory = TempDir::new().expect("create a Web session directory");
+    let database = directory.path().join("tit.sqlite3");
+    let first_private_key = directory.path().join("first-identity");
+    let second_private_key = directory.path().join("second-identity");
+    create_ssh_key_fixture(&first_private_key);
+    create_ssh_key_fixture(&second_private_key);
+    let first_public_key = fs::read_to_string(first_private_key.with_extension("pub"))
+        .expect("read the first SSH public key");
+    let second_public_key = fs::read_to_string(second_private_key.with_extension("pub"))
+        .expect("read the second SSH public key");
+    let first = SshPublicKey::parse(&first_public_key).expect("parse the first SSH public key");
+    let second = SshPublicKey::parse(&second_public_key).expect("parse the second SSH public key");
+    Store::open(&database)
+        .expect("create the database")
+        .create_initial_administrator(&InitialAdministrator {
+            username: "alice",
+            canonical_key: first.canonical(),
+            fingerprint: first.fingerprint(),
+            recovery_hash: &[3; 32],
+            created_at: now(),
+        })
+        .expect("create the account");
+    let origin = Url::parse("https://tit.example/").expect("parse the origin");
+    let login = WebLoginService::new(database.clone(), &origin).expect("create the login service");
+    let browser = login
+        .issue_approval()
+        .expect("issue a browser login approval");
+    login
+        .approve(&browser.secret, "alice", first.fingerprint())
+        .expect("approve the browser login");
+    let session = login
+        .complete_approval(&browser.secret, &browser.login_csrf, "browser-login")
+        .expect("create the browser session");
+
+    let add = login
+        .issue_account_approval("alice", &session.csrf)
+        .expect("issue an account-key approval");
+    let restarted =
+        WebLoginService::new(database.clone(), &origin).expect("restart the login service");
+    restarted
+        .approve(&add.secret, "alice", first.fingerprint())
+        .expect("approve the account-key change after restart");
+    let accounts = AccountService::new(database.clone());
+    let add_request = AccountKeyRequest {
+        username: "alice",
+        session: &session.token,
+        csrf: &session.csrf,
+        secret: &add.secret,
+        correlation_id: "key-add",
+    };
+    accounts
+        .complete_key_add(&add_request, "laptop", &second_public_key)
+        .expect("add the second key");
+    assert!(matches!(
+        accounts.complete_key_add(&add_request, "replay", &second_public_key),
+        Err(AccountError::Store(StoreError::InvalidLoginApproval))
+    ));
+    let restarted_accounts = AccountService::new(database.clone());
+    let keys = restarted_accounts
+        .keys("alice")
+        .expect("read keys after restart");
+    assert_eq!(
+        keys.iter().filter(|key| key.revoked_at.is_none()).count(),
+        2
+    );
+    assert!(keys.iter().any(|key| {
+        key.label == "laptop" && key.fingerprint == second.fingerprint() && key.revoked_at.is_none()
+    }));
+
+    let revoke = restarted
+        .issue_account_approval("alice", &session.csrf)
+        .expect("issue a revoke approval");
+    restarted
+        .approve(&revoke.secret, "alice", first.fingerprint())
+        .expect("approve the revoke");
+    let revoke_request = AccountKeyRequest {
+        username: "alice",
+        session: &session.token,
+        csrf: &session.csrf,
+        secret: &revoke.secret,
+        correlation_id: "key-revoke",
+    };
+    restarted_accounts
+        .complete_key_revoke(&revoke_request, second.fingerprint())
+        .expect("revoke the second key");
+    assert_eq!(
+        AccountService::new(database.clone())
+            .keys("alice")
+            .expect("read durable revoked key")
+            .iter()
+            .filter(|key| key.revoked_at.is_none())
+            .count(),
+        1
+    );
+
+    let final_revoke = restarted
+        .issue_account_approval("alice", &session.csrf)
+        .expect("issue the final revoke approval");
+    restarted
+        .approve(&final_revoke.secret, "alice", first.fingerprint())
+        .expect("approve the final revoke");
+    let final_request = AccountKeyRequest {
+        username: "alice",
+        session: &session.token,
+        csrf: &session.csrf,
+        secret: &final_revoke.secret,
+        correlation_id: "final-key",
+    };
+    assert!(matches!(
+        restarted_accounts.complete_key_revoke(&final_request, first.fingerprint()),
+        Err(AccountError::Store(StoreError::LastKey))
+    ));
+
+    let third_private_key = directory.path().join("third-identity");
+    create_ssh_key_fixture(&third_private_key);
+    let third_public_key = fs::read_to_string(third_private_key.with_extension("pub"))
+        .expect("read the third SSH public key");
+    let third = SshPublicKey::parse(&third_public_key).expect("parse the third SSH public key");
+    let add_third = restarted
+        .issue_account_approval("alice", &session.csrf)
+        .expect("issue the third-key approval");
+    restarted
+        .approve(&add_third.secret, "alice", first.fingerprint())
+        .expect("approve the third-key change");
+    restarted_accounts
+        .complete_key_add(
+            &AccountKeyRequest {
+                username: "alice",
+                session: &session.token,
+                csrf: &session.csrf,
+                secret: &add_third.secret,
+                correlation_id: "third-key",
+            },
+            "workstation",
+            &third_public_key,
+        )
+        .expect("add the third key");
+    let third_login = restarted
+        .issue_approval()
+        .expect("issue a login for the third key");
+    restarted
+        .approve(&third_login.secret, "alice", third.fingerprint())
+        .expect("approve login with the third key");
+    let third_session = restarted
+        .complete_approval(&third_login.secret, &third_login.login_csrf, "third-login")
+        .expect("create a session with the third key");
+    let revoke_current = restarted
+        .issue_account_approval("alice", &third_session.csrf)
+        .expect("issue current-key revoke approval");
+    restarted
+        .approve(&revoke_current.secret, "alice", third.fingerprint())
+        .expect("approve current-key revoke");
+    restarted_accounts
+        .complete_key_revoke(
+            &AccountKeyRequest {
+                username: "alice",
+                session: &third_session.token,
+                csrf: &third_session.csrf,
+                secret: &revoke_current.secret,
+                correlation_id: "revoke-current",
+            },
+            third.fingerprint(),
+        )
+        .expect("revoke the current session key");
+    assert!(matches!(
+        restarted.authenticate(&third_session.token, Some(&third_session.csrf)),
+        Err(SessionError::Store(StoreError::InvalidSession))
+    ));
+    assert!(matches!(
+        restarted.authenticate(&session.token, Some(&session.csrf)),
+        Err(SessionError::Store(StoreError::InvalidSession))
+    ));
+
+    let audits = Store::open(&database)
+        .expect("open the database")
+        .audit_events(20)
+        .expect("read key audit events");
+    assert!(
+        audits
+            .iter()
+            .any(|event| { event.action == "key.add" && event.outcome == "success" })
+    );
+    assert!(
+        audits
+            .iter()
+            .any(|event| { event.action == "key.add" && event.outcome == "failure" })
+    );
+    assert!(
+        audits
+            .iter()
+            .any(|event| { event.action == "key.revoke" && event.outcome == "success" })
+    );
+    assert!(
+        audits
+            .iter()
+            .any(|event| { event.action == "key.revoke" && event.outcome == "failure" })
+    );
 }
 
 fn sign(directory: &Path, private_key: &Path, challenge: &str) -> String {

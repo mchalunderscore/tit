@@ -6,39 +6,21 @@
 {% include "repository-nav.html" %}
   </header>
 
-  <h2>Watch preferences</h2>
+  <h2>Watch repository</h2>
 {% if watching %}
-  <p>You watch selected activity in this repository.</p>
+  <p>You watch activity in this repository.</p>
 {% else %}
   <p>You do not watch this repository.</p>
 {% endif %}
 {% if can_change %}
   <form method="post" action="/{{ owner }}/{{ repository }}/watch">
     <input type="hidden" name="csrf" value="{{ csrf }}">
-    <div class="field">
-      <label for="watch-pushes">Pushes</label>
-      <select id="watch-pushes" name="pushes">
-        <option value="0"{% if !pushes %} selected{% endif %}>Do not watch</option>
-        <option value="1"{% if pushes %} selected{% endif %}>Watch</option>
-      </select>
-    </div>
-    <div class="field">
-      <label for="watch-issues">Issues</label>
-      <select id="watch-issues" name="issues">
-        <option value="0"{% if !issues %} selected{% endif %}>Do not watch</option>
-        <option value="1"{% if issues %} selected{% endif %}>Watch</option>
-      </select>
-    </div>
-    <div class="field">
-      <label for="watch-pull-requests">Pull requests</label>
-      <select id="watch-pull-requests" name="pull-requests">
-        <option value="0"{% if !pull_requests %} selected{% endif %}>Do not watch</option>
-        <option value="1"{% if pull_requests %} selected{% endif %}>Watch</option>
-      </select>
-    </div>
-    <button type="submit">Save watch preferences</button>
+{% if watching %}
+    <button type="submit" name="state" value="unwatch">Stop watching</button>
+{% else %}
+    <button type="submit" name="state" value="watch">Watch repository</button>
+{% endif %}
   </form>
-  <p>Set all three values to “Do not watch” to stop watching this repository.</p>
 {% else %}
   <p><a href="/login">Log in</a> to change watch preferences.</p>
 {% endif %}

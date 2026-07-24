@@ -1,19 +1,19 @@
 {% extends "base.html" %}
 {% block title %}Search · tit{% endblock %}
 {% block content %}
-  <h1>Search repositories and issues</h1>
+  <h1>Search repositories</h1>
   <form method="get" action="/search">
     <label for="metadata-query">Search text</label>
     <input id="metadata-query" name="q" value="{{ query }}" maxlength="256" required>
     <button type="submit">Search</button>
   </form>
 {% if searched %}
-  <p>Scanned {{ rows_scanned }} records and {{ bytes_scanned }} bytes.</p>
+  <p>Scanned {{ rows_scanned }} repository names.</p>
 {% if truncated %}
   <p>The result is incomplete because the search reached a limit.</p>
 {% endif %}
 {% if results.is_empty() %}
-  <p>No repository or issue matched the search text.</p>
+  <p>No repository matched the search text.</p>
 {% else %}
   <ol class="search-results">
 {% for result in results %}

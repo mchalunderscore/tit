@@ -39,7 +39,7 @@ async fn search(
             StatusCode::BAD_REQUEST,
             &request_id.0,
             "Search error",
-            "The metadata search query is not valid.",
+            "The repository search query is not valid.",
         ),
         Err(_) => search_internal(&request_id.0),
     }
@@ -113,7 +113,7 @@ fn search_internal(request_id: &str) -> Response {
         StatusCode::INTERNAL_SERVER_ERROR,
         request_id,
         "Search error",
-        "The metadata search could not be completed.",
+        "The repository search could not be completed.",
     )
 }
 

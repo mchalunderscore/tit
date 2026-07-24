@@ -1,6 +1,8 @@
 {% extends "base.html" %}
 {% block title %}{% if signed_in %}{{ username }}{% else %}Repositories{% endif %} · tit{% endblock %}
 {% block content %}
+  <div class="two-column">
+  <section>
 {% if signed_in %}
   <h1>{{ username }}</h1>
   <p><a href="/account">Open your account profile</a>.</p>
@@ -13,10 +15,23 @@
 {% else %}
   <ul>
   {% for item in repositories %}
-    <li><a href="/{{ item.owner }}/{{ item.slug }}">{{ item.owner }}/{{ item.slug }}</a> · {{ item.visibility }} · updated <time datetime="{{ item.updated_at }}">{{ item.updated_at|human_time }}</time></li>
+{% if item.state == "archived" %}
+    <li>
+      {{ item.owner }}/{{ item.slug }} · archived
+      <form class="inline-form" method="post" action="/{{ item.owner }}/{{ item.slug }}/settings/unarchive">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="confirm" value="yes">
+        <button type="submit">Unarchive repository</button>
+      </form>
+    </li>
+{% else %}
+    <li><a href="/{{ item.owner }}/{{ item.slug }}">{{ item.owner }}/{{ item.slug }}</a> · {{ item.visibility }} · updated <time datetime="{{ item.updated_at }}">{{ item.updated_at|human_time }}</time>{% if item.description.is_empty() %}{% else %}<br>{{ item.description }}{% endif %}</li>
+{% endif %}
   {% endfor %}
   </ul>
 {% endif %}
+  </section>
+  <section>
   <h2>Open a repository</h2>
   <p>Enter an owner and a repository to open its public page.</p>
 {% if has_error %}
@@ -33,4 +48,6 @@
     </div>
     <button type="submit">Open repository</button>
   </form>
+  </section>
+  </div>
 {% endblock %}

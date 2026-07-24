@@ -1,9 +1,9 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rand::rng;
 use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Server, Session};
@@ -22,6 +22,7 @@ use crate::git::transport::{GitRepositories, GitSshService};
 use crate::git::upload_pack::{ProtocolVersion, UploadPack, UploadPackError};
 use crate::issue::{IssueError, IssueService, MAX_BODY_BYTES, MAX_TITLE_BYTES};
 use crate::policy::RepositoryOperation;
+use crate::pull_request::{PullRequestError, PullRequestService};
 use crate::rate_limit::AttemptLimiter;
 use crate::repository::{RepositoryService, RepositoryServiceError};
 use crate::store::{Store, StoreError};
@@ -29,7 +30,7 @@ use crate::telemetry::Telemetry;
 
 const VERSION_COMMAND: &[u8] = b"tit --version";
 const HELP_COMMAND: &[u8] = b"help";
-const LOGIN_COMMAND_PREFIX: &[u8] = b"login ";
+const AUTH_COMMAND_PREFIX: &[u8] = b"auth ";
 const GIT_PROTOCOL_VARIABLE: &str = "GIT_PROTOCOL";
 const MAX_RECEIVE_PACK_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_REPOSITORY_COMMAND_BYTES: usize = 512;
@@ -38,19 +39,40 @@ const MAX_PULL_REQUEST_COMMAND_BYTES: usize = 512;
 const MAX_ISSUE_INPUT_BYTES: usize = MAX_TITLE_BYTES + 1 + MAX_BODY_BYTES;
 const SSH_ATTEMPTS_PER_MINUTE: usize = 30;
 const MAX_SSH_CLIENTS: usize = 4096;
+const MAX_GIT_CHANNELS_PER_CONNECTION: usize = 4;
+const MAX_GIT_CHANNELS_GLOBAL: usize = 64;
+const GIT_CHANNEL_INACTIVITY_LIMIT: Duration = Duration::from_secs(30);
+const GIT_CHANNEL_WALL_CLOCK_LIMIT: Duration = Duration::from_secs(120);
+const MAX_GIT_CHANNEL_BYTES: u64 = 257 * 1024 * 1024;
 const REPOSITORY_CREATE_USAGE: &str = "repo create NAME [--output human|json]";
 const ISSUE_LIST_USAGE: &str = "issue list OWNER/REPOSITORY [--output human|json]";
 const ISSUE_CREATE_USAGE: &str = "issue create OWNER/REPOSITORY [--output human|json]";
+const ISSUE_COMMENT_USAGE: &str = "issue comment OWNER/REPOSITORY NUMBER [--output human|json]";
+const ISSUE_CLOSE_USAGE: &str = "issue close OWNER/REPOSITORY NUMBER [--output human|json]";
+const ISSUE_REOPEN_USAGE: &str = "issue reopen OWNER/REPOSITORY NUMBER [--output human|json]";
+const PULL_REQUEST_LIST_USAGE: &str =
+    "pr list OWNER/REPOSITORY [--state open|closed|merged|all] [--output human|json]";
+const PULL_REQUEST_CREATE_USAGE: &str =
+    "pr create OWNER/REPOSITORY BASE HEAD [--output human|json]";
+const PULL_REQUEST_CLOSE_USAGE: &str = "pr close OWNER/REPOSITORY NUMBER [--output human|json]";
+const PULL_REQUEST_REOPEN_USAGE: &str = "pr reopen OWNER/REPOSITORY NUMBER [--output human|json]";
 const PULL_REQUEST_CHECKOUT_USAGE: &str =
     "pr checkout OWNER/REPOSITORY NUMBER [--output human|json]";
 const HELP_TEXT: &str = "\
 Available tit SSH commands:
   help
   tit --version
-  login ONE-TIME-SECRET
+  auth ONE-TIME-SECRET
   repo create NAME [--output human|json]
   issue list OWNER/REPOSITORY [--output human|json]
   issue create OWNER/REPOSITORY [--output human|json]
+  issue comment OWNER/REPOSITORY NUMBER [--output human|json]
+  issue close OWNER/REPOSITORY NUMBER [--output human|json]
+  issue reopen OWNER/REPOSITORY NUMBER [--output human|json]
+  pr list OWNER/REPOSITORY [--state open|closed|merged|all] [--output human|json]
+  pr create OWNER/REPOSITORY BASE HEAD [--output human|json]
+  pr close OWNER/REPOSITORY NUMBER [--output human|json]
+  pr reopen OWNER/REPOSITORY NUMBER [--output human|json]
   pr checkout OWNER/REPOSITORY NUMBER [--output human|json]
 
 Git clients can also use git-upload-pack and git-receive-pack.
@@ -66,8 +88,8 @@ struct SshRuntime {
     login: Option<LoginApprover>,
 }
 
-fn parse_login_command(command: &[u8]) -> Option<String> {
-    let secret = command.strip_prefix(LOGIN_COMMAND_PREFIX)?;
+fn parse_auth_command(command: &[u8]) -> Option<String> {
+    let secret = command.strip_prefix(AUTH_COMMAND_PREFIX)?;
     if secret.len() != 64
         || !secret
             .iter()
@@ -290,6 +312,7 @@ impl RunningSshServer {
             repositories: repositories.map(Arc::new),
             login: runtime.login,
             connections: Arc::new(Semaphore::new(runtime.max_connections)),
+            git_channels: Arc::new(Semaphore::new(MAX_GIT_CHANNELS_GLOBAL)),
             attempts: AttemptLimiter::new(
                 SSH_ATTEMPTS_PER_MINUTE,
                 Duration::from_secs(60),
@@ -381,6 +404,7 @@ struct SshServer {
     repositories: Option<Arc<GitRepositories>>,
     login: Option<LoginApprover>,
     connections: Arc<Semaphore>,
+    git_channels: Arc<Semaphore>,
     attempts: AttemptLimiter<IpAddr>,
     telemetry: Telemetry,
 }
@@ -407,6 +431,7 @@ impl Server for SshServer {
                 .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             attempts: self.attempts.clone(),
             _connection_permit: self.connections.clone().try_acquire_owned().ok(),
+            git_channels: Arc::clone(&self.git_channels),
             telemetry: self.telemetry.clone(),
             connection_id,
         }
@@ -427,6 +452,7 @@ struct SshSession {
     peer_address: IpAddr,
     attempts: AttemptLimiter<IpAddr>,
     _connection_permit: Option<OwnedSemaphorePermit>,
+    git_channels: Arc<Semaphore>,
     telemetry: Telemetry,
     connection_id: String,
 }
@@ -434,13 +460,30 @@ struct SshSession {
 enum ExecChannel {
     Upload(Box<UploadChannel>),
     Receive(Box<ReceiveChannel>),
-    IssueCreate(IssueCreateChannel),
+    IssueInput(IssueInputChannel),
+    PullRequestCreate(PullRequestCreateChannel),
 }
 
-struct IssueCreateChannel {
+enum IssueInputKind {
+    Create,
+    Comment(i64),
+}
+
+struct IssueInputChannel {
     actor: String,
     owner: String,
     repository: String,
+    output: CommandOutput,
+    kind: IssueInputKind,
+    input: Vec<u8>,
+}
+
+struct PullRequestCreateChannel {
+    actor: String,
+    owner: String,
+    repository: String,
+    base: String,
+    head: String,
     output: CommandOutput,
     input: Vec<u8>,
 }
@@ -448,6 +491,11 @@ struct IssueCreateChannel {
 struct UploadChannel {
     service: UploadPack,
     request: Vec<u8>,
+    started_at: Instant,
+    last_activity: Instant,
+    transferred: u64,
+    cancelled: Arc<AtomicBool>,
+    _global_permit: OwnedSemaphorePermit,
 }
 
 struct ReceiveChannel {
@@ -461,7 +509,43 @@ struct ReceiveChannel {
     commands_complete: bool,
     pack: tokio::fs::File,
     pack_bytes: u64,
-    maintenance: tokio::sync::OwnedRwLockReadGuard<()>,
+    started_at: Instant,
+    last_activity: Instant,
+    transferred: u64,
+    _global_permit: OwnedSemaphorePermit,
+}
+
+impl UploadChannel {
+    fn expired(&self) -> bool {
+        git_channel_expired(self.started_at, self.last_activity)
+    }
+}
+
+impl Drop for UploadChannel {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+impl ReceiveChannel {
+    fn expired(&self) -> bool {
+        git_channel_expired(self.started_at, self.last_activity)
+    }
+}
+
+fn git_channel_expired(started_at: Instant, last_activity: Instant) -> bool {
+    started_at.elapsed() > GIT_CHANNEL_WALL_CLOCK_LIMIT
+        || last_activity.elapsed() > GIT_CHANNEL_INACTIVITY_LIMIT
+}
+
+fn reserve_git_channel(
+    active_channels: usize,
+    global_channels: &Arc<Semaphore>,
+) -> Option<OwnedSemaphorePermit> {
+    if active_channels >= MAX_GIT_CHANNELS_PER_CONNECTION {
+        return None;
+    }
+    global_channels.clone().try_acquire_owned().ok()
 }
 
 impl Handler for SshSession {
@@ -630,11 +714,11 @@ impl Handler for SshSession {
             session.channel_success(channel)?;
             session.data(channel, HELP_TEXT.as_bytes())?;
             finish_git_channel(channel, 0, session)?;
-        } else if command.starts_with(LOGIN_COMMAND_PREFIX) {
+        } else if command.starts_with(AUTH_COMMAND_PREFIX) {
             self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
             session.channel_success(channel)?;
             let result = match (
-                parse_login_command(command),
+                parse_auth_command(command),
                 self.active_identity(),
                 self.login.clone(),
             ) {
@@ -653,7 +737,7 @@ impl Handler for SshSession {
                     session.data(
                         channel,
                         format!(
-                            "Browser login approved.\nOrigin: {}\nAccount: {}\nReturn to your browser and select Continue.\n",
+                            "Authentication approved.\nOrigin: {}\nAccount: {}\nReturn to your browser and select Continue.\n",
                             origin, username
                         )
                         .into_bytes(),
@@ -665,7 +749,7 @@ impl Handler for SshSession {
                         channel,
                         1,
                         format!(
-                            "tit: The login approval is invalid or expired.\n{HELP_GUIDANCE}\n"
+                            "tit: The authentication approval is invalid or expired.\n{HELP_GUIDANCE}\n"
                         )
                         .into_bytes(),
                     )?;
@@ -704,14 +788,34 @@ impl Handler for SshSession {
                 (Ok(IssueCommand::Create(command)), Some(identity)) => {
                     self.exec_channels.insert(
                         channel,
-                        ExecChannel::IssueCreate(IssueCreateChannel {
+                        ExecChannel::IssueInput(IssueInputChannel {
                             actor: identity.username,
                             owner: command.owner,
                             repository: command.repository,
                             output: command.output,
+                            kind: IssueInputKind::Create,
                             input: Vec::new(),
                         }),
                     );
+                }
+                (Ok(IssueCommand::Comment(command)), Some(identity)) => {
+                    self.exec_channels.insert(
+                        channel,
+                        ExecChannel::IssueInput(IssueInputChannel {
+                            actor: identity.username,
+                            owner: command.owner,
+                            repository: command.repository,
+                            output: command.output,
+                            kind: IssueInputKind::Comment(command.number),
+                            input: Vec::new(),
+                        }),
+                    );
+                }
+                (Ok(IssueCommand::SetState(command)), Some(identity)) => {
+                    let result =
+                        run_issue_set_state(self.repositories.clone(), identity.username, command)
+                            .await;
+                    send_issue_mutation_result(channel, result, machine_requested, session)?;
                 }
                 (Ok(_), None) => send_issue_error(
                     channel,
@@ -730,15 +834,61 @@ impl Handler for SshSession {
             self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
             session.channel_success(channel)?;
             let machine_requested = requests_json(command);
-            let result = match (parse_pull_request_command(command), self.active_identity()) {
-                (Ok(command), Some(identity)) => {
-                    run_pull_request_checkout(self.repositories.clone(), identity.username, command)
-                        .await
+            match (parse_pull_request_command(command), self.active_identity()) {
+                (Ok(PullRequestCommand::Checkout(command)), Some(identity)) => {
+                    let result = run_pull_request_checkout(
+                        self.repositories.clone(),
+                        identity.username,
+                        command,
+                    )
+                    .await;
+                    send_pull_request_checkout_result(channel, result, machine_requested, session)?;
                 }
-                (Ok(_), None) => Err(PullRequestCommandError::Unavailable),
-                (Err(()), _) => Err(PullRequestCommandError::Usage),
-            };
-            send_pull_request_result(channel, result, machine_requested, session)?;
+                (Ok(PullRequestCommand::List(command)), Some(identity)) => {
+                    let result = run_pull_request_list(
+                        self.repositories.clone(),
+                        identity.username,
+                        command,
+                    )
+                    .await;
+                    send_pull_request_list_result(channel, result, machine_requested, session)?;
+                }
+                (Ok(PullRequestCommand::Create(command)), Some(identity)) => {
+                    self.exec_channels.insert(
+                        channel,
+                        ExecChannel::PullRequestCreate(PullRequestCreateChannel {
+                            actor: identity.username,
+                            owner: command.owner,
+                            repository: command.repository,
+                            base: command.base,
+                            head: command.head,
+                            output: command.output,
+                            input: Vec::new(),
+                        }),
+                    );
+                }
+                (Ok(PullRequestCommand::SetState(command)), Some(identity)) => {
+                    let result = run_pull_request_set_state(
+                        self.repositories.clone(),
+                        identity.username,
+                        command,
+                    )
+                    .await;
+                    send_pull_request_mutation_result(channel, result, machine_requested, session)?;
+                }
+                (Ok(_), None) => send_pull_request_error(
+                    channel,
+                    PullRequestCommandError::Unavailable,
+                    machine_requested,
+                    session,
+                )?,
+                (Err(()), _) => send_pull_request_error(
+                    channel,
+                    PullRequestCommandError::Usage,
+                    machine_requested,
+                    session,
+                )?,
+            }
         } else {
             let service = self.open_git_service(command).await;
             if let Some(service) = service {
@@ -748,13 +898,22 @@ impl Handler for SshSession {
                     InitialGitService::Upload {
                         service,
                         advertisement,
+                        global_permit,
                     } => {
+                        let started_at = Instant::now();
+                        let advertisement_bytes =
+                            u64::try_from(advertisement.len()).unwrap_or(u64::MAX);
                         session.data(channel, advertisement)?;
                         self.exec_channels.insert(
                             channel,
                             ExecChannel::Upload(Box::new(UploadChannel {
                                 service: *service,
                                 request: Vec::new(),
+                                started_at,
+                                last_activity: started_at,
+                                transferred: advertisement_bytes,
+                                cancelled: Arc::new(AtomicBool::new(false)),
+                                _global_permit: global_permit,
                             })),
                         );
                     }
@@ -766,8 +925,11 @@ impl Handler for SshSession {
                             repository,
                             identity,
                             public_key,
-                            maintenance,
+                            global_permit,
                         } = *receive;
+                        let started_at = Instant::now();
+                        let advertisement_bytes =
+                            u64::try_from(advertisement.len()).unwrap_or(u64::MAX);
                         session.data(channel, advertisement)?;
                         let pack = tokio::fs::File::create(service.incoming_pack()).await;
                         match pack {
@@ -785,7 +947,10 @@ impl Handler for SshSession {
                                         commands_complete: false,
                                         pack,
                                         pack_bytes: 0,
-                                        maintenance,
+                                        started_at,
+                                        last_activity: started_at,
+                                        transferred: advertisement_bytes,
+                                        _global_permit: global_permit,
                                     })),
                                 );
                             }
@@ -828,7 +993,7 @@ impl Handler for SshSession {
             return Ok(());
         };
         let mut git = match exec {
-            ExecChannel::IssueCreate(mut issue) => {
+            ExecChannel::IssueInput(mut issue) => {
                 if append_issue_input(&mut issue.input, data).is_err() {
                     send_issue_error(
                         channel,
@@ -838,12 +1003,38 @@ impl Handler for SshSession {
                     )?;
                 } else {
                     self.exec_channels
-                        .insert(channel, ExecChannel::IssueCreate(issue));
+                        .insert(channel, ExecChannel::IssueInput(issue));
+                }
+                return Ok(());
+            }
+            ExecChannel::PullRequestCreate(mut pull_request) => {
+                if append_issue_input(&mut pull_request.input, data).is_err() {
+                    send_pull_request_error(
+                        channel,
+                        PullRequestCommandError::Input,
+                        pull_request.output == CommandOutput::Json,
+                        session,
+                    )?;
+                } else {
+                    self.exec_channels
+                        .insert(channel, ExecChannel::PullRequestCreate(pull_request));
                 }
                 return Ok(());
             }
             ExecChannel::Upload(git) => git,
             ExecChannel::Receive(mut git) => {
+                if git.expired() {
+                    fail_git_channel(channel, session)?;
+                    return Ok(());
+                }
+                git.last_activity = Instant::now();
+                git.transferred = git
+                    .transferred
+                    .saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+                if !git_channel_bytes_within_limit(git.transferred, 0) {
+                    fail_git_channel(channel, session)?;
+                    return Ok(());
+                }
                 if receive_data(&mut git, data).await.is_err() {
                     fail_git_channel(channel, session)?;
                 } else if git.commands_complete
@@ -861,6 +1052,17 @@ impl Handler for SshSession {
                 return Ok(());
             }
         };
+        if git.expired() {
+            fail_git_channel(channel, session)?;
+            return Ok(());
+        }
+        git.last_activity = Instant::now();
+        let bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        git.transferred = git.transferred.saturating_add(bytes);
+        if !git_channel_bytes_within_limit(git.transferred, 0) {
+            fail_git_channel(channel, session)?;
+            return Ok(());
+        }
         if git.request.len().saturating_add(data.len()) > MAX_REQUEST_BYTES {
             fail_git_channel(channel, session)?;
             return Ok(());
@@ -891,7 +1093,11 @@ impl Handler for SshSession {
                 );
                 if done {
                     match respond_git(self.repositories.clone(), self.protocol, git).await {
-                        Some((_, Ok(response))) => {
+                        Some((git, Ok(response))) => {
+                            if !git_response_within_limit(&git, response.len()) {
+                                fail_git_channel(channel, session)?;
+                                return Ok(());
+                            }
                             session.data(channel, response)?;
                             finish_git_channel(channel, 0, session)?;
                         }
@@ -914,6 +1120,13 @@ impl Handler for SshSession {
                 );
                 match respond_git(self.repositories.clone(), self.protocol, git).await {
                     Some((mut git, Ok(response))) => {
+                        if !git_response_within_limit(&git, response.len()) {
+                            fail_git_channel(channel, session)?;
+                            return Ok(());
+                        }
+                        git.transferred = git
+                            .transferred
+                            .saturating_add(u64::try_from(response.len()).unwrap_or(u64::MAX));
                         session.data(channel, response)?;
                         if fetch && done {
                             finish_git_channel(channel, 0, session)?;
@@ -945,24 +1158,36 @@ impl Handler for SshSession {
     ) -> Result<(), Self::Error> {
         match self.exec_channels.remove(&channel) {
             Some(ExecChannel::Receive(git)) => {
-                if !git.commands_complete {
+                if !git.commands_complete || git.expired() {
                     fail_git_channel(channel, session)?;
                     return Ok(());
                 }
                 let result = finish_receive(self.repositories.clone(), git).await;
                 send_receive_result(channel, result, session)?;
             }
-            Some(ExecChannel::IssueCreate(issue)) => {
+            Some(ExecChannel::IssueInput(issue)) => {
                 let active = self
                     .active_identity()
                     .is_some_and(|identity| identity.username == issue.actor);
                 let machine_requested = issue.output == CommandOutput::Json;
                 let result = if active {
-                    run_issue_create(self.repositories.clone(), issue).await
+                    run_issue_input(self.repositories.clone(), issue).await
                 } else {
                     Err(IssueCommandError::Unavailable)
                 };
-                send_issue_create_result(channel, result, machine_requested, session)?;
+                send_issue_mutation_result(channel, result, machine_requested, session)?;
+            }
+            Some(ExecChannel::PullRequestCreate(pull_request)) => {
+                let active = self
+                    .active_identity()
+                    .is_some_and(|identity| identity.username == pull_request.actor);
+                let machine_requested = pull_request.output == CommandOutput::Json;
+                let result = if active {
+                    run_pull_request_create(self.repositories.clone(), pull_request).await
+                } else {
+                    Err(PullRequestCommandError::Unavailable)
+                };
+                send_pull_request_mutation_result(channel, result, machine_requested, session)?;
             }
             Some(ExecChannel::Upload(_)) | None => {}
         }
@@ -1195,6 +1420,8 @@ fn repository_command_error_message(error: &RepositoryCommandError) -> String {
 enum IssueCommand {
     List(IssueListCommand),
     Create(IssueCreateCommand),
+    Comment(IssueNumberCommand),
+    SetState(IssueStateCommand),
 }
 
 struct IssueListCommand {
@@ -1209,16 +1436,34 @@ struct IssueCreateCommand {
     output: CommandOutput,
 }
 
+struct IssueNumberCommand {
+    owner: String,
+    repository: String,
+    number: i64,
+    output: CommandOutput,
+}
+
+struct IssueStateCommand {
+    owner: String,
+    repository: String,
+    number: i64,
+    state: &'static str,
+    output: CommandOutput,
+}
+
 struct IssueListResult {
     repository: crate::store::RepositoryRecord,
     issues: Vec<crate::store::IssueRecord>,
     output: CommandOutput,
 }
 
-struct IssueCreateResult {
+struct IssueMutationResult {
     owner: String,
     repository: String,
-    issue: crate::store::IssueRecord,
+    number: i64,
+    operation: &'static str,
+    issue: Option<crate::store::IssueRecord>,
+    comment_id: Option<String>,
     output: CommandOutput,
 }
 
@@ -1254,18 +1499,50 @@ fn parse_issue_command(command: &[u8]) -> Result<IssueCommand, ()> {
     if owner.is_empty() || repository.is_empty() || repository.contains('/') {
         return Err(());
     }
-    let output = parse_output_options(tokens)?;
     match operation {
-        "list" => Ok(IssueCommand::List(IssueListCommand {
-            owner: owner.to_owned(),
-            repository: repository.to_owned(),
-            output,
-        })),
-        "create" => Ok(IssueCommand::Create(IssueCreateCommand {
-            owner: owner.to_owned(),
-            repository: repository.to_owned(),
-            output,
-        })),
+        "list" | "create" => {
+            let output = parse_output_options(tokens)?;
+            if operation == "list" {
+                Ok(IssueCommand::List(IssueListCommand {
+                    owner: owner.to_owned(),
+                    repository: repository.to_owned(),
+                    output,
+                }))
+            } else {
+                Ok(IssueCommand::Create(IssueCreateCommand {
+                    owner: owner.to_owned(),
+                    repository: repository.to_owned(),
+                    output,
+                }))
+            }
+        }
+        "comment" | "close" | "reopen" => {
+            let number = tokens.next().ok_or(())?.parse::<i64>().map_err(|_| ())?;
+            if number < 1 {
+                return Err(());
+            }
+            let output = parse_output_options(tokens)?;
+            if operation == "comment" {
+                Ok(IssueCommand::Comment(IssueNumberCommand {
+                    owner: owner.to_owned(),
+                    repository: repository.to_owned(),
+                    number,
+                    output,
+                }))
+            } else {
+                Ok(IssueCommand::SetState(IssueStateCommand {
+                    owner: owner.to_owned(),
+                    repository: repository.to_owned(),
+                    number,
+                    state: if operation == "close" {
+                        "closed"
+                    } else {
+                        "open"
+                    },
+                    output,
+                }))
+            }
+        }
         _ => Err(()),
     }
 }
@@ -1317,11 +1594,77 @@ async fn run_issue_list(
     .map_err(|_| IssueCommandError::Unavailable)?
 }
 
-async fn run_issue_create(
+async fn run_issue_input(
     repositories: Option<Arc<GitRepositories>>,
-    command: IssueCreateChannel,
-) -> Result<IssueCreateResult, IssueCommandError> {
-    let (title, body) = parse_issue_input(&command.input)?;
+    command: IssueInputChannel,
+) -> Result<IssueMutationResult, IssueCommandError> {
+    let repositories = repositories.ok_or(IssueCommandError::Unavailable)?;
+    let database = repositories
+        .push_database()
+        .ok_or(IssueCommandError::Unavailable)?
+        .to_owned();
+    let permit = repositories
+        .blocking_permit()
+        .await
+        .map_err(|_| IssueCommandError::Unavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let service = IssueService::new(&database);
+        match command.kind {
+            IssueInputKind::Create => {
+                let (title, body) = parse_issue_input(&command.input)?;
+                service
+                    .create(
+                        &command.owner,
+                        &command.repository,
+                        &command.actor,
+                        &title,
+                        &body,
+                    )
+                    .map(|issue| IssueMutationResult {
+                        owner: command.owner,
+                        repository: command.repository,
+                        number: issue.number,
+                        operation: "created",
+                        issue: Some(issue),
+                        comment_id: None,
+                        output: command.output,
+                    })
+                    .map_err(IssueCommandError::Service)
+            }
+            IssueInputKind::Comment(number) => {
+                let body =
+                    std::str::from_utf8(&command.input).map_err(|_| IssueCommandError::Input)?;
+                service
+                    .comment(
+                        &command.owner,
+                        &command.repository,
+                        number,
+                        &command.actor,
+                        body,
+                    )
+                    .map(|comment_id| IssueMutationResult {
+                        owner: command.owner,
+                        repository: command.repository,
+                        number,
+                        operation: "commented",
+                        issue: None,
+                        comment_id: Some(comment_id),
+                        output: command.output,
+                    })
+                    .map_err(IssueCommandError::Service)
+            }
+        }
+    })
+    .await
+    .map_err(|_| IssueCommandError::Unavailable)?
+}
+
+async fn run_issue_set_state(
+    repositories: Option<Arc<GitRepositories>>,
+    actor: String,
+    command: IssueStateCommand,
+) -> Result<IssueMutationResult, IssueCommandError> {
     let repositories = repositories.ok_or(IssueCommandError::Unavailable)?;
     let database = repositories
         .push_database()
@@ -1334,17 +1677,24 @@ async fn run_issue_create(
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         IssueService::new(&database)
-            .create(
+            .set_state(
                 &command.owner,
                 &command.repository,
-                &command.actor,
-                &title,
-                &body,
+                command.number,
+                &actor,
+                command.state,
             )
-            .map(|issue| IssueCreateResult {
+            .map(|()| IssueMutationResult {
                 owner: command.owner,
                 repository: command.repository,
-                issue,
+                number: command.number,
+                operation: if command.state == "closed" {
+                    "closed"
+                } else {
+                    "reopened"
+                },
+                issue: None,
+                comment_id: None,
                 output: command.output,
             })
             .map_err(IssueCommandError::Service)
@@ -1436,9 +1786,9 @@ fn issue_list_json(result: &IssueListResult) -> Vec<u8> {
     }))
 }
 
-fn send_issue_create_result(
+fn send_issue_mutation_result(
     channel: ChannelId,
-    result: Result<IssueCreateResult, IssueCommandError>,
+    result: Result<IssueMutationResult, IssueCommandError>,
     machine_requested: bool,
     session: &mut Session,
 ) -> Result<(), russh::Error> {
@@ -1446,8 +1796,11 @@ fn send_issue_create_result(
         Ok(result) => {
             let data = match result.output {
                 CommandOutput::Human => format!(
-                    "Created issue {}/{}#{}.\n",
-                    result.owner, result.repository, result.issue.number
+                    "{} issue {}/{}#{}.\n",
+                    sentence_case(result.operation),
+                    result.owner,
+                    result.repository,
+                    result.number
                 )
                 .into_bytes(),
                 CommandOutput::Json => json_line(serde_json::json!({
@@ -1458,19 +1811,29 @@ fn send_issue_create_result(
                         "name": result.repository,
                     },
                     "issue": {
-                        "number": result.issue.number,
-                        "title": result.issue.title,
-                        "state": result.issue.state,
-                        "author": result.issue.author,
-                        "created_at": result.issue.created_at,
-                        "updated_at": result.issue.updated_at,
+                        "number": result.number,
+                        "title": result.issue.as_ref().map(|issue| &issue.title),
+                        "state": result.issue.as_ref().map(|issue| &issue.state),
+                        "author": result.issue.as_ref().map(|issue| &issue.author),
+                        "created_at": result.issue.as_ref().map(|issue| issue.created_at),
+                        "updated_at": result.issue.as_ref().map(|issue| issue.updated_at),
                     },
+                    "operation": result.operation,
+                    "comment_id": result.comment_id,
                 })),
             };
             session.data(channel, data)?;
             finish_git_channel(channel, 0, session)
         }
         Err(error) => send_issue_error(channel, error, machine_requested, session),
+    }
+}
+
+fn sentence_case(value: &str) -> String {
+    let mut characters = value.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
     }
 }
 
@@ -1531,7 +1894,10 @@ fn issue_command_error_code(error: &IssueCommandError) -> &'static str {
 fn issue_command_error_message(error: &IssueCommandError) -> String {
     match issue_command_error_code(error) {
         "invalid-command" => {
-            format!("usage: {ISSUE_LIST_USAGE} or {ISSUE_CREATE_USAGE}\n{HELP_GUIDANCE}")
+            format!(
+                "usage: {ISSUE_LIST_USAGE}, {ISSUE_CREATE_USAGE}, {ISSUE_COMMENT_USAGE}, \
+                 {ISSUE_CLOSE_USAGE}, or {ISSUE_REOPEN_USAGE}\n{HELP_GUIDANCE}"
+            )
         }
         "invalid-input" => {
             "The first input line must be a valid title. The remaining input is the body."
@@ -1553,6 +1919,36 @@ struct PullRequestCheckoutCommand {
     output: CommandOutput,
 }
 
+enum PullRequestCommand {
+    Checkout(PullRequestCheckoutCommand),
+    List(PullRequestListCommand),
+    Create(PullRequestCreateCommand),
+    SetState(PullRequestStateCommand),
+}
+
+struct PullRequestListCommand {
+    owner: String,
+    repository: String,
+    state: String,
+    output: CommandOutput,
+}
+
+struct PullRequestCreateCommand {
+    owner: String,
+    repository: String,
+    base: String,
+    head: String,
+    output: CommandOutput,
+}
+
+struct PullRequestStateCommand {
+    owner: String,
+    repository: String,
+    number: i64,
+    state: &'static str,
+    output: CommandOutput,
+}
+
 struct PullRequestCheckoutResult {
     owner: String,
     repository: String,
@@ -1560,17 +1956,35 @@ struct PullRequestCheckoutResult {
     output: CommandOutput,
 }
 
+struct PullRequestListResult {
+    repository: crate::store::RepositoryRecord,
+    pull_requests: Vec<crate::store::PullRequestRecord>,
+    state: String,
+    output: CommandOutput,
+}
+
+struct PullRequestMutationResult {
+    owner: String,
+    repository: String,
+    number: i64,
+    operation: &'static str,
+    pull_request: Option<crate::store::PullRequestRecord>,
+    output: CommandOutput,
+}
+
 enum PullRequestCommandError {
     Usage,
+    Input,
     Unavailable,
     Store(StoreError),
+    Service(PullRequestError),
 }
 
 fn is_pull_request_command(command: &[u8]) -> bool {
     command == b"pr" || command.starts_with(b"pr ")
 }
 
-fn parse_pull_request_command(command: &[u8]) -> Result<PullRequestCheckoutCommand, ()> {
+fn parse_pull_request_command(command: &[u8]) -> Result<PullRequestCommand, ()> {
     if command.len() > MAX_PULL_REQUEST_COMMAND_BYTES || !command.is_ascii() {
         return Err(());
     }
@@ -1582,25 +1996,96 @@ fn parse_pull_request_command(command: &[u8]) -> Result<PullRequestCheckoutComma
         return Err(());
     }
     let mut tokens = command.split_ascii_whitespace();
-    if tokens.next() != Some("pr") || tokens.next() != Some("checkout") {
+    if tokens.next() != Some("pr") {
         return Err(());
     }
+    let operation = tokens.next().ok_or(())?;
     let target = tokens.next().ok_or(())?;
     let (owner, repository) = target.split_once('/').ok_or(())?;
     if owner.is_empty() || repository.is_empty() || repository.contains('/') {
         return Err(());
     }
-    let number = tokens.next().ok_or(())?.parse::<i64>().map_err(|_| ())?;
-    if number < 1 {
-        return Err(());
+    match operation {
+        "list" => {
+            let (state, output) = parse_pull_request_list_options(tokens)?;
+            Ok(PullRequestCommand::List(PullRequestListCommand {
+                owner: owner.to_owned(),
+                repository: repository.to_owned(),
+                state,
+                output,
+            }))
+        }
+        "create" => {
+            let base = tokens.next().ok_or(())?.to_owned();
+            let head = tokens.next().ok_or(())?.to_owned();
+            let output = parse_output_options(tokens)?;
+            Ok(PullRequestCommand::Create(PullRequestCreateCommand {
+                owner: owner.to_owned(),
+                repository: repository.to_owned(),
+                base,
+                head,
+                output,
+            }))
+        }
+        "checkout" | "close" | "reopen" => {
+            let number = tokens.next().ok_or(())?.parse::<i64>().map_err(|_| ())?;
+            if number < 1 {
+                return Err(());
+            }
+            let output = parse_output_options(tokens)?;
+            if operation == "checkout" {
+                Ok(PullRequestCommand::Checkout(PullRequestCheckoutCommand {
+                    owner: owner.to_owned(),
+                    repository: repository.to_owned(),
+                    number,
+                    output,
+                }))
+            } else {
+                Ok(PullRequestCommand::SetState(PullRequestStateCommand {
+                    owner: owner.to_owned(),
+                    repository: repository.to_owned(),
+                    number,
+                    state: if operation == "close" {
+                        "closed"
+                    } else {
+                        "open"
+                    },
+                    output,
+                }))
+            }
+        }
+        _ => Err(()),
     }
-    let output = parse_output_options(tokens)?;
-    Ok(PullRequestCheckoutCommand {
-        owner: owner.to_owned(),
-        repository: repository.to_owned(),
-        number,
-        output,
-    })
+}
+
+fn parse_pull_request_list_options<'a>(
+    mut tokens: impl Iterator<Item = &'a str>,
+) -> Result<(String, CommandOutput), ()> {
+    let mut state = None;
+    let mut output = None;
+    while let Some(option) = tokens.next() {
+        let value = tokens.next().ok_or(())?;
+        match option {
+            "--state" if state.is_none() => {
+                if !matches!(value, "open" | "closed" | "merged" | "all") {
+                    return Err(());
+                }
+                state = Some(value.to_owned());
+            }
+            "--output" if output.is_none() => {
+                output = Some(match value {
+                    "human" => CommandOutput::Human,
+                    "json" => CommandOutput::Json,
+                    _ => return Err(()),
+                });
+            }
+            _ => return Err(()),
+        }
+    }
+    Ok((
+        state.unwrap_or_else(|| "open".to_owned()),
+        output.unwrap_or(CommandOutput::Human),
+    ))
 }
 
 async fn run_pull_request_checkout(
@@ -1640,7 +2125,129 @@ async fn run_pull_request_checkout(
     .map_err(|_| PullRequestCommandError::Unavailable)?
 }
 
-fn send_pull_request_result(
+async fn run_pull_request_list(
+    repositories: Option<Arc<GitRepositories>>,
+    actor: String,
+    command: PullRequestListCommand,
+) -> Result<PullRequestListResult, PullRequestCommandError> {
+    let repositories = repositories.ok_or(PullRequestCommandError::Unavailable)?;
+    let database = repositories
+        .push_database()
+        .ok_or(PullRequestCommandError::Unavailable)?
+        .to_owned();
+    let root = repositories.repository_root().to_owned();
+    let permit = repositories
+        .blocking_permit()
+        .await
+        .map_err(|_| PullRequestCommandError::Unavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        PullRequestService::new(&database, &root)
+            .list_page(
+                &command.owner,
+                &command.repository,
+                Some(&actor),
+                &command.state,
+                1,
+            )
+            .map(|(repository, page, _)| PullRequestListResult {
+                repository,
+                pull_requests: page.items,
+                state: command.state,
+                output: command.output,
+            })
+            .map_err(PullRequestCommandError::Service)
+    })
+    .await
+    .map_err(|_| PullRequestCommandError::Unavailable)?
+}
+
+async fn run_pull_request_create(
+    repositories: Option<Arc<GitRepositories>>,
+    command: PullRequestCreateChannel,
+) -> Result<PullRequestMutationResult, PullRequestCommandError> {
+    let (title, body) =
+        parse_issue_input(&command.input).map_err(|_| PullRequestCommandError::Input)?;
+    let repositories = repositories.ok_or(PullRequestCommandError::Unavailable)?;
+    let database = repositories
+        .push_database()
+        .ok_or(PullRequestCommandError::Unavailable)?
+        .to_owned();
+    let root = repositories.repository_root().to_owned();
+    let permit = repositories
+        .blocking_permit()
+        .await
+        .map_err(|_| PullRequestCommandError::Unavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        PullRequestService::new(&database, &root)
+            .open(
+                &command.owner,
+                &command.repository,
+                &command.actor,
+                &title,
+                &body,
+                &command.base,
+                &command.head,
+            )
+            .map(|pull_request| PullRequestMutationResult {
+                owner: command.owner,
+                repository: command.repository,
+                number: pull_request.number,
+                operation: "created",
+                pull_request: Some(pull_request),
+                output: command.output,
+            })
+            .map_err(PullRequestCommandError::Service)
+    })
+    .await
+    .map_err(|_| PullRequestCommandError::Unavailable)?
+}
+
+async fn run_pull_request_set_state(
+    repositories: Option<Arc<GitRepositories>>,
+    actor: String,
+    command: PullRequestStateCommand,
+) -> Result<PullRequestMutationResult, PullRequestCommandError> {
+    let repositories = repositories.ok_or(PullRequestCommandError::Unavailable)?;
+    let database = repositories
+        .push_database()
+        .ok_or(PullRequestCommandError::Unavailable)?
+        .to_owned();
+    let root = repositories.repository_root().to_owned();
+    let permit = repositories
+        .blocking_permit()
+        .await
+        .map_err(|_| PullRequestCommandError::Unavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        PullRequestService::new(&database, &root)
+            .set_state(
+                &command.owner,
+                &command.repository,
+                command.number,
+                &actor,
+                command.state,
+            )
+            .map(|()| PullRequestMutationResult {
+                owner: command.owner,
+                repository: command.repository,
+                number: command.number,
+                operation: if command.state == "closed" {
+                    "closed"
+                } else {
+                    "reopened"
+                },
+                pull_request: None,
+                output: command.output,
+            })
+            .map_err(PullRequestCommandError::Service)
+    })
+    .await
+    .map_err(|_| PullRequestCommandError::Unavailable)?
+}
+
+fn send_pull_request_checkout_result(
     channel: ChannelId,
     result: Result<PullRequestCheckoutResult, PullRequestCommandError>,
     machine_requested: bool,
@@ -1669,50 +2276,188 @@ fn send_pull_request_result(
             session.data(channel, data.into_bytes())?;
             finish_git_channel(channel, 0, session)
         }
-        Err(error) => {
-            if machine_requested {
-                session.data(
-                    channel,
-                    format!(
-                        "{{\"version\":1,\"status\":\"error\",\"error\":{{\"code\":\"{}\"}}}}\n",
-                        pull_request_command_error_code(&error)
-                    )
-                    .into_bytes(),
-                )?;
-            } else {
-                session.extended_data(
-                    channel,
-                    1,
-                    format!("tit: {}\n", pull_request_command_error_message(&error)).into_bytes(),
-                )?;
-            }
-            finish_git_channel(channel, 1, session)
-        }
+        Err(error) => send_pull_request_error(channel, error, machine_requested, session),
     }
+}
+
+fn send_pull_request_list_result(
+    channel: ChannelId,
+    result: Result<PullRequestListResult, PullRequestCommandError>,
+    machine_requested: bool,
+    session: &mut Session,
+) -> Result<(), russh::Error> {
+    match result {
+        Ok(result) => {
+            let data = match result.output {
+                CommandOutput::Human => {
+                    if result.pull_requests.is_empty() {
+                        b"No pull requests.\n".to_vec()
+                    } else {
+                        result
+                            .pull_requests
+                            .iter()
+                            .map(|pull_request| {
+                                format!(
+                                    "#{} {} {} ({} <- {})\n",
+                                    pull_request.number,
+                                    pull_request.state,
+                                    pull_request.title,
+                                    pull_request.base_ref,
+                                    pull_request.head_ref
+                                )
+                            })
+                            .collect::<String>()
+                            .into_bytes()
+                    }
+                }
+                CommandOutput::Json => {
+                    let pull_requests = result
+                        .pull_requests
+                        .iter()
+                        .map(pull_request_json)
+                        .collect::<Vec<_>>();
+                    json_line(serde_json::json!({
+                        "version": 1,
+                        "status": "success",
+                        "repository": {
+                            "owner": result.repository.owner,
+                            "name": result.repository.slug,
+                        },
+                        "state": result.state,
+                        "pull_requests": pull_requests,
+                    }))
+                }
+            };
+            session.data(channel, data)?;
+            finish_git_channel(channel, 0, session)
+        }
+        Err(error) => send_pull_request_error(channel, error, machine_requested, session),
+    }
+}
+
+fn send_pull_request_mutation_result(
+    channel: ChannelId,
+    result: Result<PullRequestMutationResult, PullRequestCommandError>,
+    machine_requested: bool,
+    session: &mut Session,
+) -> Result<(), russh::Error> {
+    match result {
+        Ok(result) => {
+            let data = match result.output {
+                CommandOutput::Human => format!(
+                    "{} pull request {}/{}#{}.\n",
+                    sentence_case(result.operation),
+                    result.owner,
+                    result.repository,
+                    result.number
+                )
+                .into_bytes(),
+                CommandOutput::Json => json_line(serde_json::json!({
+                    "version": 1,
+                    "status": "success",
+                    "repository": {
+                        "owner": result.owner,
+                        "name": result.repository,
+                    },
+                    "pull_request": result.pull_request.as_ref().map(pull_request_json)
+                        .unwrap_or_else(|| serde_json::json!({ "number": result.number })),
+                    "operation": result.operation,
+                })),
+            };
+            session.data(channel, data)?;
+            finish_git_channel(channel, 0, session)
+        }
+        Err(error) => send_pull_request_error(channel, error, machine_requested, session),
+    }
+}
+
+fn pull_request_json(pull_request: &crate::store::PullRequestRecord) -> serde_json::Value {
+    serde_json::json!({
+        "number": pull_request.number,
+        "title": pull_request.title,
+        "state": pull_request.state,
+        "author": pull_request.author,
+        "base": pull_request.base_ref,
+        "head": pull_request.head_ref,
+        "created_at": pull_request.created_at,
+        "updated_at": pull_request.updated_at,
+    })
+}
+
+fn send_pull_request_error(
+    channel: ChannelId,
+    error: PullRequestCommandError,
+    machine_requested: bool,
+    session: &mut Session,
+) -> Result<(), russh::Error> {
+    if machine_requested {
+        session.data(
+            channel,
+            json_line(serde_json::json!({
+                "version": 1,
+                "status": "error",
+                "error": { "code": pull_request_command_error_code(&error) },
+            })),
+        )?;
+    } else {
+        session.extended_data(
+            channel,
+            1,
+            format!("tit: {}\n", pull_request_command_error_message(&error)).into_bytes(),
+        )?;
+    }
+    finish_git_channel(channel, 1, session)
 }
 
 fn pull_request_command_error_code(error: &PullRequestCommandError) -> &'static str {
     match error {
         PullRequestCommandError::Usage => "invalid-command",
+        PullRequestCommandError::Input
+        | PullRequestCommandError::Service(
+            PullRequestError::Title | PullRequestError::Body | PullRequestError::Branch,
+        ) => "invalid-input",
         PullRequestCommandError::Unavailable => "service-unavailable",
         PullRequestCommandError::Store(
             StoreError::PullRequestHidden
             | StoreError::PullRequestNotFound(_, _, _)
             | StoreError::RepositoryNotFound(_, _),
         ) => "pull-request-unavailable",
-        PullRequestCommandError::Store(_) => "pull-request-checkout-failed",
+        PullRequestCommandError::Service(PullRequestError::Auth(_))
+        | PullRequestCommandError::Service(PullRequestError::RepositoryName(_)) => "invalid-target",
+        PullRequestCommandError::Service(PullRequestError::Store(
+            StoreError::PullRequestHidden
+            | StoreError::PullRequestNotFound(_, _, _)
+            | StoreError::RepositoryNotFound(_, _),
+        )) => "pull-request-unavailable",
+        PullRequestCommandError::Service(PullRequestError::Store(
+            StoreError::PullRequestDenied,
+        )) => "permission-denied",
+        PullRequestCommandError::Store(_) | PullRequestCommandError::Service(_) => {
+            "pull-request-command-failed"
+        }
     }
 }
 
 fn pull_request_command_error_message(error: &PullRequestCommandError) -> String {
     match pull_request_command_error_code(error) {
         "invalid-command" => {
-            format!("usage: {PULL_REQUEST_CHECKOUT_USAGE}\n{HELP_GUIDANCE}")
+            format!(
+                "usage: {PULL_REQUEST_LIST_USAGE}, {PULL_REQUEST_CREATE_USAGE}, \
+                 {PULL_REQUEST_CLOSE_USAGE}, {PULL_REQUEST_REOPEN_USAGE}, or \
+                 {PULL_REQUEST_CHECKOUT_USAGE}\n{HELP_GUIDANCE}"
+            )
+        }
+        "invalid-input" => {
+            "The refs or input are not valid. The first input line is the title and the remaining input is the body."
+                .to_owned()
         }
         "pull-request-unavailable" => "The pull request is not available.".to_owned(),
         "invalid-target" => "The pull-request target is not valid.".to_owned(),
+        "permission-denied" => {
+            "The account cannot change a pull request in this repository.".to_owned()
+        }
         "service-unavailable" => "The pull-request service is not available.".to_owned(),
-        _ => "The pull-request checkout command could not be completed.".to_owned(),
+        _ => "The pull-request command could not be completed.".to_owned(),
     }
 }
 
@@ -1726,6 +2471,12 @@ impl SshSession {
     }
 
     async fn open_git_service(&mut self, command: &[u8]) -> Option<InitialGitService> {
+        let active_channels = self
+            .exec_channels
+            .values()
+            .filter(|channel| matches!(channel, ExecChannel::Upload(_) | ExecChannel::Receive(_)))
+            .count();
+        let global_permit = reserve_git_channel(active_channels, &self.git_channels)?;
         let repositories = self.repositories.as_ref()?;
         let identity = self.active_identity()?;
         let service = repositories
@@ -1742,6 +2493,7 @@ impl SshSession {
                     Ok::<_, UploadPackError>(InitialGitService::Upload {
                         service: Box::new(service),
                         advertisement,
+                        global_permit,
                     })
                 })
                 .await
@@ -1760,7 +2512,6 @@ impl SshSession {
                 let actor = identity.username.clone();
                 let public_key = self.authenticated_key.clone()?;
                 let uses_policy = repositories.uses_policy();
-                let maintenance = repositories.mutation_permit().await;
                 let permit = repositories.blocking_permit().await.ok()?;
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
@@ -1784,7 +2535,7 @@ impl SshSession {
                             repository,
                             identity,
                             public_key,
-                            maintenance,
+                            global_permit,
                         },
                     )))
                 })
@@ -1807,6 +2558,7 @@ enum InitialGitService {
     Upload {
         service: Box<UploadPack>,
         advertisement: Vec<u8>,
+        global_permit: OwnedSemaphorePermit,
     },
     Receive(Box<InitialReceiveService>),
 }
@@ -1818,7 +2570,7 @@ struct InitialReceiveService {
     repository: String,
     identity: SshIdentity,
     public_key: PublicKey,
-    maintenance: tokio::sync::OwnedRwLockReadGuard<()>,
+    global_permit: OwnedSemaphorePermit,
 }
 
 async fn receive_data(git: &mut ReceiveChannel, data: &[u8]) -> Result<(), ()> {
@@ -1860,15 +2612,19 @@ async fn finish_receive(
         authorized_keys,
         commands,
         mut pack,
-        maintenance,
+        started_at,
         ..
     } = *git;
+    if started_at.elapsed() > GIT_CHANNEL_WALL_CLOCK_LIMIT - Duration::from_secs(30) {
+        return None;
+    }
     pack.flush().await.ok()?;
     pack.sync_all().await.ok()?;
     drop(pack);
     let repositories = repositories?;
     let push_permit = repositories.push_permit().await.ok()?;
     let permit = repositories.blocking_permit().await.ok()?;
+    let maintenance = repositories.mutation_permit().await;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _push_permit = push_permit;
@@ -1943,14 +2699,33 @@ async fn respond_git(
     protocol: ProtocolVersion,
     git: Box<UploadChannel>,
 ) -> Option<(Box<UploadChannel>, Result<Vec<u8>, UploadPackError>)> {
+    let remaining = GIT_CHANNEL_WALL_CLOCK_LIMIT.checked_sub(git.started_at.elapsed())?;
+    let cancelled = Arc::clone(&git.cancelled);
     let permit = repositories?.blocking_permit().await.ok()?;
-    tokio::task::spawn_blocking(move || {
+    let cancellation_for_job = Arc::clone(&cancelled);
+    let mut task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let response = git.service.respond(protocol, &git.request);
+        let response =
+            git.service
+                .respond_with_cancellation(protocol, &git.request, &cancellation_for_job);
         (git, response)
-    })
-    .await
-    .ok()
+    });
+    match tokio::time::timeout(remaining, &mut task).await {
+        Ok(result) => result.ok(),
+        Err(_) => {
+            cancelled.store(true, Ordering::Relaxed);
+            task.await.ok()
+        }
+    }
+}
+
+fn git_response_within_limit(git: &UploadChannel, response_bytes: usize) -> bool {
+    let response_bytes = u64::try_from(response_bytes).unwrap_or(u64::MAX);
+    git_channel_bytes_within_limit(git.transferred, response_bytes)
+}
+
+fn git_channel_bytes_within_limit(transferred: u64, additional: u64) -> bool {
+    transferred.saturating_add(additional) <= MAX_GIT_CHANNEL_BYTES
 }
 
 fn valid_git_protocol(value: &str) -> bool {
@@ -2052,22 +2827,71 @@ mod tests {
     }
 
     #[test]
-    fn parses_only_bounded_pull_request_checkout_commands() {
+    fn parses_only_bounded_pull_request_commands() {
         let command = parse_pull_request_command(b"pr checkout alice/project 42 --output json")
             .expect("parse a pull-request checkout command");
+        let PullRequestCommand::Checkout(command) = command else {
+            panic!("expected checkout");
+        };
         assert_eq!(command.owner, "alice");
         assert_eq!(command.repository, "project");
         assert_eq!(command.number, 42);
         assert!(command.output == CommandOutput::Json);
+        assert!(matches!(
+            parse_pull_request_command(
+                b"pr list alice/project --output json --state merged"
+            ),
+            Ok(PullRequestCommand::List(PullRequestListCommand {
+                state,
+                output: CommandOutput::Json,
+                ..
+            })) if state == "merged"
+        ));
+        assert!(matches!(
+            parse_pull_request_command(b"pr create alice/project main topic"),
+            Ok(PullRequestCommand::Create(_))
+        ));
+        assert!(matches!(
+            parse_pull_request_command(b"pr close alice/project 2"),
+            Ok(PullRequestCommand::SetState(_))
+        ));
         for command in [
             b"pr checkout alice/project 0".as_slice(),
             b"pr checkout alice/project not-a-number".as_slice(),
             b"pr checkout alice/project/extra 1".as_slice(),
             b"pr checkout alice/project 1 --output json extra".as_slice(),
             b"pr checkout alice/project 1 --output json --output json".as_slice(),
+            b"pr list alice/project --state invalid".as_slice(),
+            b"pr create alice/project main".as_slice(),
             &[b'x'; MAX_PULL_REQUEST_COMMAND_BYTES + 1],
         ] {
             assert!(parse_pull_request_command(command).is_err());
         }
+    }
+
+    #[test]
+    fn bounds_git_channel_time_bytes_and_concurrency() {
+        let now = Instant::now();
+        assert!(!git_channel_expired(now, now));
+        assert!(git_channel_expired(
+            now - GIT_CHANNEL_WALL_CLOCK_LIMIT - Duration::from_secs(1),
+            now
+        ));
+        assert!(git_channel_expired(
+            now,
+            now - GIT_CHANNEL_INACTIVITY_LIMIT - Duration::from_secs(1)
+        ));
+
+        let global = Arc::new(Semaphore::new(MAX_GIT_CHANNELS_GLOBAL));
+        let permits = (0..MAX_GIT_CHANNELS_GLOBAL)
+            .map(|_| reserve_git_channel(0, &global).expect("reserve a global Git channel"))
+            .collect::<Vec<_>>();
+        assert!(reserve_git_channel(0, &global).is_none());
+        drop(permits);
+        assert!(reserve_git_channel(MAX_GIT_CHANNELS_PER_CONNECTION, &global).is_none());
+
+        let limit = std::hint::black_box(MAX_GIT_CHANNEL_BYTES);
+        assert!(git_channel_bytes_within_limit(limit, 0));
+        assert!(!git_channel_bytes_within_limit(limit, 1));
     }
 }

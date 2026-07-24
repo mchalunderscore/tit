@@ -11,11 +11,12 @@ use crate::domain::repository::{RepositoryNameError, validate_slug};
 use crate::git::repository::{GitRepository, GitRepositoryError};
 use crate::maintenance::MaintenanceGate;
 use crate::store::{
-    HomeRepositoryRecord, NewAuditEvent, NewRepository, RepositoryOrigin, RepositoryRecord, Store,
-    StoreError,
+    HomeRepositoryRecord, NewAuditEvent, NewRepository, RepositoryOrigin, RepositoryRecord,
+    RepositorySettings, Store, StoreError,
 };
 
 const HOME_REPOSITORY_LIMIT: usize = 20;
+pub(crate) const MAX_DESCRIPTION_BYTES: usize = 512;
 
 #[derive(Clone)]
 pub(crate) struct RepositoryService {
@@ -56,6 +57,181 @@ impl RepositoryService {
         owner: Option<&str>,
     ) -> Result<Vec<HomeRepositoryRecord>, RepositoryServiceError> {
         Ok(Store::open(&self.database)?.home_repositories(owner, HOME_REPOSITORY_LIMIT)?)
+    }
+
+    pub(crate) fn default_branch(
+        &self,
+        owner: &str,
+        repository: &str,
+    ) -> Result<String, RepositoryServiceError> {
+        validate_username(owner)?;
+        validate_slug(repository)?;
+        Store::open(&self.database)?
+            .repository_default_branch(owner, repository)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn settings(
+        &self,
+        owner: &str,
+        repository: &str,
+        actor: &str,
+    ) -> Result<RepositorySettings, RepositoryServiceError> {
+        validate_username(owner)?;
+        validate_slug(repository)?;
+        validate_username(actor)?;
+        let mut settings = Store::open(&self.database)?
+            .repository_settings(owner, repository, actor)
+            .map_err(RepositoryServiceError::from)?;
+        settings.branches =
+            GitRepository::open(&self.root.join(format!("{}.git", settings.repository.id)))?
+                .references()?
+                .into_iter()
+                .filter(|reference| reference.name.starts_with(b"refs/heads/"))
+                .filter_map(|reference| String::from_utf8(reference.name).ok())
+                .collect();
+        Ok(settings)
+    }
+
+    pub(crate) fn update_default_branch(
+        &self,
+        owner: &str,
+        repository: &str,
+        actor: &str,
+        default_branch: &str,
+    ) -> Result<(), RepositoryServiceError> {
+        validate_username(owner)?;
+        validate_slug(repository)?;
+        validate_username(actor)?;
+        let _maintenance = self.maintenance.mutation();
+        let mut store = Store::open(&self.database)?;
+        let settings = store.repository_settings(owner, repository, actor)?;
+        let git = GitRepository::open(&self.root.join(format!("{}.git", settings.repository.id)))?;
+        let previous = settings.default_branch;
+        git.set_default_branch(default_branch)?;
+        let result = store.update_repository_default_branch(
+            owner,
+            repository,
+            actor,
+            default_branch,
+            timestamp()?,
+            &random_id()?,
+        );
+        if result.is_err() {
+            let _ = git.set_default_branch(&previous);
+        }
+        result?;
+        Ok(())
+    }
+
+    pub(crate) fn update_settings(
+        &self,
+        owner: &str,
+        repository: &str,
+        actor: &str,
+        description: &str,
+        visibility: &str,
+    ) -> Result<(), RepositoryServiceError> {
+        validate_username(owner)?;
+        validate_slug(repository)?;
+        validate_username(actor)?;
+        validate_description(description)?;
+        let mut store = Store::open(&self.database)?;
+        store.update_repository_settings(
+            owner,
+            repository,
+            actor,
+            description,
+            visibility,
+            timestamp()?,
+            &random_id()?,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn update_collaborator(
+        &self,
+        owner: &str,
+        repository: &str,
+        actor: &str,
+        username: &str,
+        role: Option<&str>,
+    ) -> Result<(), RepositoryServiceError> {
+        validate_username(owner)?;
+        validate_slug(repository)?;
+        validate_username(actor)?;
+        validate_username(username)?;
+        let mut store = Store::open(&self.database)?;
+        store.update_repository_collaborator(
+            owner,
+            repository,
+            actor,
+            username,
+            role,
+            timestamp()?,
+            &random_id()?,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn archive_for_actor(
+        &self,
+        owner: &str,
+        repository: &str,
+        actor: &str,
+    ) -> Result<(), RepositoryServiceError> {
+        validate_username(owner)?;
+        validate_slug(repository)?;
+        validate_username(actor)?;
+        Store::open(&self.database)?.archive_repository_for_actor(
+            owner,
+            repository,
+            actor,
+            timestamp()?,
+            &random_id()?,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn rename_for_owner(
+        &self,
+        owner: &str,
+        repository: &str,
+        new_name: &str,
+        actor: &str,
+    ) -> Result<(), RepositoryServiceError> {
+        validate_username(owner)?;
+        validate_slug(repository)?;
+        validate_slug(new_name)?;
+        validate_username(actor)?;
+        Store::open(&self.database)?.rename_repository_for_owner(
+            owner,
+            repository,
+            new_name,
+            actor,
+            timestamp()?,
+            &random_id()?,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn unarchive_for_owner(
+        &self,
+        owner: &str,
+        repository: &str,
+        actor: &str,
+    ) -> Result<(), RepositoryServiceError> {
+        validate_username(owner)?;
+        validate_slug(repository)?;
+        validate_username(actor)?;
+        Store::open(&self.database)?.unarchive_repository_for_owner(
+            owner,
+            repository,
+            actor,
+            timestamp()?,
+            &random_id()?,
+        )?;
+        Ok(())
     }
 
     pub(crate) fn create_for_administrator(
@@ -156,6 +332,7 @@ impl RepositoryService {
             owner,
             slug,
             object_format: object_format_name,
+            default_branch: "refs/heads/main",
             created_at,
             origin: RepositoryOrigin::Created,
             initial_references: &[],
@@ -193,6 +370,17 @@ fn timestamp() -> Result<i64, RepositoryServiceError> {
         .as_secs()
         .try_into()
         .map_err(|_| RepositoryServiceError::Clock)
+}
+
+fn validate_description(description: &str) -> Result<(), RepositoryServiceError> {
+    if description.len() > MAX_DESCRIPTION_BYTES
+        || description
+            .chars()
+            .any(|character| character.is_control() && character != '\n')
+    {
+        return Err(RepositoryServiceError::Description);
+    }
+    Ok(())
 }
 
 fn object_format_name(kind: Kind) -> Result<&'static str, RepositoryServiceError> {
@@ -238,6 +426,8 @@ pub(crate) enum RepositoryServiceError {
     PathEscape(PathBuf),
     #[error("random repository ID collision")]
     IdentifierCollision,
+    #[error("repository description is not valid")]
+    Description,
     #[error("cannot create a random repository ID")]
     Random,
     #[error("system clock is before the Unix epoch")]

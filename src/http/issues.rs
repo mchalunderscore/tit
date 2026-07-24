@@ -1,7 +1,7 @@
 use askama::Template;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Extension, Path, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -38,14 +38,6 @@ pub(super) fn routes() -> Router<WebState> {
             "/{owner}/{repository}/issues/{number}/state",
             post(change_state),
         )
-        .route(
-            "/{owner}/{repository}/issues/{number}/labels",
-            post(change_label),
-        )
-        .route(
-            "/{owner}/{repository}/issues/{number}/assignees",
-            post(change_assignee),
-        )
         .layer(DefaultBodyLimit::max(MAX_ISSUE_REQUEST_BYTES))
 }
 
@@ -54,6 +46,7 @@ async fn issue_list(
     Extension(request_id): Extension<RequestId>,
     Extension(actor): Extension<RequestActor>,
     Path(path): Path<RepositoryPath>,
+    Query(query): Query<ListQuery>,
     headers: HeaderMap,
 ) -> Response {
     let Some(service) = state.issues.clone() else {
@@ -67,12 +60,21 @@ async fn issue_list(
     let owner = path.owner.clone();
     let repository = path.repository.clone();
     let authenticated = actor.0.is_some();
+    let state_filter = query.state.unwrap_or_else(|| "open".to_owned());
+    let page_number = query.page.unwrap_or(1);
+    let state_for_job = state_filter.clone();
     let result = issue_job(state, move || {
-        service.list(&owner, &repository, actor.0.as_deref())
+        service.list_page(
+            &owner,
+            &repository,
+            actor.0.as_deref(),
+            &state_for_job,
+            page_number,
+        )
     })
     .await;
     match result {
-        Ok((record, issues)) => {
+        Ok((record, page)) => {
             let csrf = cookie(&headers, CSRF_COOKIE).unwrap_or_default();
             render(
                 StatusCode::OK,
@@ -81,7 +83,8 @@ async fn issue_list(
                     signed_in: authenticated,
                     owner: &record.owner,
                     repository: &record.slug,
-                    issues: issues
+                    issues: page
+                        .items
                         .iter()
                         .map(|issue| IssueListItem {
                             number: issue.number,
@@ -93,6 +96,14 @@ async fn issue_list(
                         .collect(),
                     csrf: &csrf,
                     can_create: authenticated && !csrf.is_empty(),
+                    state: &state_filter,
+                    state_all: state_filter == "all",
+                    state_open: state_filter == "open",
+                    state_closed: state_filter == "closed",
+                    has_previous: page.page > 1,
+                    has_next: page.has_next,
+                    previous_page: page.page.saturating_sub(1),
+                    next_page: page.page.saturating_add(1),
                 },
             )
         }
@@ -105,6 +116,7 @@ async fn issue_detail(
     Extension(request_id): Extension<RequestId>,
     Extension(actor): Extension<RequestActor>,
     Path(path): Path<IssuePath>,
+    Query(query): Query<ActivityQuery>,
     headers: HeaderMap,
 ) -> Response {
     let Some(service) = state.issues.clone() else {
@@ -118,8 +130,17 @@ async fn issue_detail(
     let owner = path.owner.clone();
     let repository = path.repository.clone();
     let number = path.number;
+    let comments_page = query.comments_page.unwrap_or(1);
+    let timeline_page = query.timeline_page.unwrap_or(1);
     let result = issue_job(state, move || {
-        service.get(&owner, &repository, number, actor.0.as_deref())
+        service.get_page(
+            &owner,
+            &repository,
+            number,
+            actor.0.as_deref(),
+            comments_page,
+            timeline_page,
+        )
     })
     .await;
     match result {
@@ -246,72 +267,6 @@ async fn change_state(
     .await
 }
 
-async fn change_label(
-    State(state): State<WebState>,
-    Extension(request_id): Extension<RequestId>,
-    Path(path): Path<IssuePath>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let fields = match parse_named_form(&headers, &body, &["csrf", "label", "operation"]) {
-        Ok(fields) => fields,
-        Err(()) => return issue_bad_request(&request_id.0),
-    };
-    let present = match operation(&fields[2]) {
-        Ok(present) => present,
-        Err(()) => return issue_bad_request(&request_id.0),
-    };
-    let actor =
-        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
-            Ok(actor) => actor,
-            Err(response) => return response,
-        };
-    mutate(state, request_id, path, move |service, path| {
-        service.set_label(
-            &path.owner,
-            &path.repository,
-            path.number,
-            &actor,
-            &fields[1],
-            present,
-        )
-    })
-    .await
-}
-
-async fn change_assignee(
-    State(state): State<WebState>,
-    Extension(request_id): Extension<RequestId>,
-    Path(path): Path<IssuePath>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let fields = match parse_named_form(&headers, &body, &["csrf", "assignee", "operation"]) {
-        Ok(fields) => fields,
-        Err(()) => return issue_bad_request(&request_id.0),
-    };
-    let present = match operation(&fields[2]) {
-        Ok(present) => present,
-        Err(()) => return issue_bad_request(&request_id.0),
-    };
-    let actor =
-        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
-            Ok(actor) => actor,
-            Err(response) => return response,
-        };
-    mutate(state, request_id, path, move |service, path| {
-        service.set_assignee(
-            &path.owner,
-            &path.repository,
-            path.number,
-            &actor,
-            &fields[1],
-            present,
-        )
-    })
-    .await
-}
-
 async fn mutate(
     state: WebState,
     request_id: RequestId,
@@ -348,14 +303,6 @@ async fn issue_job<T: Send + 'static>(
     .map_err(|_| IssueError::Store(StoreError::Integrity("issue worker failed".to_owned())))?
 }
 
-fn operation(value: &str) -> Result<bool, ()> {
-    match value {
-        "add" => Ok(true),
-        "remove" => Ok(false),
-        _ => Err(()),
-    }
-}
-
 fn render_issue(request_id: &str, headers: &HeaderMap, detail: &IssueDetail) -> Response {
     let csrf = cookie(headers, CSRF_COOKIE).unwrap_or_default();
     render(
@@ -373,8 +320,6 @@ fn render_issue(request_id: &str, headers: &HeaderMap, detail: &IssueDetail) -> 
             author: &detail.issue.author,
             created_at: detail.issue.created_at,
             updated_at: detail.issue.updated_at,
-            labels: &detail.labels,
-            assignees: &detail.assignees,
             comments: detail
                 .comments
                 .iter()
@@ -398,8 +343,17 @@ fn render_issue(request_id: &str, headers: &HeaderMap, detail: &IssueDetail) -> 
             csrf: &csrf,
             can_comment: detail.can_comment && !csrf.is_empty(),
             can_edit: detail.can_edit && !csrf.is_empty(),
-            can_maintain: detail.can_maintain && !csrf.is_empty(),
             is_open: detail.issue.state == "open",
+            comments_page: detail.comments_page,
+            comments_has_previous: detail.comments_page > 1,
+            comments_has_next: detail.comments_has_next,
+            comments_previous_page: detail.comments_page.saturating_sub(1),
+            comments_next_page: detail.comments_page.saturating_add(1),
+            timeline_page: detail.timeline_page,
+            timeline_has_previous: detail.timeline_page > 1,
+            timeline_has_next: detail.timeline_has_next,
+            timeline_previous_page: detail.timeline_page.saturating_sub(1),
+            timeline_next_page: detail.timeline_page.saturating_add(1),
         },
     )
 }
@@ -420,6 +374,7 @@ fn issue_read_error(error: IssueError, request_id: &str) -> Response {
             "Not found",
             "The issue was not found.",
         ),
+        IssueError::State => issue_bad_request(request_id),
         _ => issue_internal(request_id),
     }
 }
@@ -431,19 +386,14 @@ fn issue_mutation_error(error: IssueError, request_id: &str) -> Response {
         | IssueError::Number
         | IssueError::Title
         | IssueError::Body
-        | IssueError::State
-        | IssueError::Label => issue_bad_request(request_id),
+        | IssueError::State => issue_bad_request(request_id),
         IssueError::Store(StoreError::IssueDenied) => render_error(
             StatusCode::FORBIDDEN,
             request_id,
             "Forbidden",
             "The issue change is not authorized.",
         ),
-        IssueError::Store(
-            StoreError::IssueState(_)
-            | StoreError::IssueLabelState
-            | StoreError::IssueAssigneeState,
-        ) => render_error(
+        IssueError::Store(StoreError::IssueState(_)) => render_error(
             StatusCode::CONFLICT,
             request_id,
             "Issue conflict",
@@ -452,7 +402,6 @@ fn issue_mutation_error(error: IssueError, request_id: &str) -> Response {
         IssueError::Store(
             StoreError::RepositoryNotFound(_, _)
             | StoreError::IssueNotFound(_, _, _)
-            | StoreError::IssueAssigneeNotFound(_)
             | StoreError::IssueHidden,
         ) => render_error(
             StatusCode::NOT_FOUND,
@@ -507,6 +456,18 @@ struct IssuePath {
     number: i64,
 }
 
+#[derive(Default, Deserialize)]
+struct ListQuery {
+    state: Option<String>,
+    page: Option<usize>,
+}
+
+#[derive(Default, Deserialize)]
+struct ActivityQuery {
+    comments_page: Option<usize>,
+    timeline_page: Option<usize>,
+}
+
 #[derive(Template)]
 #[template(path = "issues.html")]
 struct IssueListTemplate<'a> {
@@ -517,6 +478,14 @@ struct IssueListTemplate<'a> {
     issues: Vec<IssueListItem<'a>>,
     csrf: &'a str,
     can_create: bool,
+    state: &'a str,
+    state_all: bool,
+    state_open: bool,
+    state_closed: bool,
+    has_previous: bool,
+    has_next: bool,
+    previous_page: usize,
+    next_page: usize,
 }
 
 struct IssueListItem<'a> {
@@ -542,15 +511,22 @@ struct IssueTemplate<'a> {
     author: &'a str,
     created_at: i64,
     updated_at: i64,
-    labels: &'a [String],
-    assignees: &'a [String],
     comments: Vec<CommentView<'a>>,
     timeline: Vec<TimelineView<'a>>,
     csrf: &'a str,
     can_comment: bool,
     can_edit: bool,
-    can_maintain: bool,
     is_open: bool,
+    comments_page: usize,
+    comments_has_previous: bool,
+    comments_has_next: bool,
+    comments_previous_page: usize,
+    comments_next_page: usize,
+    timeline_page: usize,
+    timeline_has_previous: bool,
+    timeline_has_next: bool,
+    timeline_previous_page: usize,
+    timeline_next_page: usize,
 }
 
 struct CommentView<'a> {

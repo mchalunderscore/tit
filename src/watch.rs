@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::auth::{AuthError, validate_username};
 use crate::domain::repository::{RepositoryNameError, validate_slug};
-use crate::store::{RepositoryRecord, Store, StoreError, WatchPreferences, WatchRecord};
+use crate::store::{RepositoryRecord, Store, StoreError, WatchRecord};
 
 #[derive(Clone)]
 pub(crate) struct WatchService {
@@ -40,11 +40,11 @@ impl WatchService {
         owner: &str,
         repository: &str,
         actor: &str,
-        preferences: WatchPreferences,
+        watching: bool,
     ) -> Result<Option<WatchRecord>, WatchError> {
         validate(owner, repository, actor)?;
         Store::open(&self.database)?
-            .set_watch(owner, repository, actor, preferences, timestamp()?)
+            .set_watch(owner, repository, actor, watching, timestamp()?)
             .map_err(Into::into)
     }
 }

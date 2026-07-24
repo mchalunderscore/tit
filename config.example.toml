@@ -15,6 +15,3 @@ policy = "invite"
 [limits]
 max_request_bytes = 1048576
 max_connections = 1024
-
-[proxy]
-trusted_addresses = []

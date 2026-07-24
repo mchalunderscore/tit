@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gix::hash::{Kind, ObjectId};
 use gix::objs::{Commit, Data, Kind as ObjectKind, tree::EntryKind};
@@ -132,6 +134,34 @@ impl GitRepository {
         Ok(references)
     }
 
+    pub(crate) fn default_branch(&self) -> Result<Option<String>, GitRepositoryError> {
+        let name = self
+            .repository
+            .head_name()
+            .map_err(|error| GitRepositoryError::References(error.to_string()))?;
+        Ok(name
+            .filter(|name| name.as_bstr().starts_with(b"refs/heads/"))
+            .and_then(|name| std::str::from_utf8(name.as_bstr()).ok().map(str::to_owned)))
+    }
+
+    pub(crate) fn set_default_branch(&self, name: &str) -> Result<(), GitRepositoryError> {
+        self.resolve_branch(name)?;
+        let target = FullName::try_from(gix::bstr::BString::from(name.as_bytes()))
+            .map_err(|_| GitRepositoryError::InvalidBranch)?;
+        self.repository
+            .edit_reference(RefEdit {
+                change: Change::Update {
+                    log: Default::default(),
+                    expected: PreviousValue::Any,
+                    new: Target::Symbolic(target),
+                },
+                name: "HEAD".try_into().expect("HEAD is a valid reference name"),
+                deref: false,
+            })
+            .map_err(|error| GitRepositoryError::References(error.to_string()))?;
+        Ok(())
+    }
+
     pub(crate) fn resolve_branch(&self, name: &str) -> Result<ObjectId, GitRepositoryError> {
         if !name.starts_with("refs/heads/") || name.len() > 1024 {
             return Err(GitRepositoryError::InvalidBranch);
@@ -235,6 +265,18 @@ impl GitRepository {
         wants: &[ObjectId],
         haves: &[ObjectId],
     ) -> Result<Vec<u8>, GitRepositoryError> {
+        let mut output = Vec::new();
+        self.write_pack(wants, haves, &mut output, &AtomicBool::new(false))?;
+        Ok(output)
+    }
+
+    pub(crate) fn write_pack(
+        &self,
+        wants: &[ObjectId],
+        haves: &[ObjectId],
+        output: impl Write,
+        cancelled: &AtomicBool,
+    ) -> Result<(), GitRepositoryError> {
         if wants.iter().any(|want| want.kind() != self.object_format())
             || haves.iter().any(|have| have.kind() != self.object_format())
         {
@@ -249,9 +291,10 @@ impl GitRepository {
         if wants.is_empty() || wants.iter().any(|want| !advertised.contains(want)) {
             return Err(GitRepositoryError::UnadvertisedWant);
         }
-        let excluded = self.walk_reachable(haves, true)?;
+        let permitted_missing_roots = haves.iter().copied().collect::<HashSet<_>>();
+        let excluded = self.walk_reachable(haves, Some(&permitted_missing_roots), cancelled)?;
         let mut objects: Vec<_> = self
-            .walk_reachable(wants, false)?
+            .walk_reachable(wants, None, cancelled)?
             .into_iter()
             .filter(|id| !excluded.contains(id))
             .collect();
@@ -259,30 +302,18 @@ impl GitRepository {
 
         let object_count =
             u32::try_from(objects.len()).map_err(|_| GitRepositoryError::ObjectLimit)?;
-        let mut entries = Vec::with_capacity(objects.len());
         let mut total_object_bytes = 0_usize;
-        for id in objects {
-            let object = self.find_object(id)?;
-            total_object_bytes = total_object_bytes
-                .checked_add(object.data.len())
-                .ok_or(GitRepositoryError::ObjectLimit)?;
-            if object.data.len() > MAX_OBJECT_BYTES || total_object_bytes > MAX_PACK_BYTES {
-                return Err(GitRepositoryError::ObjectLimit);
+        let chunks = objects.into_iter().map(|id| {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other("pack generation was cancelled"));
             }
-            let count = Count::from_data(id, None);
-            let data = Data::new(&object.data, object.kind, self.object_format());
-            entries.push(
-                Entry::from_data(&count, &data)
-                    .map_err(|error| GitRepositoryError::Pack(error.to_string()))?,
-            );
-        }
-
-        let chunks = entries
-            .into_iter()
-            .map(|entry| Ok::<_, std::io::Error>(vec![entry]));
+            self.pack_entry(id, &mut total_object_bytes)
+                .map(|entry| vec![entry])
+                .map_err(std::io::Error::other)
+        });
         let mut writer = FromEntriesIter::new(
             chunks,
-            Vec::new(),
+            CountingWriter::new(output, MAX_PACK_BYTES),
             object_count,
             Version::V2,
             self.object_format(),
@@ -290,11 +321,27 @@ impl GitRepository {
         for result in writer.by_ref() {
             result.map_err(|error| GitRepositoryError::Pack(error.to_string()))?;
         }
-        let pack = writer.into_write();
-        if pack.len() > MAX_PACK_BYTES {
-            return Err(GitRepositoryError::PackLimit);
+        writer
+            .into_write()
+            .finish()
+            .map_err(|error| GitRepositoryError::Pack(error.to_string()))
+    }
+
+    fn pack_entry(
+        &self,
+        id: ObjectId,
+        total_object_bytes: &mut usize,
+    ) -> Result<Entry, GitRepositoryError> {
+        let object = self.find_object(id)?;
+        *total_object_bytes = total_object_bytes
+            .checked_add(object.data.len())
+            .ok_or(GitRepositoryError::ObjectLimit)?;
+        if object.data.len() > MAX_OBJECT_BYTES || *total_object_bytes > MAX_PACK_BYTES {
+            return Err(GitRepositoryError::ObjectLimit);
         }
-        Ok(pack)
+        let count = Count::from_data(id, None);
+        let data = Data::new(&object.data, object.kind, self.object_format());
+        Entry::from_data(&count, &data).map_err(|error| GitRepositoryError::Pack(error.to_string()))
     }
 
     pub(crate) fn integrity_check(&self) -> Result<(), GitRepositoryError> {
@@ -304,18 +351,22 @@ impl GitRepository {
             .flat_map(|reference| [Some(reference.target), reference.peeled])
             .flatten()
             .collect();
-        self.walk_reachable(&roots, false)?;
+        self.walk_reachable(&roots, None, &AtomicBool::new(false))?;
         Ok(())
     }
 
     fn walk_reachable(
         &self,
         roots: &[ObjectId],
-        permit_missing_roots: bool,
+        permitted_missing_roots: Option<&HashSet<ObjectId>>,
+        cancelled: &AtomicBool,
     ) -> Result<HashSet<ObjectId>, GitRepositoryError> {
         let mut seen = HashSet::new();
         let mut pending = roots.to_vec();
         while let Some(id) = pending.pop() {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(GitRepositoryError::Cancelled);
+            }
             if !seen.insert(id) {
                 continue;
             }
@@ -324,7 +375,10 @@ impl GitRepository {
             }
             let object = match self.repository.try_find_object(id) {
                 Ok(Some(object)) => object,
-                Ok(None) if permit_missing_roots && roots.contains(&id) => {
+                Ok(None)
+                    if permitted_missing_roots
+                        .is_some_and(|missing_roots| missing_roots.contains(&id)) =>
+                {
                     seen.remove(&id);
                     continue;
                 }
@@ -397,6 +451,47 @@ impl GitRepository {
             });
         }
         Ok(id)
+    }
+}
+
+struct CountingWriter<W> {
+    inner: W,
+    written: usize,
+    limit: usize,
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W, limit: usize) -> Self {
+        Self {
+            inner,
+            written: 0,
+            limit,
+        }
+    }
+}
+
+impl<W: Write> CountingWriter<W> {
+    fn finish(mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let total = self
+            .written
+            .checked_add(data.len())
+            .ok_or_else(|| std::io::Error::other("pack byte limit exceeded"))?;
+        if total > self.limit {
+            return Err(std::io::Error::other("pack byte limit exceeded"));
+        }
+        self.inner.write_all(data)?;
+        self.written = total;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -499,6 +594,8 @@ pub(crate) enum GitRepositoryError {
     ObjectLimit,
     #[error("generated Git pack exceeds the limit")]
     PackLimit,
+    #[error("Git pack generation was cancelled")]
+    Cancelled,
     #[error("cannot generate Git pack: {0}")]
     Pack(String),
 }

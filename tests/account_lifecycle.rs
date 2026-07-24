@@ -47,6 +47,24 @@ fn invitation_signup_key_and_recovery_lifecycle_is_atomic() {
     let recovery = accounts
         .signup(&invitation, "alice", &first_key, "test")
         .expect("create the account");
+    accounts
+        .update_profile(
+            "alice",
+            "A small profile.\nSecond line.",
+            "alice@example.test",
+        )
+        .expect("update the public profile");
+    let profile = accounts.profile("alice").expect("read the public profile");
+    assert_eq!(profile.bio, "A small profile.\nSecond line.");
+    assert_eq!(profile.contact_email, "alice@example.test");
+    assert!(matches!(
+        accounts.update_profile("alice", "profile", "not-an-email"),
+        Err(AccountError::InvalidProfile)
+    ));
+    Store::open(&database)
+        .expect("open the account database")
+        .create_feed_token("alice", &[7; 32], 1)
+        .expect("create a feed token");
     assert!(recovery.starts_with("tit-recovery-v1:"));
     assert!(matches!(
         accounts.signup(&invitation, "bob", &second_key, "test"),
@@ -87,6 +105,11 @@ fn invitation_signup_key_and_recovery_lifecycle_is_atomic() {
     let replacement = accounts
         .recover("alice", &recovery, &third_key, "test")
         .expect("recover the account");
+    assert_eq!(
+        active_feed_tokens(&database, "alice"),
+        0,
+        "recovery must revoke active feed tokens"
+    );
     assert!(matches!(
         accounts.recover("alice", &recovery, &first_key, "test"),
         Err(AccountError::Store(StoreError::InvalidRecovery))
@@ -141,6 +164,10 @@ fn failed_signup_preserves_the_invitation_and_username_reservation() {
     accounts
         .signup(&first, "alice", &public_key(), "test")
         .expect("create the first account");
+    Store::open(&database)
+        .expect("open the account database")
+        .create_feed_token("alice", &[8; 32], 1)
+        .expect("create a feed token");
 
     let second = accounts.issue_invitation().expect("issue an invitation");
     assert!(matches!(
@@ -153,6 +180,11 @@ fn failed_signup_preserves_the_invitation_and_username_reservation() {
     accounts
         .suspend("alice", true, "admin-cli", "test")
         .expect("suspend the account");
+    assert_eq!(
+        active_feed_tokens(&database, "alice"),
+        0,
+        "suspension must revoke active feed tokens"
+    );
     assert_eq!(
         Store::open(&database)
             .expect("open the account database")
@@ -182,6 +214,21 @@ fn failed_signup_preserves_the_invitation_and_username_reservation() {
         .expect("read the invitation")
         .flatten();
     assert_eq!(consumed, None);
+}
+
+fn active_feed_tokens(database: &std::path::Path, username: &str) -> i64 {
+    Store::open(database)
+        .expect("open the account database")
+        .connection()
+        .query_row(
+            "SELECT count(*)
+             FROM feed_token
+             JOIN account ON account.id = feed_token.account_id
+             WHERE account.username = ?1 AND feed_token.revoked_at IS NULL",
+            [username],
+            |row| row.get(0),
+        )
+        .expect("count active feed tokens")
 }
 
 #[test]

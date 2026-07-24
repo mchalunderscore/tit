@@ -1,691 +1,278 @@
 # tit
 
-`tit` is a small, self-hosted collaborative development environment (CDE) for
-Git. The current implementation has a read-only Web UI, HTTP and SSH clone
-services, authenticated SSH push, public feeds, and bounded source search.
+`tit` is a small, self-hosted collaborative development environment for Git.
+One executable provides:
 
-Read [PLAN.md](PLAN.md) for the product design and implementation gates. Read
-[CONTRIBUTING.md](CONTRIBUTING.md) before you change code.
+- a server-rendered Web UI;
+- public HTTP clone and authenticated SSH clone and push;
+- accounts that use SSH keys;
+- repositories, issues, pull requests, reviews, and a protected default branch;
+- repository and issue RSS feeds;
+- repository name and source search;
+- public user profiles;
+- backup, restore, diagnostics, audit, and repair commands.
 
-For a release installation, use the [installation procedure](docs/install.md).
-Also keep the [upgrade procedure](docs/upgrade.md) and the
-[disaster-recovery exercise](docs/disaster-recovery.md) with the instance
-operations documentation.
+The server does not require Git, OpenSSH, JavaScript, or an external database
+at run time. SQLite stores application data. Bare repository directories store
+Git objects and refs.
 
 ## Build
 
-Install the Rust toolchain that `rust-toolchain.toml` specifies. Then, run:
+Install the Rust toolchain that `rust-toolchain.toml` specifies. Build the
+release executable:
 
 ```text
-cargo build --locked
+cargo build --locked --release
 ```
 
-## Run
+The executable is `target/release/tit`.
 
-Create the first administrator and import a bare repository before you start
-the server:
+## Configure
+
+Create a private instance directory and copy the example configuration:
+
+```text
+install -d -m 700 /srv/tit
+install -m 600 config.example.toml /srv/tit/config.toml
+```
+
+Set `public_url`, the HTTP listener, and the SSH listener and advertised
+hostname in `/srv/tit/config.toml`. Use HTTPS for a public instance. The
+included files in `release/examples/` contain service definitions and a Caddy
+example for Linux, macOS, FreeBSD, OpenBSD, and NetBSD.
+
+Create the first administrator:
 
 ```text
 tit --config /srv/tit/config.toml setup admin alice "SSH_PUBLIC_KEY"
-tit --config /srv/tit/config.toml admin repository import alice example /absolute/path/example.git
+```
+
+The command prints one recovery credential. Store it offline.
+
+Start the HTTP and SSH servers:
+
+```text
 tit --config /srv/tit/config.toml serve
 ```
 
-The `serve` command starts the HTTP and SSH listeners in one process. It creates
-`ssh_host_ed25519_key` with mode 600 during the first start and uses the same
-host key during subsequent starts. Keep this file with the instance data.
+The server creates and preserves an Ed25519 SSH host key in the instance
+directory. It holds an instance lock until shutdown. Send SIGINT or SIGTERM for
+a controlled shutdown.
 
-The server owns the instance lock until it receives SIGINT or SIGTERM. It does
-not put a process ID in the lock file. Stop the server before you run an offline
-administrator command.
+Use `GET /healthz` as a readiness check. Use `GET /metrics` for the fixed,
+unlabelled process counters.
 
-Use `GET /healthz` or `HEAD /healthz` as the readiness probe. The endpoint
-returns status 200 only after the HTTP and SSH listeners are ready. During
-shutdown, the server gives active connections 10 seconds to finish. It then
-cancels unfinished connections.
+## Accounts and login
 
-Create a signup code through the control socket while the server runs:
+Create a one-time signup code while the server runs:
 
 ```text
 tit --config /srv/tit/config.toml invite-code
 ```
 
-The code is valid for one signup during the next 24 hours. Open `/signup` to
-create the account. Store the recovery credential offline when the Web UI shows
-it. Open `/recover` to replace all account keys with a new key.
+Open `/signup` and submit the code with an SSH public key. The Web UI displays
+the new recovery credential one time.
 
-Stop the server before you change repository access with an offline
-administrator command:
+Web login uses SSH approval. Start login in the browser, then run the displayed
+`auth` SSH command. The fallback flow signs a short-lived challenge with
+`ssh-keygen -Y sign`. Account recovery replaces the account keys, revokes
+sessions and feed tokens, and issues a new recovery credential.
 
-```text
-tit --config /srv/tit/config.toml admin repository visibility alice example private
-tit --config /srv/tit/config.toml admin repository collaborator-set alice example bob writer
-tit --config /srv/tit/config.toml admin repository collaborator-remove alice example bob
-```
+Each account has a public `/<username>` profile. The account can publish a
+plain-text bio and contact email. The profile lists only public repositories.
+The account page lists active and revoked SSH keys. A fresh SSH `auth`
+approval is required to add or revoke a key.
 
-The policy permits a reader to read and a writer to write. It permits a
-maintainer to change repository settings and collaborators. Only the owner can
-change ownership. An owner or collaborator can read a private repository in the
-Web UI after login. The built-in SSH server binds the supplied key to its
-account. The SSH username does not select the account. An owner, maintainer, or
-writer can push branches and tags. A reader cannot push. HTTP Git access stays
-read-only.
+## Repositories
 
-The `[limits]` configuration sets the maximum HTTP request size and the maximum
-concurrent HTTP requests and SSH sessions. The default values are 1 MiB and
-1024. A route can use a smaller request limit. Each HTTP request has a
-30-second time limit. An HTTP request can wait for one second for a concurrency
-permit.
-
-The server permits 10 Web login attempts per client address in one minute. It
-permits 30 SSH authentication attempts per client address in one minute. It
-keeps attempt state for a maximum of 4096 client addresses. SSH also permits a
-maximum of three public-key authentication attempts on one connection and
-closes an inactive connection after 30 seconds.
-
-Git reads have byte, object-count, entry-count, and 30-second limits. Git
-receive-pack has byte, object-count, delta-depth, and processing-time limits.
-Markdown rendering accepts a maximum of 256 KiB of source and 1 MiB of rendered
-HTML. The Web UI shows a limit message instead of content that exceeds a
-Markdown limit.
-
-Stop the server and show the newest audit events with this command:
+An authenticated account can create a repository through SSH:
 
 ```text
-tit --config /srv/tit/config.toml admin audit --limit 100
+ssh -p 2222 tit.example repo create project
 ```
 
-Each event shows its action, actor, target, outcome, time, and correlation ID.
-The history does not store recovery credentials, login challenges, signatures,
-session tokens, or SSH private keys.
+List all SSH commands:
+
+```text
+ssh -p 2222 tit.example help
+```
+
+An invalid SSH command returns a nonzero status and directs the user to
+`help`.
+
+Clone a public repository through HTTP or SSH:
+
+```text
+git clone https://tit.example/alice/project.git
+git clone ssh://tit@tit.example:2222/alice/project.git
+```
+
+HTTP Git access is read-only. SSH permits repository readers to clone and
+writers, maintainers, and owners to push. The SSH login name does not select
+the account; the SSH key does.
+
+An administrator can import an existing bare repository while the server is
+stopped:
+
+```text
+tit --config /srv/tit/config.toml admin repository import \
+  alice project /absolute/path/project.git
+```
+
+Owners and maintainers can change a repository description, visibility, and
+collaborators on the repository settings page. They can select an existing
+branch as the default branch and archive the repository. The owner can rename
+or unarchive the repository. A rename does not move the bare repository
+directory.
+
+The ref policy is fixed. `tit` rejects force updates, prevents deletion of the
+default branch, and permits only owners and maintainers to update it.
+
+Use the offline administrator commands to import or rename repositories and
+to administer accounts. Run the applicable command with `--help` for its exact
+arguments:
+
+```text
+tit admin repository --help
+tit admin account --help
+```
+
+## Web UI
+
+Anonymous users can browse recently updated public repositories and public
+profiles. Authenticated users get an account overview and their repositories.
+
+A repository page provides refs, commits, trees, blobs, blame, archives,
+source search, issues, pull requests, watch state, and RSS. The recent commit
+list shows ten commits and links to the complete commit view. Forms and
+navigation operate without JavaScript.
+
+Issue and pull-request comments use bounded Markdown. Raw HTML and unsafe links
+do not render.
+
+Authenticated accounts can open `/activity` to see recent events from watched
+repositories. A commit page can download a `.patch` file. Each pull-request
+revision has an immutable `.patch` download. These files work with
+`git apply`.
+
+The SSH interface can list and create issues and pull requests. It can also
+comment on, close, and reopen issues, and close and reopen pull requests.
+Commands support human output and versioned JSON output. Run
+`ssh -p 2222 tit.example help` for the exact syntax.
 
 ## Backup and restore
 
-For an offline backup, stop the server and run:
+Create a backup while the server is stopped or active:
 
 ```text
-tit --config /srv/tit/config.toml backup /var/backups/tit-2026-07-23.tar
+tit --config /srv/tit/config.toml backup /var/backups/tit-backup.tar
 ```
 
-For an online backup, leave the server active and run the same command. The CLI
-sends the request through the private control socket. The server pauses Git
-ref mutations while it makes the SQLite backup and copies the repositories,
-configuration, and SSH host key.
+An online backup uses the private control socket and pauses Git ref mutations
+while it copies consistent state. A backup contains credentials. Store it as a
+secret.
 
-The output file must be an absolute path outside `/srv/tit`. The command creates
-a new mode-0600 file and does not replace an existing file. The backup contains
-credentials. Store it as a secret.
-
-Restore always uses a different, empty instance directory:
+Restore to a new, empty instance directory:
 
 ```text
 install -d -m 700 /srv/tit-restored
-tit restore /var/backups/tit-2026-07-23.tar /srv/tit-restored
+tit restore /var/backups/tit-backup.tar /srv/tit-restored
 tit --config /srv/tit-restored/config.toml doctor
 ```
 
-Restore checks the manifest, all checksums, the database, and all repositories.
-It does not activate the restored instance. To activate it, stop the old server
-and explicitly start `tit --config /srv/tit-restored/config.toml serve`.
+Restore does not activate the new instance. Stop the old server before you
+start the restored instance.
 
-## Diagnostics and repair
+## Diagnostics
 
-Run the read-only instance checks with:
+Check an instance without changing it:
 
 ```text
 tit --config /srv/tit/config.toml doctor
+tit --config /srv/tit/config.toml doctor \
+  --backup /var/backups/tit-backup.tar
 ```
 
-Also check one or more backup archives with:
+Inspect records or write deterministic JSON Lines:
 
 ```text
-tit --config /srv/tit/config.toml doctor --backup /var/backups/tit-2026-07-23.tar
+tit --config /srv/tit/config.toml inspect account alice
+tit --config /srv/tit/config.toml inspect repository alice project
+tit --config /srv/tit/config.toml dump >tit-dump.jsonl
 ```
 
-Doctor checks configuration, private permissions, the schema, record
-relations, indexes, incomplete intents, Git refs and reachable objects,
-quarantine debris, the SSH host key, and each supplied backup. It does not
-change the instance.
+The dump can contain credential and token hashes. Store it as a secret.
 
-Use the separate repair commands only after you review the doctor error:
+Run a repair command only after `doctor` reports the applicable problem and
+only while the server is stopped:
 
 ```text
 tit --config /srv/tit/config.toml repair intents
 tit --config /srv/tit/config.toml repair quarantine
 ```
 
-Stop the server before repair. Intent repair uses the normal recovery rules.
-Quarantine repair refuses to run while an incomplete intent exists.
-
-Inspect one typed record as JSON:
-
-```text
-tit --config /srv/tit/config.toml inspect account alice
-tit --config /srv/tit/config.toml inspect repository alice example
-tit --config /srv/tit/config.toml inspect intent 0123456789abcdef0123456789abcdef
-```
-
-Write all SQLite rows as deterministic JSON Lines:
+Run maintenance while the server is stopped. This command removes expired or
+revoked workflow records and old audit events, then compacts SQLite. The
+default retention period is 365 days:
 
 ```text
-tit --config /srv/tit/config.toml dump >tit-dump.jsonl
+tit --config /srv/tit/config.toml maintenance
+tit --config /srv/tit/config.toml maintenance --retention-days 90
 ```
 
-The dump can contain credential hashes, session hashes, token hashes, and SSH
-public keys. Store it as a secret. The dump is for inspection and comparison;
-it is not a restore format.
+## Upgrade
 
-## Observability
+Make and verify a backup before an upgrade. Stop the server, replace the
+executable, and start the server. `tit` applies forward-only SQLite migrations
+during startup. Run `doctor` after startup.
 
-The `serve` command writes one JSON object per line to standard error. HTTP
-request events contain a request ID, method, status, and duration. SSH
-connection, authentication, and command events contain an operation ID. Server
-lifecycle events record start, readiness, and shutdown.
+To go back to an older version, restore the pre-upgrade backup into a new
+instance directory. Do not run an older executable against a newer database.
 
-Logs do not contain URLs, request headers, request bodies, public keys, or
-client addresses. Thus, they do not contain authorization headers, cookies,
-feed tokens, recovery credentials, login challenges, raw signatures, or SSH
-private keys. Audit history continues to record durable security and mutation
-events in SQLite.
+## Release packages
 
-`GET /metrics` returns six fixed process counters as plain text. The counters
-cover HTTP requests, HTTP errors, active HTTP requests, SSH connections,
-rejected SSH authentication, and SSH operations. The endpoint has no labels
-and does not contain repository, account, path, or client data.
-
-An authenticated account can create a repository with SSH:
+Build a release archive for the current host:
 
 ```text
-ssh -p 2222 tit.example repo create project
+cargo build --locked --release
+./scripts/package-release target/release/tit dist
 ```
 
-Run `ssh -p 2222 tit.example help` to list all SSH commands. A command that is
-not valid returns a nonzero status and tells the user to run `help`.
-
-The account that owns the SSH key becomes the repository owner. The SSH login
-name does not select the owner. New repositories use SHA-1 unless the command
-selects SHA-256:
+Verify an archive and its checksum:
 
 ```text
-ssh -p 2222 tit.example repo create project --object-format sha256
+./scripts/verify-release-artifact \
+  dist/tit-VERSION-TARGET.tar.gz \
+  dist/tit-VERSION-TARGET.tar.gz.sha256
 ```
 
-Use the versioned JSON mode for scripts:
+The package contains the executable, example service files, shell
+completions, the manual page, the example configuration, this README, and the
+license.
+
+## Development
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before you change code. Run the quality
+gate directly:
 
 ```text
-ssh -p 2222 tit.example repo create project --output json
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+cargo deny check advisories licenses sources
+cargo build --locked --release
 ```
 
-The complete command is `repo create NAME [--object-format sha1|sha256]
-[--output human|json]`. Human output can change in a later release. The JSON
-object has `version`, `status`, and `repository` fields after success. It has
-`version`, `status`, and `error.code` fields after failure. The command returns
-zero after success and nonzero after failure.
-
-## Quality gate
-
-Install `cargo-deny` version 0.20.2. Then, run this command from the repository
-root:
+The ignored workload tests are explicit performance checks:
 
 ```text
-./scripts/check
+cargo test --locked --release --test git_reads \
+  measures_bounded_search_without_an_index -- --ignored --nocapture
+cargo test --locked --release --test metadata_search \
+  measures_bounded_repository_name_search_without_an_index \
+  -- --ignored --nocapture
+cargo test --locked --release --test sqlite_workload \
+  -- --ignored --nocapture
 ```
 
-This command formats, lints, tests, audits, and builds the release executable.
-
-## Milestone 1A gate
-
-Run the SQLite durability gate on a local filesystem:
-
-```text
-./scripts/check-m1a
-```
-
-This command also creates and measures a release database with 10,000 issue
-records and 1,000,000 event records. Read the SQLite
-[architectural decision record](docs/adr/0001-sqlite-storage.md) for the limits
-and current platform evidence.
-
-## Milestone 1B gate
-
-Install stock OpenSSH. Then, run the SSH identity gate:
-
-```text
-./scripts/check-m1b
-```
-
-This command uses stock `ssh`, `ssh-agent`, `ssh-add`, and `ssh-keygen` to do
-tests of public-key authentication, SSH request restrictions, and SSHSIG login
-challenges. Read the SSH identity
-[architectural decision record](docs/adr/0002-ssh-identity.md) for the supported
-algorithms, limits, and current platform evidence.
-
-## Milestone 1C gate
-
-Install stock Git and OpenSSH. Then, run the read-side Git protocol gate:
-
-```text
-./scripts/check-m1c
-```
-
-This command uses stock Git to clone and fetch SHA-1 and SHA-256 repositories
-through smart HTTP and SSH. Read the read-side Git
-[architectural decision record](docs/adr/0003-read-side-git.md) for the protocol
-versions, limits, known omissions, and current platform evidence.
-
-## Database check
-
-An initialized instance keeps its metadata in `tit.sqlite3`. Check an existing
-database with this command:
-
-```text
-tit --config /absolute/path/to/tit/config.toml doctor
-```
-
-The command does not create or migrate a database. Successful validation writes
-no output and returns exit code 0.
-
-## Configuration validation
-
-Copy `config.example.toml` into an empty instance directory. Change
-`public_url` to the canonical HTTPS URL of the instance. Then, run:
-
-```text
-tit --config /absolute/path/to/tit/config.toml
-```
-
-Successful validation writes no output and returns exit code 0. A configuration
-error writes a diagnostic to standard error and returns exit code 1. A CLI
-syntax error returns exit code 2. Help and version output use standard output.
-
-The directory that contains `config.toml` is the instance directory. HTTP clone
-URLs use `public_url`. SSH clone URLs use `ssh.public_host` and
-`ssh.public_port`. By default, `ssh.public_host` uses the host from `public_url`.
-Listener addresses do not change public clone URLs.
-
-`ssh.public_host` accepts a DNS hostname, an IP address, or an `.onion`
-hostname. `tit` validates and normalizes this value without resolving it. A Tor
-client supplies the necessary SSH `ProxyCommand` configuration.
-
-Use `--user` instead of `--config` to read the configuration from
-`$XDG_DATA_HOME/tit/config.toml`. If `XDG_DATA_HOME` is not set, `tit` uses
-`$HOME/.local/share/tit/config.toml`.
-
-The executable does not run Git or OpenSSH. Tests can use stock clients as
-external test drivers.
-
-## Milestone 2 gate
-
-Install stock Git and OpenSSH. Then, run the read-only CDE gate:
-
-```text
-./scripts/check-m2-8
-```
-
-This command runs the quality gate, measures source search without an index,
-and tests the public routes with SHA-1 and SHA-256 repositories. Read the
-[source search architectural decision record](docs/adr/0008-bounded-source-search.md)
-for the search limits and current measurement.
-
-## Milestone 3.1 gate
-
-Install stock Git and OpenSSH. Then, run the account lifecycle gate:
-
-```text
-./scripts/check-m3-1
-```
-
-This command tests invitation, signup, recovery, key revocation, account
-suspension, and the owner-only control socket. Read the
-[account lifecycle architectural decision record](docs/adr/0010-account-lifecycle.md)
-for the credential and failure behavior.
-
-## Milestone 3.2 gate
-
-Install stock OpenSSH. Then, run the Web login gate:
-
-```text
-./scripts/check-m3-2
-```
-
-Open `/login` and select **Log in with SSH**. Run the exact command, check the
-origin and account in its output, and continue in the browser. If the SSH
-service is not available, create a fallback challenge and sign its exact
-content with the `tit-auth` SSHSIG namespace. The Web UI accepts the signature
-file and creates an opaque session. Read the
-[Web login architectural decision record](docs/adr/0011-web-login-sessions.md)
-for the session and CSRF behavior.
-
-## Milestone 3.3 gate
-
-Run the repository authorization gate:
-
-```text
-./scripts/check-m3-3
-```
-
-This command tests public and private visibility, each collaborator role,
-suspended accounts, archived repositories, and anonymous HTTP routes. Read the
-[repository authorization architectural decision record](docs/adr/0012-repository-authorization.md)
-for the complete access matrix.
-
-## Milestone 3.4 gate
-
-Install stock Git and OpenSSH. Then, run the authenticated Git gate:
-
-```text
-./scripts/check-m3-4
-```
-
-This command tests account-bound SSH keys, each repository role, key revocation,
-account suspension, role removal, push permission, and ref policy. Read the
-[authenticated Git architectural decision record](docs/adr/0013-authenticated-git.md)
-for the service and ref-update checks.
-
-## Milestone 3.5 gate
-
-Run the audit history gate:
-
-```text
-./scripts/check-m3-5
-```
-
-This command tests successful and failed account, login, repository,
-collaborator, and ref audit events. It also tests correlation IDs and secret
-exclusion. Read the
-[audit history architectural decision record](docs/adr/0014-audit-history.md)
-for the transaction and recovery rules.
-
-## Milestone 3.6 gate
-
-Run the SSH repository command gate:
-
-```text
-./scripts/check-m3-6
-```
-
-This command tests repository creation from the Web UI and SSH. It tests
-account ownership, both object formats, human output, JSON output, failure
-codes, audit events, and clone access. Read the
-[SSH repository command architectural decision record](docs/adr/0015-ssh-repository-commands.md)
-for the command and authorization rules.
-
-## Milestone 3 gate
-
-Run the complete account and authorization gate:
-
-```text
-./scripts/check-m3
-```
-
-This command tests one Web and SSH identity, account recovery, key revocation,
-sessions, repository roles, private route isolation, push policy, audit history,
-and repository creation from the Web UI and SSH.
-
-## Milestone 4.1 gate
-
-Run the repository event service gate:
-
-```text
-./scripts/check-m4-1
-```
-
-This command tests event migration, random public IDs, repository sequences,
-versioned JSON payloads, atomic metadata and event writes, Git operation
-recovery, feed parsing, and sequence pagination. Read the
-[repository event service architectural decision record](docs/adr/0016-repository-event-service.md)
-for the event type and payload contracts.
-
-## Milestone 4.2 gate
-
-Run the issue workflow gate:
-
-```text
-./scripts/check-m4-2
-```
-
-This command tests issue numbers, raw Markdown storage, safe rendering, roles,
-comments, state, labels, assignees, the event timeline, transaction rollback,
-sessions, CSRF checks, and forms that operate without JavaScript. Read the
-[issue workflow architectural decision record](docs/adr/0017-issue-workflow.md)
-for the permission and event contracts.
-
-## Milestone 4.3 gate
-
-Run the repository watch gate:
-
-```text
-./scripts/check-m4-3
-```
-
-This command tests granular push, issue, and pull-request preferences, the
-“everything” selection, stable watch IDs, permission checks, removal, private
-preference handling, CSRF checks, and forms that operate without JavaScript.
-Read the [repository watches architectural decision record](docs/adr/0018-repository-watches.md)
-for the storage and privacy contracts.
-
-## Milestone 4.4 gate
-
-Run the scoped feed gate:
-
-```text
-./scripts/check-m4-4
-```
-
-This command tests public issue feeds, hash-only feed tokens, one-time token
-display, repository and personalized scopes, current private-repository access,
-rotation, revocation, stable event selection, and Atom and RSS parsing. Read the
-[scoped feeds architectural decision record](docs/adr/0019-scoped-feeds.md) for
-the token, authorization, and ordering contracts.
-
-## Milestone 4.5 gate
-
-Run the metadata search gate:
-
-```text
-./scripts/check-m4-5
-```
-
-This command tests bounded repository and issue metadata search, public and
-private visibility, current collaborator permission, stable result identity,
-query validation, and the representative index workload. Read the
-[bounded metadata search architectural decision record](docs/adr/0020-bounded-metadata-search.md)
-for the limits, authorization, and index decision.
-
-## Milestone 4.6 gate
-
-Install stock OpenSSH. Then, run the SSH issue command gate:
-
-```text
-./scripts/check-m4-6
-```
-
-This command tests issue creation and listing with human and JSON output. It
-tests owner and reader permission, hidden private repositories, suspended
-account access, invalid input, raw Markdown storage, and atomic issue events.
-Read the [SSH issue command architectural decision record](docs/adr/0021-ssh-issue-commands.md)
-for the input, output, authorization, and error contracts.
-
-## Milestone 5.1 gate
-
-Install stock Git. Then, run the pull-request ref gate:
-
-```text
-./scripts/check-m5-1
-```
-
-This command tests increasing pull-request numbers, SHA-1 and SHA-256 refs,
-immutable revision object IDs, concurrent opens, intent recovery before and
-after a ref change, the Web forms, and historical schema migration. Read the
-[pull-request ref architectural decision record](docs/adr/0022-pull-request-refs.md)
-for the record, ref, permission, and recovery contracts.
-
-## Milestone 5.2 gate
-
-Run the pull-request comparison gate:
-
-```text
-./scripts/check-m5-2
-```
-
-This command tests SHA-1 and SHA-256 merge bases, commit ranges, changed paths,
-diffs, immutable revision selection, mergeability states, unrelated histories,
-work limits, and Web output. Read the
-[pull-request comparison architectural decision record](docs/adr/0023-pull-request-comparison.md)
-for the computation, limit, and cache contracts.
-
-## Milestone 5.3 gate
-
-Run the pull-request review gate:
-
-```text
-./scripts/check-m5-3
-```
-
-This command tests general comments, line comments, approvals, change requests,
-immutable byte-path anchors, outdated display, repository permission, atomic
-events, the chronological timeline, no-JavaScript Web forms, and historical
-schema migration. Read the
-[pull-request review architectural decision record](docs/adr/0024-pull-request-review.md)
-for the anchor, permission, event, and outdated-state contracts.
-
-## Milestone 5.4 gate
-
-Run the pull-request merge gate:
-
-```text
-./scripts/check-m5-4
-```
-
-This command tests fast-forward and server-created merge commits, SHA-1 and
-SHA-256 repositories, rename and mode preservation, deterministic parents,
-attribution, conflict and stale-ref rejection, intent recovery, concurrent base
-updates, atomic events, the no-JavaScript Web form, and historical schema
-migration. Read the
-[pull-request merge architectural decision record](docs/adr/0025-pull-request-merge.md)
-for the merge, permission, intent, and recovery contracts.
-
-## Milestone 5.5 gate
-
-Run the branch-rule gate:
-
-```text
-./scripts/check-m5-5
-```
-
-This command tests protected-ref access, fast-forward-only branches,
-force-push rejection, protected-ref deletion rejection, topic-branch access,
-and pull-request merge permission. Read the
-[branch-rule architectural decision record](docs/adr/0026-branch-rules.md) for
-the ref, role, transport, and merge contracts.
-
-## Milestone 5.6 gate
-
-Run the SSH pull-request command gate:
-
-```text
-./scripts/check-m5-6
-```
-
-This command tests bounded command parsing, exact human output, versioned JSON
-output, repository read permission, and the returned stock Git fetch and
-checkout commands. Read the
-[SSH pull-request checkout architectural decision record](docs/adr/0027-ssh-pull-request-checkout.md)
-for the command, output, permission, and error contracts.
-
-## Milestone 5 gate
-
-Install stock Git and stock OpenSSH. Then, run the collaboration gate:
-
-```text
-./scripts/check-m5
-```
-
-This command tests branch pushes, pull-request revisions, anchored reviews,
-merges, concurrent ref updates, and recovery after an interrupted ref update.
-It also tests the Web workflow, the SSH checkout command, and historical schema
-migration.
-
-## Milestone 6.1 gate
-
-Run the process lifecycle gate:
-
-```text
-./scripts/check-m6-1
-```
-
-This command tests listener readiness, SIGTERM shutdown, the bounded connection
-drain, the empty advisory lock file, and rejection of a second server process.
-Read the
-[process lifecycle architectural decision record](docs/adr/0028-process-lifecycle.md)
-for the readiness, shutdown, and instance-lock contracts.
-
-## Milestone 6.2 gate
-
-Install stock Git. Then, run the backup and restore gate:
-
-```text
-./scripts/check-m6-2
-```
-
-This command tests offline and online backup, owner-only archive permissions,
-the global maintenance gate, manifest checksum failures, empty restore targets,
-database validation, and restored Git object access. Read the
-[backup and restore architectural decision record](docs/adr/0029-backup-and-restore.md)
-for the archive, gate, credential, and activation contracts.
-
-## Milestone 6.3 gate
-
-Install stock Git and stock `ssh-keygen`. Then, run the diagnostics gate:
-
-```text
-./scripts/check-m6-3
-```
-
-This command tests read-only doctor checks, explicit repair, typed inspection,
-deterministic JSON Lines output, damaged Git state, incomplete intents,
-quarantine debris, missing indexes, unsafe permissions, and changed backup
-data. Read the
-[read-only diagnostics architectural decision record](docs/adr/0030-read-only-diagnostics.md)
-for the check, repair, inspection, and dump contracts.
-
-## Milestone 6.4 gate
-
-Install stock OpenSSH. Then, run the limits gate:
-
-```text
-./scripts/check-m6-4
-```
-
-This command tests HTTP request and login-attempt limits, SSH authentication
-limits, Markdown limits, Git pack limits, and repository diff and archive
-limits. Read the
-[limits and abuse resistance architectural decision record](docs/adr/0031-limits-and-abuse-resistance.md)
-for the limit values and failure behavior.
-
-## Milestone 6.5 gate
-
-Install stock Git and OpenSSH. Then, run the observability gate:
-
-```text
-./scripts/check-m6-5
-```
-
-This command tests structured HTTP, SSH, and lifecycle logs, request and
-operation IDs, fixed metrics, audit records, and secret redaction. Read the
-[observability architectural decision record](docs/adr/0032-observability.md)
-for the event and redaction contracts.
-
-## Milestone 6.6 gate
-
-Install stock Git, OpenSSH, and `ssh-keygen`. Then, run the release gate:
-
-```text
-./scripts/check-m6-6
-```
-
-This command runs the quality gate, creates and verifies the native release
-archive, damages and restores a disposable instance, and runs the process
-security and recovery tests with the packaged executable. Read the
-[release packaging architectural decision record](docs/adr/0033-release-packaging.md)
-for the artifact and platform gate contracts.
+`tit` is licensed under the MIT License. See [LICENSE](LICENSE).

@@ -27,7 +27,12 @@ const CURRENT_DATABASE: &str = concat!(
     include_str!("../src/store/migrations/016_pull_request_reviews.sql"),
     include_str!("../src/store/migrations/017_pull_request_merges.sql"),
     include_str!("../src/store/migrations/018_streamlined_login.sql"),
-    "PRAGMA user_version = 18;\n",
+    include_str!("../src/store/migrations/019_product_reduction.sql"),
+    include_str!("../src/store/migrations/020_repository_profiles.sql"),
+    include_str!("../src/store/migrations/021_pull_request_lifecycle.sql"),
+    include_str!("../src/store/migrations/022_account_key_management.sql"),
+    include_str!("../src/store/migrations/023_default_branch.sql"),
+    "PRAGMA user_version = 23;\n",
 );
 
 #[test]
@@ -398,6 +403,28 @@ fn concurrent_setup_creates_exactly_one_administrator() {
 }
 
 #[test]
+fn maintenance_runs_offline_and_rejects_a_zero_retention_period() {
+    let instance = TestInstance::new();
+    create_administrator(&instance, "alice");
+    let config = instance.config().to_str().expect("a UTF-8 path");
+
+    let maintained = instance.run(&["--config", config, "maintenance"]);
+    assert!(
+        maintained.status.success(),
+        "maintenance failed: {}",
+        String::from_utf8_lossy(&maintained.stderr)
+    );
+    assert!(String::from_utf8_lossy(&maintained.stdout).starts_with("Pruned "));
+
+    let rejected = instance.run(&["--config", config, "maintenance", "--retention-days", "0"]);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("retention days must be greater than zero")
+    );
+}
+
+#[test]
 fn administers_repositories_with_immutable_canonical_paths() {
     let instance = TestInstance::new();
     create_administrator(&instance, "alice");
@@ -412,8 +439,6 @@ fn administers_repositories_with_immutable_canonical_paths() {
             "create",
             "alice",
             "project",
-            "--object-format",
-            "sha256",
         ])
         .env("PATH", "")
         .output()
@@ -431,10 +456,7 @@ fn administers_repositories_with_immutable_canonical_paths() {
         Some("public")
     );
     assert_eq!(created.get("state").map(String::as_str), Some("active"));
-    assert_eq!(
-        created.get("object-format").map(String::as_str),
-        Some("sha256")
-    );
+    assert!(!created.contains_key("object-format"));
     let id = created.get("id").expect("read the repository ID");
     assert_eq!(id.len(), 32);
     assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -647,6 +669,8 @@ fn imports_bare_repositories_and_rejects_unsafe_sources() {
     let config = instance.config().to_str().expect("a UTF-8 path");
     let source = instance.path().join("source.git");
     create_bare_git_fixture(&source, "sha1");
+    fs::write(source.join("HEAD"), "ref: refs/heads/trunk\n")
+        .expect("set the imported symbolic HEAD");
 
     let imported = instance.run(&[
         "--config",
@@ -664,11 +688,21 @@ fn imports_bare_repositories_and_rejects_unsafe_sources() {
         String::from_utf8_lossy(&imported.stderr)
     );
     let imported = repository_output(&imported.stdout);
-    assert_eq!(
-        imported.get("object-format").map(String::as_str),
-        Some("sha1")
-    );
+    assert!(!imported.contains_key("object-format"));
     assert_ne!(imported.get("path"), Some(&source.display().to_string()));
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the imported repository database");
+    let default_branch: String = database
+        .query_row(
+            "SELECT repository_default_branch.ref_name
+             FROM repository_default_branch
+             JOIN repository ON repository.id = repository_default_branch.repository_id
+             WHERE repository.slug = 'imported'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the imported default branch");
+    assert_eq!(default_branch, "refs/heads/trunk");
 
     let unsafe_source = instance.path().join("unsafe.git");
     create_bare_git_fixture(&unsafe_source, "sha1");
@@ -708,6 +742,58 @@ fn imports_bare_repositories_and_rejects_unsafe_sources() {
         ]);
         assert_eq!(rejected.status.code(), Some(1), "accepted {slug:?}");
         assert!(rejected.stdout.is_empty());
+    }
+}
+
+#[test]
+fn removes_an_import_after_each_post_rename_failure() {
+    for point in [
+        "after-rename",
+        "after-canonicalize",
+        "after-object-format",
+        "after-open",
+        "after-references",
+    ] {
+        let instance = TestInstance::new();
+        create_administrator(&instance, "alice");
+        let config = instance.config().to_str().expect("a UTF-8 path");
+        let source = instance.path().join("source.git");
+        create_bare_git_fixture(&source, "sha1");
+        let output = Command::new(env!("CARGO_BIN_EXE_tit"))
+            .args([
+                "--config",
+                config,
+                "admin",
+                "repository",
+                "import",
+                "alice",
+                "failed",
+                source.to_str().expect("a UTF-8 path"),
+            ])
+            .env("TIT_TEST_IMPORT_FAIL", point)
+            .output()
+            .expect("run the faulted import");
+        assert_eq!(output.status.code(), Some(1), "{point}");
+        assert!(
+            fs::read_dir(instance.path().join("repositories"))
+                .expect("read managed repositories")
+                .all(|entry| entry
+                    .expect("read a managed repository")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('.')),
+            "{point} left an unmanaged repository"
+        );
+        let inspected = instance.run(&[
+            "--config",
+            config,
+            "admin",
+            "repository",
+            "inspect",
+            "alice",
+            "failed",
+        ]);
+        assert_eq!(inspected.status.code(), Some(1), "{point}");
     }
 }
 

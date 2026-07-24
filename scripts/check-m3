@@ -1,7 +1,0 @@
-#!/bin/sh
-set -eu
-
-./scripts/check
-cargo test --locked --release --test auth --test account_lifecycle --test web_session --test repository_policy
-cargo test --locked --release --test git_push_ssh
-cargo test --locked --release --test serve

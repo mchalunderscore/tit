@@ -47,7 +47,6 @@ root="$stage/$package"
 install -d -m 755 \
     "$root/bin" \
     "$root/etc/tit" \
-    "$root/share/doc/tit/adr" \
     "$root/share/doc/tit/examples" \
     "$root/share/man/man1" \
     "$root/share/bash-completion/completions" \
@@ -57,17 +56,6 @@ install -m 755 "$binary" "$root/bin/tit"
 install -m 644 "$project_dir/LICENSE" "$root/LICENSE"
 install -m 644 "$project_dir/README.md" "$root/README.md"
 install -m 600 "$project_dir/config.example.toml" "$root/etc/tit/config.toml"
-install -m 644 "$project_dir/docs/install.md" "$root/share/doc/tit/install.md"
-install -m 644 "$project_dir/docs/upgrade.md" "$root/share/doc/tit/upgrade.md"
-install -m 644 \
-    "$project_dir/docs/disaster-recovery.md" \
-    "$root/share/doc/tit/disaster-recovery.md"
-install -m 644 \
-    "$project_dir/docs/adr/0029-backup-and-restore.md" \
-    "$root/share/doc/tit/adr/0029-backup-and-restore.md"
-install -m 644 \
-    "$project_dir/docs/adr/0033-release-packaging.md" \
-    "$root/share/doc/tit/adr/0033-release-packaging.md"
 install -m 644 "$project_dir/release/examples/Caddyfile" "$root/share/doc/tit/examples/Caddyfile"
 install -m 644 \
     "$project_dir/release/examples/tit.service" \
