@@ -36,7 +36,7 @@ jobs:
       - run: cargo test --locked --all-targets --all-features
       - run: cargo test --locked --release --lib
       - run: cargo test --locked --release --lib git_reads_tests::measures_bounded_search_without_an_index -- --ignored --nocapture
-      - run: cargo test --locked --release --lib sqlite_workload_tests:: -- --ignored --nocapture
+      - run: "cargo test --locked --release --lib sqlite_workload_tests:: -- --ignored --nocapture"
       - run: cargo build --locked --release
       - run: wc -c target/release/tit
       - run: ./scripts/package-release target/release/tit dist
