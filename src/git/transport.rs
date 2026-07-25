@@ -39,15 +39,27 @@ impl GitRepositories {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_pushes(
         root: &Path,
         database: &Path,
     ) -> Result<Self, RepositoryPathError> {
+        Self::new_with_pushes_and_gate(root, database, MaintenanceGate::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_pushes_and_gate(
+        root: &Path,
+        database: &Path,
+        maintenance: MaintenanceGate,
+    ) -> Result<Self, RepositoryPathError> {
         let mut repositories = Self::new(root)?;
         repositories.push_database = Some(database.to_owned());
+        repositories.maintenance = maintenance;
         Ok(repositories)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_managed_public(
         root: &Path,
         repositories: impl IntoIterator<Item = (String, String, String)>,
@@ -67,13 +79,6 @@ impl GitRepositories {
         Ok(service)
     }
 
-    pub(crate) fn new_managed_authorized(
-        root: &Path,
-        database: &Path,
-    ) -> Result<Self, RepositoryPathError> {
-        Self::new_managed_authorized_with_gate(root, database, MaintenanceGate::default())
-    }
-
     pub(crate) fn new_managed_authorized_with_gate(
         root: &Path,
         database: &Path,
@@ -86,6 +91,7 @@ impl GitRepositories {
         Ok(service)
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve(
         &self,
         owner: &str,
@@ -141,6 +147,7 @@ impl GitRepositories {
         Ok(candidate)
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_ssh_command(
         &self,
         command: &[u8],
@@ -168,6 +175,7 @@ impl GitRepositories {
         self.resolve(owner, repository)
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_ssh_service(
         &self,
         command: &[u8],
@@ -183,11 +191,7 @@ impl GitRepositories {
         if command.starts_with(b"git-upload-pack ") {
             let (owner, repository) = parse_ssh_repository(command, "git-upload-pack '")?;
             let path = self.resolve_for(actor, &owner, &repository, RepositoryOperation::Read)?;
-            return Ok(GitSshService::Upload {
-                path,
-                owner,
-                repository,
-            });
+            return Ok(GitSshService::Upload { path });
         }
         let (owner, repository) = parse_ssh_repository(command, "git-receive-pack '")?;
         let path = self.resolve_for(actor, &owner, &repository, RepositoryOperation::Write)?;
@@ -224,6 +228,10 @@ impl GitRepositories {
         &self.root
     }
 
+    pub(crate) fn maintenance_gate(&self) -> MaintenanceGate {
+        self.maintenance.clone()
+    }
+
     pub(crate) async fn push_permit(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
         self.push_jobs.clone().acquire_owned().await
     }
@@ -237,6 +245,7 @@ impl GitRepositories {
     }
 }
 
+#[cfg(test)]
 fn valid_managed_id(value: &str) -> bool {
     value.len() == 32
         && value
@@ -247,8 +256,6 @@ fn valid_managed_id(value: &str) -> bool {
 pub(crate) enum GitSshService {
     Upload {
         path: PathBuf,
-        owner: String,
-        repository: String,
     },
     Receive {
         path: PathBuf,
@@ -314,6 +321,7 @@ pub(crate) enum RepositoryPathError {
     },
     #[error("repository resolves outside the repository root")]
     OutsideRoot,
+    #[cfg(test)]
     #[error("managed repository catalog is not valid")]
     InvalidCatalog,
     #[error("repository access is not authorized")]

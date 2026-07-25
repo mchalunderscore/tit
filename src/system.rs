@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "integration test crates use only the system operations required by their imported modules"
-)]
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::TryRng;

@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use rand::rng;
 use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Server, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Preferred, Pty};
@@ -12,17 +13,17 @@ use ssh_key::{Algorithm, EcdsaCurve, PrivateKey, PublicKey};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::auth::SshPublicKey;
 use crate::git::packetline::{MAX_REQUEST_BYTES, Packet, decode, encode_data, first_flush_end};
-use crate::git::receive_pack::{ReceivePack, ReceivePackError};
+use crate::git::receive_pack::{ReceivePack, ReceivePackError, recover_incomplete_pushes};
 use crate::git::transport::{GitRepositories, GitSshService, RepositoryPathError};
 use crate::git::upload_pack::{ProtocolVersion, UploadPack, UploadPackError};
 use crate::issue::{IssueError, IssueService, MAX_BODY_BYTES, MAX_TITLE_BYTES};
 use crate::policy::RepositoryOperation;
-use crate::pull_request::{PullRequestError, PullRequestService};
+use crate::pull_request::{NewPullRequest, PullRequestError, PullRequestService};
 use crate::rate_limit::AttemptLimiter;
 use crate::repository::{RepositoryService, RepositoryServiceError};
 use crate::store::{Store, StoreError};
@@ -101,9 +102,11 @@ fn parse_auth_command(command: &[u8]) -> Option<String> {
 }
 
 pub(crate) struct RunningSshServer {
+    #[cfg(test)]
     address: SocketAddr,
     handle: russh::server::RunningServerHandle,
     task: JoinHandle<std::io::Result<()>>,
+    #[cfg(test)]
     audit: Arc<RequestAudit>,
 }
 
@@ -119,6 +122,7 @@ struct SshIdentity {
 }
 
 impl AuthorizedSshKeys {
+    #[cfg(test)]
     pub(crate) fn new(keys: &[SshPublicKey]) -> Self {
         Self {
             keys: Arc::new(RwLock::new(key_map(keys))),
@@ -146,6 +150,7 @@ impl AuthorizedSshKeys {
     }
 }
 
+#[cfg(test)]
 fn key_map(keys: &[SshPublicKey]) -> HashMap<PublicKey, SshIdentity> {
     keys.iter()
         .map(|key| {
@@ -176,6 +181,7 @@ fn account_key_map(keys: Vec<(String, SshPublicKey)>) -> HashMap<PublicKey, SshI
 }
 
 impl RunningSshServer {
+    #[cfg(test)]
     pub(crate) async fn start(
         address: SocketAddr,
         authorized_keys: &[SshPublicKey],
@@ -184,21 +190,13 @@ impl RunningSshServer {
         Self::start_inner(address, authorized_keys, &[], None, host_key).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_with_git(
         address: SocketAddr,
         authorized_keys: &[SshPublicKey],
         repositories: GitRepositories,
     ) -> Result<Self, SshServerError> {
         let host_key = PrivateKey::random(&mut rng(), Algorithm::Ed25519)?;
-        Self::start_inner(address, authorized_keys, &[], Some(repositories), host_key).await
-    }
-
-    pub(crate) async fn start_with_git_and_host_key(
-        address: SocketAddr,
-        authorized_keys: &[SshPublicKey],
-        repositories: GitRepositories,
-        host_key: PrivateKey,
-    ) -> Result<Self, SshServerError> {
         Self::start_inner(address, authorized_keys, &[], Some(repositories), host_key).await
     }
 
@@ -227,6 +225,7 @@ impl RunningSshServer {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_with_git_writes(
         address: SocketAddr,
         authorized_keys: &[SshPublicKey],
@@ -245,6 +244,7 @@ impl RunningSshServer {
         .await
     }
 
+    #[cfg(test)]
     async fn start_inner(
         address: SocketAddr,
         authorized_keys: &[SshPublicKey],
@@ -276,6 +276,7 @@ impl RunningSshServer {
         runtime: SshRuntime,
     ) -> Result<Self, SshServerError> {
         let listener = TcpListener::bind(address).await?;
+        #[cfg(test)]
         let address = listener.local_addr()?;
         let mut methods = MethodSet::empty();
         methods.push(MethodKind::PublicKey);
@@ -329,21 +330,26 @@ impl RunningSshServer {
         });
         let handle = handle_receiver.await.map_err(|_| SshServerError::Startup)?;
         Ok(Self {
+            #[cfg(test)]
             address,
             handle,
             task,
+            #[cfg(test)]
             audit,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn address(&self) -> SocketAddr {
         self.address
     }
 
+    #[cfg(test)]
     pub(crate) fn audit(&self) -> RequestAuditSnapshot {
         self.audit.snapshot()
     }
 
+    #[cfg(test)]
     pub(crate) async fn shutdown(self) -> Result<(), SshServerError> {
         self.handle.shutdown("tit test shutdown".to_owned());
         self.task.await.map_err(|_| SshServerError::Join)??;
@@ -374,12 +380,10 @@ async fn recover_pushes(repositories: &GitRepositories) -> Result<(), SshServerE
         .push_database()
         .ok_or_else(|| SshServerError::Recovery("push storage is not configured".to_owned()))?
         .to_owned();
-    tokio::task::spawn_blocking(move || {
-        crate::git::receive_pack::recover_incomplete_pushes(&database)
-    })
-    .await
-    .map_err(|_| SshServerError::Join)?
-    .map_err(|error| SshServerError::Recovery(error.to_string()))
+    tokio::task::spawn_blocking(move || recover_incomplete_pushes(&database))
+        .await
+        .map_err(|_| SshServerError::Join)?
+        .map_err(|error| SshServerError::Recovery(error.to_string()))
 }
 
 #[derive(Debug, Error)]
@@ -499,7 +503,7 @@ struct UploadChannel {
 }
 
 struct ReceiveChannel {
-    service: ReceivePack,
+    lease: ReceiveLease,
     owner: String,
     repository: String,
     identity: SshIdentity,
@@ -513,6 +517,11 @@ struct ReceiveChannel {
     last_activity: Instant,
     transferred: u64,
     _global_permit: OwnedSemaphorePermit,
+}
+
+struct ReceiveLease {
+    service: ReceivePack,
+    _maintenance: OwnedRwLockReadGuard<()>,
 }
 
 impl UploadChannel {
@@ -936,18 +945,23 @@ impl Handler for SshSession {
                             identity,
                             public_key,
                             global_permit,
+                            maintenance,
                         } = *receive;
                         let started_at = Instant::now();
                         let advertisement_bytes =
                             u64::try_from(advertisement.len()).unwrap_or(u64::MAX);
                         session.data(channel, advertisement)?;
-                        let pack = tokio::fs::File::create(service.incoming_pack()).await;
+                        let lease = ReceiveLease {
+                            service: *service,
+                            _maintenance: maintenance,
+                        };
+                        let pack = tokio::fs::File::create(lease.service.incoming_pack()).await;
                         match pack {
                             Ok(pack) => {
                                 self.exec_channels.insert(
                                     channel,
                                     ExecChannel::Receive(Box::new(ReceiveChannel {
-                                        service: *service,
+                                        lease,
                                         owner,
                                         repository,
                                         identity,
@@ -1048,7 +1062,7 @@ impl Handler for SshSession {
                 if receive_data(&mut git, data).await.is_err() {
                     fail_git_channel(channel, session)?;
                 } else if git.commands_complete
-                    && matches!(git.service.expects_pack(&git.commands), Ok(false))
+                    && matches!(git.lease.service.expects_pack(&git.commands), Ok(false))
                 {
                     send_receive_result(
                         channel,
@@ -1323,6 +1337,7 @@ async fn run_repository_command(
         .ok_or(RepositoryCommandError::Unavailable)?
         .to_owned();
     let root = repositories.repository_root().to_owned();
+    let maintenance = repositories.maintenance_gate();
     let permit = repositories
         .blocking_permit()
         .await
@@ -1331,7 +1346,7 @@ async fn run_repository_command(
     let correlation_id = format!("{:032x}", rand::random::<u128>());
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        RepositoryService::new(&database, &root)
+        RepositoryService::new_with_gate(&database, &root, maintenance)
             .create_for_account(
                 &actor,
                 &command.slug,
@@ -2146,13 +2161,14 @@ async fn run_pull_request_list(
         .ok_or(PullRequestCommandError::Unavailable)?
         .to_owned();
     let root = repositories.repository_root().to_owned();
+    let maintenance = repositories.maintenance_gate();
     let permit = repositories
         .blocking_permit()
         .await
         .map_err(|_| PullRequestCommandError::Unavailable)?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        PullRequestService::new(&database, &root)
+        PullRequestService::new_with_gate(&database, &root, maintenance)
             .list_page(
                 &command.owner,
                 &command.repository,
@@ -2184,22 +2200,23 @@ async fn run_pull_request_create(
         .ok_or(PullRequestCommandError::Unavailable)?
         .to_owned();
     let root = repositories.repository_root().to_owned();
+    let maintenance = repositories.maintenance_gate();
     let permit = repositories
         .blocking_permit()
         .await
         .map_err(|_| PullRequestCommandError::Unavailable)?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        PullRequestService::new(&database, &root)
-            .open(
-                &command.owner,
-                &command.repository,
-                &command.actor,
-                &title,
-                &body,
-                &command.base,
-                &command.head,
-            )
+        PullRequestService::new_with_gate(&database, &root, maintenance)
+            .open(&NewPullRequest {
+                owner: &command.owner,
+                repository: &command.repository,
+                actor: &command.actor,
+                title: &title,
+                body: &body,
+                base_ref: &command.base,
+                head_ref: &command.head,
+            })
             .map(|pull_request| PullRequestMutationResult {
                 owner: command.owner,
                 repository: command.repository,
@@ -2225,13 +2242,14 @@ async fn run_pull_request_set_state(
         .ok_or(PullRequestCommandError::Unavailable)?
         .to_owned();
     let root = repositories.repository_root().to_owned();
+    let maintenance = repositories.maintenance_gate();
     let permit = repositories
         .blocking_permit()
         .await
         .map_err(|_| PullRequestCommandError::Unavailable)?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        PullRequestService::new(&database, &root)
+        PullRequestService::new_with_gate(&database, &root, maintenance)
             .set_state(
                 &command.owner,
                 &command.repository,
@@ -2547,6 +2565,7 @@ impl SshSession {
                     return Ok(None);
                 };
                 let uses_policy = repositories.uses_policy();
+                let maintenance = repositories.mutation_permit().await;
                 let permit = repositories.blocking_permit().await?;
                 let service = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
@@ -2571,6 +2590,7 @@ impl SshSession {
                             identity,
                             public_key,
                             global_permit,
+                            maintenance,
                         },
                     )))
                 })
@@ -2621,6 +2641,7 @@ struct InitialReceiveService {
     identity: SshIdentity,
     public_key: PublicKey,
     global_permit: OwnedSemaphorePermit,
+    maintenance: OwnedRwLockReadGuard<()>,
 }
 
 async fn receive_data(git: &mut ReceiveChannel, data: &[u8]) -> Result<(), ()> {
@@ -2654,7 +2675,7 @@ async fn finish_receive(
     git: Box<ReceiveChannel>,
 ) -> ReceiveResult {
     let ReceiveChannel {
-        mut service,
+        mut lease,
         owner,
         repository,
         identity,
@@ -2674,11 +2695,9 @@ async fn finish_receive(
     let repositories = repositories?;
     let push_permit = repositories.push_permit().await.ok()?;
     let permit = repositories.blocking_permit().await.ok()?;
-    let maintenance = repositories.mutation_permit().await;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _push_permit = push_permit;
-        let _maintenance = maintenance;
         if authorized_keys.identity(&public_key).as_ref() != Some(&identity)
             || !repositories.authorize(
                 &identity.username,
@@ -2689,14 +2708,14 @@ async fn finish_receive(
         {
             return None;
         }
-        Some(match service.finish(&commands) {
+        Some(match lease.service.finish(&commands) {
             Ok(response) => Ok(response),
             Err(error) => {
-                let response = service.rejection_response(&commands, &error);
-                match service.record_rejection() {
+                let response = lease.service.rejection_response(&commands, &error);
+                match lease.service.record_rejection() {
                     Ok(()) => Err((error, response)),
                     Err(audit_error) => {
-                        let response = service.rejection_response(&commands, &audit_error);
+                        let response = lease.service.rejection_response(&commands, &audit_error);
                         Err((audit_error, response))
                     }
                 }
@@ -2818,12 +2837,12 @@ struct RequestAudit {
 }
 
 impl RequestAudit {
+    #[cfg(test)]
     fn snapshot(&self) -> RequestAuditSnapshot {
         RequestAuditSnapshot {
             accepted_env: self.accepted_env.load(Ordering::Relaxed),
             rejected_env: self.rejected_env.load(Ordering::Relaxed),
             accepted_exec: self.accepted_exec.load(Ordering::Relaxed),
-            rejected_exec: self.rejected_exec.load(Ordering::Relaxed),
             rejected_shell: self.rejected_shell.load(Ordering::Relaxed),
             rejected_pty: self.rejected_pty.load(Ordering::Relaxed),
             rejected_agent: self.rejected_agent.load(Ordering::Relaxed),
@@ -2832,12 +2851,12 @@ impl RequestAudit {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RequestAuditSnapshot {
     pub(crate) accepted_env: usize,
     pub(crate) rejected_env: usize,
     pub(crate) accepted_exec: usize,
-    pub(crate) rejected_exec: usize,
     pub(crate) rejected_shell: usize,
     pub(crate) rejected_pty: usize,
     pub(crate) rejected_agent: usize,

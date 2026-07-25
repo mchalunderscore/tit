@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use gix::hash::ObjectId;
 use thiserror::Error;
@@ -8,15 +7,16 @@ use thiserror::Error;
 use crate::auth::{AuthError, validate_username};
 use crate::domain::repository::{RepositoryNameError, validate_slug};
 use crate::git::read::{
-    Comparison, ReadCancellation, ReadError, ReadLimits, RepositoryReadService,
+    Comparison, Mergeability, ReadCancellation, ReadError, ReadLimits, RepositoryReadService,
 };
+use crate::git::receive_pack::{ReceivePackError, recover_incomplete_pushes};
 use crate::git::repository::{GitRepository, GitRepositoryError};
 use crate::maintenance::MaintenanceGate;
 use crate::policy::{PolicyError, RepositoryPolicy};
 use crate::store::{
     GitOperationIntent, NewPullRequestMerge, NewPullRequestRefIntent, NewPullRequestReview,
-    PullRequestDetail, PullRequestRecord, PullRequestRefIntentRecord, PullRequestRevisionRecord,
-    RecordPage, RepositoryRecord, Store, StoreError,
+    PullRequestDetail, PullRequestEdit, PullRequestRecord, PullRequestRefIntentRecord,
+    PullRequestRevisionRecord, RecordPage, RepositoryRecord, Store, StoreError, TimelinePagination,
 };
 use crate::system::{random_lower_hex, unix_timestamp};
 
@@ -29,7 +29,6 @@ pub(crate) const PAGE_SIZE: usize = 50;
 pub(crate) struct PullRequestService {
     database: PathBuf,
     repositories: PathBuf,
-    operations: Arc<Mutex<()>>,
     maintenance: MaintenanceGate,
 }
 
@@ -37,6 +36,35 @@ pub(crate) struct PullRequestComparison {
     pub(crate) detail: PullRequestDetail,
     pub(crate) revision: PullRequestRevisionRecord,
     pub(crate) comparison: Comparison,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ActivityPages {
+    pub(crate) reviews: usize,
+    pub(crate) timeline: usize,
+}
+
+pub(crate) struct NewPullRequest<'a> {
+    pub(crate) owner: &'a str,
+    pub(crate) repository: &'a str,
+    pub(crate) actor: &'a str,
+    pub(crate) title: &'a str,
+    pub(crate) body: &'a str,
+    pub(crate) base_ref: &'a str,
+    pub(crate) head_ref: &'a str,
+}
+
+pub(crate) struct PullRequestReview<'a> {
+    pub(crate) owner: &'a str,
+    pub(crate) repository: &'a str,
+    pub(crate) number: i64,
+    pub(crate) revision: i64,
+    pub(crate) actor: &'a str,
+    pub(crate) kind: &'a str,
+    pub(crate) body: &'a str,
+    pub(crate) path: Option<&'a [u8]>,
+    pub(crate) side: Option<&'a str>,
+    pub(crate) line: Option<i64>,
 }
 
 impl PullRequestService {
@@ -52,34 +80,27 @@ impl PullRequestService {
         Self {
             database: database.to_owned(),
             repositories: repositories.to_owned(),
-            operations: Arc::new(Mutex::new(())),
             maintenance,
         }
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "opening a pull request requires its repository, content, and two refs"
-    )]
     pub(crate) fn open(
         &self,
-        owner: &str,
-        repository: &str,
-        actor: &str,
-        title: &str,
-        body: &str,
-        base_ref: &str,
-        head_ref: &str,
+        request: &NewPullRequest<'_>,
     ) -> Result<PullRequestRecord, PullRequestError> {
+        let owner = request.owner;
+        let repository = request.repository;
+        let actor = request.actor;
+        let title = request.title;
+        let body = request.body;
+        let base_ref = request.base_ref;
+        let head_ref = request.head_ref;
         validate_context(owner, repository, actor)?;
         validate_content(title, body)?;
         validate_branch(base_ref)?;
         validate_branch(head_ref)?;
         let _maintenance = self.maintenance.mutation();
-        let _operation = self
-            .operations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _operation = self.maintenance.git_operation();
         self.recover_inner()?;
 
         let authorization = Store::open(&self.database)?.repository_authorization(
@@ -129,10 +150,7 @@ impl PullRequestService {
             return Err(PullRequestError::Number);
         }
         let _maintenance = self.maintenance.mutation();
-        let _operation = self
-            .operations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _operation = self.maintenance.git_operation();
         self.recover_inner()?;
         let current = Store::open(&self.database)?
             .pull_request(owner, repository, number, Some(actor))?
@@ -181,10 +199,6 @@ impl PullRequestService {
             .pull_request)
     }
 
-    #[allow(
-        dead_code,
-        reason = "the pull-request integration test imports this module without the Web list route"
-    )]
     pub(crate) fn list_page(
         &self,
         owner: &str,
@@ -202,10 +216,7 @@ impl PullRequestService {
             return Err(PullRequestError::State);
         }
         let _maintenance = self.maintenance.mutation();
-        let _operation = self
-            .operations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _operation = self.maintenance.git_operation();
         self.recover_inner()?;
         let result = Store::open(&self.database)?
             .pull_request_page(owner, repository, actor, state, page, PAGE_SIZE)
@@ -216,10 +227,6 @@ impl PullRequestService {
         Ok(result)
     }
 
-    #[allow(
-        dead_code,
-        reason = "the pull-request integration test imports this module without the Web edit route"
-    )]
     pub(crate) fn edit(
         &self,
         owner: &str,
@@ -235,14 +242,18 @@ impl PullRequestService {
         }
         validate_content(title, body)?;
         Store::open(&self.database)?
-            .edit_pull_request(owner, repository, number, actor, title, body, timestamp()?)
+            .edit_pull_request(&PullRequestEdit {
+                owner,
+                repository,
+                number,
+                actor,
+                title,
+                body,
+                changed_at: timestamp()?,
+            })
             .map_err(Into::into)
     }
 
-    #[allow(
-        dead_code,
-        reason = "the pull-request integration test imports this module without the Web state route"
-    )]
     pub(crate) fn set_state(
         &self,
         owner: &str,
@@ -263,10 +274,7 @@ impl PullRequestService {
             .map_err(Into::into)
     }
 
-    #[allow(
-        dead_code,
-        reason = "integration tests and later non-Web callers read pull requests without comparison"
-    )]
+    #[cfg(test)]
     pub(crate) fn get(
         &self,
         owner: &str,
@@ -283,20 +291,14 @@ impl PullRequestService {
             return Err(PullRequestError::Number);
         }
         let _maintenance = self.maintenance.mutation();
-        let _operation = self
-            .operations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _operation = self.maintenance.git_operation();
         self.recover_inner()?;
         Store::open(&self.database)?
             .pull_request(owner, repository, number, actor)
             .map_err(Into::into)
     }
 
-    #[allow(
-        dead_code,
-        reason = "the binary uses the paged Web comparison and integration tests use the full comparison"
-    )]
+    #[cfg(test)]
     pub(crate) fn compare(
         &self,
         owner: &str,
@@ -308,11 +310,6 @@ impl PullRequestService {
         self.compare_with_activity(owner, repository, number, revision, actor, None)
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        dead_code,
-        reason = "the pull-request integration test imports this module without the Web detail route"
-    )]
     pub(crate) fn compare_page(
         &self,
         owner: &str,
@@ -320,8 +317,7 @@ impl PullRequestService {
         number: i64,
         revision: Option<i64>,
         actor: Option<&str>,
-        reviews_page: usize,
-        timeline_page: usize,
+        pages: ActivityPages,
     ) -> Result<PullRequestComparison, PullRequestError> {
         self.compare_with_activity(
             owner,
@@ -329,14 +325,10 @@ impl PullRequestService {
             number,
             revision,
             actor,
-            Some((reviews_page, timeline_page)),
+            Some((pages.reviews, pages.timeline)),
         )
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the paged comparison includes repository identity and independent activity pages"
-    )]
     fn compare_with_activity(
         &self,
         owner: &str,
@@ -360,10 +352,7 @@ impl PullRequestService {
             return Err(PullRequestError::Number);
         }
         let _maintenance = self.maintenance.mutation();
-        let _operation = self
-            .operations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _operation = self.maintenance.git_operation();
         self.recover_inner()?;
         let store = Store::open(&self.database)?;
         let detail = match activity {
@@ -372,9 +361,11 @@ impl PullRequestService {
                 repository,
                 number,
                 actor,
-                reviews_page,
-                timeline_page,
-                PAGE_SIZE,
+                TimelinePagination {
+                    primary_page: reviews_page,
+                    timeline_page,
+                    page_size: PAGE_SIZE,
+                },
             )?,
             None => store.pull_request(owner, repository, number, actor)?,
         };
@@ -407,33 +398,27 @@ impl PullRequestService {
         })
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "a review action includes its repository, revision, content, and optional line anchor"
-    )]
     pub(crate) fn review(
         &self,
-        owner: &str,
-        repository: &str,
-        number: i64,
-        revision_number: i64,
-        actor: &str,
-        kind: &str,
-        body: &str,
-        path: Option<&[u8]>,
-        side: Option<&str>,
-        line: Option<i64>,
+        review: &PullRequestReview<'_>,
     ) -> Result<String, PullRequestError> {
+        let owner = review.owner;
+        let repository = review.repository;
+        let number = review.number;
+        let revision_number = review.revision;
+        let actor = review.actor;
+        let kind = review.kind;
+        let body = review.body;
+        let path = review.path;
+        let side = review.side;
+        let line = review.line;
         validate_context(owner, repository, actor)?;
         if number < 1 || revision_number < 1 {
             return Err(PullRequestError::Number);
         }
         validate_review(kind, body, path, side, line)?;
         let _maintenance = self.maintenance.mutation();
-        let _operation = self
-            .operations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _operation = self.maintenance.git_operation();
         self.recover_inner()?;
         let detail =
             Store::open(&self.database)?.pull_request(owner, repository, number, Some(actor))?;
@@ -514,10 +499,7 @@ impl PullRequestService {
             return Err(PullRequestError::MergeMethod);
         }
         let _maintenance = self.maintenance.mutation();
-        let _operation = self
-            .operations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _operation = self.maintenance.git_operation();
         self.recover_inner()?;
         let detail =
             Store::open(&self.database)?.pull_request(owner, repository, number, Some(actor))?;
@@ -549,8 +531,8 @@ impl PullRequestService {
             detail.pull_request.head_ref, detail.pull_request.title
         );
         let new_target = match (method, comparison.mergeability) {
-            ("fast-forward", crate::git::read::Mergeability::FastForward) => head,
-            ("merge-commit", crate::git::read::Mergeability::Clean) => {
+            ("fast-forward", Mergeability::FastForward) => head,
+            ("merge-commit", Mergeability::Clean) => {
                 git.prepare_merge_commit(base, head, actor, created_at, &merge_message)?
             }
             _ => return Err(PullRequestError::Mergeability),
@@ -627,40 +609,10 @@ impl PullRequestService {
             .pull_request)
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile the service without the Web list route"
-    )]
-    pub(crate) fn list(
-        &self,
-        owner: &str,
-        repository: &str,
-        actor: Option<&str>,
-    ) -> Result<(crate::store::RepositoryRecord, Vec<PullRequestRecord>, bool), PullRequestError>
-    {
-        validate_username(owner)?;
-        validate_slug(repository)?;
-        if let Some(actor) = actor {
-            validate_username(actor)?;
-        }
-        let _maintenance = self.maintenance.mutation();
-        let _operation = self
-            .operations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.recover_inner()?;
-        Store::open(&self.database)?
-            .pull_requests(owner, repository, actor)
-            .map_err(Into::into)
-    }
-
     pub(crate) fn recover(&self) -> Result<(), PullRequestError> {
         let _maintenance = self.maintenance.mutation();
-        let _operation = self
-            .operations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::git::receive_pack::recover_incomplete_pushes(&self.database)?;
+        let _operation = self.maintenance.git_operation();
+        recover_incomplete_pushes(&self.database)?;
         self.recover_inner()
     }
 
@@ -855,10 +807,6 @@ pub(crate) enum PullRequestError {
     #[error("pull-request number is not valid")]
     Number,
     #[error("pull-request list state is not valid")]
-    #[allow(
-        dead_code,
-        reason = "the pull-request integration test imports this module without Web list state"
-    )]
     State,
     #[error("pull-request revision does not exist")]
     Revision,
@@ -891,7 +839,7 @@ pub(crate) enum PullRequestError {
     #[error(transparent)]
     Policy(#[from] PolicyError),
     #[error(transparent)]
-    ReceivePack(#[from] crate::git::receive_pack::ReceivePackError),
+    ReceivePack(#[from] ReceivePackError),
     #[error("cannot create a random pull-request ID")]
     Random,
     #[error("the system clock is before the Unix epoch")]

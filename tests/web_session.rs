@@ -1,7 +1,7 @@
 use crate::{account, auth, session, store};
 
-#[allow(dead_code, reason = "the Web session test uses one shared test helper")]
-mod support;
+#[path = "ssh_fixture.rs"]
+mod ssh_fixture;
 
 use std::fs;
 use std::path::Path;
@@ -11,13 +11,13 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
-use support::create_ssh_key_fixture;
 use tempfile::TempDir;
 use url::Url;
 
 use account::{AccountError, AccountKeyRequest, AccountService};
 use auth::SshPublicKey;
 use session::{SessionError, WebLoginService};
+use ssh_fixture::create_ssh_key as create_ssh_key_fixture;
 use store::{InitialAdministrator, Store, StoreError};
 
 #[test]

@@ -6,7 +6,7 @@ use crate::auth::{AuthError, validate_username};
 use crate::domain::repository::{RepositoryNameError, validate_slug};
 use crate::store::{
     IssueChange, IssueDetail, IssueRecord, NewIssue, RecordPage, RepositoryRecord, Store,
-    StoreError,
+    StoreError, TimelinePagination,
 };
 use crate::system::unix_timestamp;
 
@@ -100,9 +100,11 @@ impl IssueService {
                 repository,
                 number,
                 actor,
-                comments_page,
-                timeline_page,
-                PAGE_SIZE,
+                TimelinePagination {
+                    primary_page: comments_page,
+                    timeline_page,
+                    page_size: PAGE_SIZE,
+                },
             )
             .map_err(IssueError::from)?;
         if (comments_page > 1 && detail.comments.is_empty())

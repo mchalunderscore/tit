@@ -8,8 +8,10 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 
 use crate::codec::{decode_ascii_hex, encode_lower_hex};
+use crate::git::read::{Comparison, Mergeability};
+use crate::git::repository::GitRepositoryError;
 use crate::markdown::{self, RenderedMarkdown};
-use crate::pull_request::PullRequestError;
+use crate::pull_request::{ActivityPages, NewPullRequest, PullRequestError, PullRequestReview};
 use crate::store::StoreError;
 
 use super::filters;
@@ -83,8 +85,10 @@ async fn download_revision_patch(
             number,
             Some(revision),
             actor.0.as_deref(),
-            1,
-            1,
+            ActivityPages {
+                reviews: 1,
+                timeline: 1,
+            },
         )
     })
     .await;
@@ -226,8 +230,10 @@ async fn pull_request_detail(
             path.number,
             query.revision,
             actor.0.as_deref(),
-            reviews_page,
-            timeline_page,
+            ActivityPages {
+                reviews: reviews_page,
+                timeline: timeline_page,
+            },
         )
     })
     .await;
@@ -460,18 +466,18 @@ async fn create_review(
     let repository = path.repository.clone();
     let number = path.number;
     let result = job(state, move || {
-        service.review(
-            &owner,
-            &repository,
+        service.review(&PullRequestReview {
+            owner: &owner,
+            repository: &repository,
             number,
             revision,
-            &actor,
-            &fields[2],
-            &fields[3],
-            path_bytes.as_deref(),
-            side.as_deref(),
+            actor: &actor,
+            kind: &fields[2],
+            body: &fields[3],
+            path: path_bytes.as_deref(),
+            side: side.as_deref(),
             line,
-        )
+        })
     })
     .await;
     match result {
@@ -506,15 +512,15 @@ async fn open_pull_request(
     let owner = path.owner.clone();
     let repository = path.repository.clone();
     let result = job(state, move || {
-        service.open(
-            &owner,
-            &repository,
-            &actor,
-            &fields[1],
-            &fields[2],
-            &fields[3],
-            &fields[4],
-        )
+        service.open(&NewPullRequest {
+            owner: &owner,
+            repository: &repository,
+            actor: &actor,
+            title: &fields[1],
+            body: &fields[2],
+            base_ref: &fields[3],
+            head_ref: &fields[4],
+        })
     })
     .await;
     match result {
@@ -623,9 +629,7 @@ fn mutation_error(error: PullRequestError, request_id: &str) -> Response {
         | PullRequestError::MergeMethod
         | PullRequestError::Store(StoreError::PullRequestRevisionNotFound)
         | PullRequestError::Store(StoreError::PullRequestReviewAnchor)
-        | PullRequestError::Git(crate::git::repository::GitRepositoryError::MissingReference(_)) => {
-            bad_request(request_id)
-        }
+        | PullRequestError::Git(GitRepositoryError::MissingReference(_)) => bad_request(request_id),
         PullRequestError::StaleRevision | PullRequestError::Mergeability => render_error(
             StatusCode::CONFLICT,
             request_id,
@@ -822,10 +826,8 @@ struct DiffView {
     hunks: String,
 }
 
-impl From<&crate::git::read::Comparison> for ComparisonView {
-    fn from(comparison: &crate::git::read::Comparison) -> Self {
-        use crate::git::read::Mergeability;
-
+impl From<&Comparison> for ComparisonView {
+    fn from(comparison: &Comparison) -> Self {
         Self {
             merge_base: comparison
                 .merge_base

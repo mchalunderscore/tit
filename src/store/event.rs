@@ -115,21 +115,21 @@ pub(super) fn pull_request_merge(
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the event payload stores the complete immutable review anchor"
-)]
+pub(super) struct PullRequestReview<'a> {
+    pub(super) pull_request_id: &'a str,
+    pub(super) number: i64,
+    pub(super) review_id: &'a str,
+    pub(super) revision: i64,
+    pub(super) body: &'a str,
+    pub(super) commit_object_id: Option<&'a str>,
+    pub(super) path: Option<&'a [u8]>,
+    pub(super) side: Option<&'a str>,
+    pub(super) line: Option<i64>,
+}
+
 pub(super) fn pull_request_review(
     kind: EventKind,
-    pull_request_id: &str,
-    number: i64,
-    review_id: &str,
-    revision: i64,
-    body: &str,
-    commit_object_id: Option<&str>,
-    path: Option<&[u8]>,
-    side: Option<&str>,
-    line: Option<i64>,
+    review: &PullRequestReview<'_>,
 ) -> VersionedEvent {
     debug_assert!(matches!(
         kind,
@@ -142,35 +142,32 @@ pub(super) fn pull_request_review(
         kind,
         payload: json!({
             "version": PAYLOAD_VERSION,
-            "pull_request_id": pull_request_id,
-            "number": number,
-            "review_id": review_id,
-            "revision": revision,
-            "body": body,
-            "commit_object_id": commit_object_id,
-            "path_hex": path.map(encode_lower_hex),
-            "side": side,
-            "line": line,
+            "pull_request_id": review.pull_request_id,
+            "number": review.number,
+            "review_id": review.review_id,
+            "revision": review.revision,
+            "body": review.body,
+            "commit_object_id": review.commit_object_id,
+            "path_hex": review.path.map(encode_lower_hex),
+            "side": review.side,
+            "line": review.line,
         })
         .to_string(),
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the event payload stores the complete immutable pull-request revision"
-)]
-pub(super) fn pull_request(
-    kind: EventKind,
-    pull_request_id: &str,
-    number: i64,
-    revision: i64,
-    title: &str,
-    base_ref: &str,
-    head_ref: &str,
-    base_object_id: &str,
-    head_object_id: &str,
-) -> VersionedEvent {
+pub(super) struct PullRequestRevision<'a> {
+    pub(super) pull_request_id: &'a str,
+    pub(super) number: i64,
+    pub(super) revision: i64,
+    pub(super) title: &'a str,
+    pub(super) base_ref: &'a str,
+    pub(super) head_ref: &'a str,
+    pub(super) base_object_id: &'a str,
+    pub(super) head_object_id: &'a str,
+}
+
+pub(super) fn pull_request(kind: EventKind, revision: &PullRequestRevision<'_>) -> VersionedEvent {
     debug_assert!(matches!(
         kind,
         EventKind::PullRequestCreated | EventKind::PullRequestRevised
@@ -179,14 +176,14 @@ pub(super) fn pull_request(
         kind,
         payload: json!({
             "version": PAYLOAD_VERSION,
-            "pull_request_id": pull_request_id,
-            "number": number,
-            "revision": revision,
-            "title": title,
-            "base_ref": base_ref,
-            "head_ref": head_ref,
-            "base_object_id": base_object_id,
-            "head_object_id": head_object_id,
+            "pull_request_id": revision.pull_request_id,
+            "number": revision.number,
+            "revision": revision.revision,
+            "title": revision.title,
+            "base_ref": revision.base_ref,
+            "head_ref": revision.head_ref,
+            "base_object_id": revision.base_object_id,
+            "head_object_id": revision.head_object_id,
         })
         .to_string(),
     }

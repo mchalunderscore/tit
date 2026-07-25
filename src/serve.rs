@@ -86,6 +86,7 @@ pub(crate) async fn run(config: &Config) -> Result<(), ServeError> {
             instance_dir: config.instance_dir.clone(),
             http_clone_base,
             ssh_clone_base,
+            trusted_proxy: config.http_trusted_proxy,
             max_request_bytes: usize::try_from(config.max_request_bytes)
                 .map_err(|_| ServeError::RequestLimit)?,
             max_connections: usize::try_from(config.max_connections)

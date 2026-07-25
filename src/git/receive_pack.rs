@@ -1048,8 +1048,6 @@ pub(crate) enum ReceivePackError {
     StaleRef,
     #[error("receive-pack input is missing a pack")]
     MissingPack,
-    #[error("receive-pack input has an unexpected pack")]
-    UnexpectedPack,
     #[error("receive-pack exceeds the pack limit")]
     PackLimit,
     #[error("receive-pack exceeds the object limit")]
@@ -1093,7 +1091,6 @@ impl ReceivePackError {
         matches!(
             self,
             Self::MissingPack
-                | Self::UnexpectedPack
                 | Self::PackLimit
                 | Self::ObjectLimit
                 | Self::Pack(_)

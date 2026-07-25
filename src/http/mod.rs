@@ -127,6 +127,7 @@ struct WebState {
     watches: Option<WatchService>,
     readiness: Option<ListenerReadiness>,
     secure_cookies: bool,
+    trusted_proxy: Option<IpAddr>,
 }
 
 #[derive(Clone)]
@@ -159,6 +160,7 @@ pub(crate) struct PublicWebConfig {
     pub(crate) instance_dir: PathBuf,
     pub(crate) http_clone_base: String,
     pub(crate) ssh_clone_base: String,
+    pub(crate) trusted_proxy: Option<IpAddr>,
     pub(crate) max_request_bytes: usize,
     pub(crate) max_connections: usize,
 }
@@ -183,12 +185,14 @@ impl ListenerReadiness {
 }
 
 pub(crate) struct RunningWebServer {
+    #[cfg(test)]
     address: SocketAddr,
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<std::io::Result<()>>,
 }
 
 impl RunningWebServer {
+    #[cfg(test)]
     pub(crate) async fn start(address: SocketAddr) -> Result<Self, WebError> {
         Self::start_with_state(
             address,
@@ -212,11 +216,13 @@ impl RunningWebServer {
                 watches: None,
                 readiness: None,
                 secure_cookies: false,
+                trusted_proxy: None,
             },
         )
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_public(
         address: SocketAddr,
         config: PublicWebConfig,
@@ -257,6 +263,7 @@ impl RunningWebServer {
         let ssh_login_target = parse_ssh_login_target(&config.ssh_clone_base)?;
         let database = config.instance_dir.join(crate::store::DATABASE_FILE);
         let accounts = AccountService::new(database.clone());
+        let trusted_proxy = config.trusted_proxy;
         let public_url = url::Url::parse(&format!("{}/", config.http_clone_base))
             .map_err(WebError::CanonicalUrl)?;
         let secure_cookies = public_url.scheme() == "https";
@@ -300,6 +307,7 @@ impl RunningWebServer {
                 watches: Some(watches),
                 readiness,
                 secure_cookies,
+                trusted_proxy,
             },
         )
         .await
@@ -307,6 +315,7 @@ impl RunningWebServer {
 
     async fn start_with_state(address: SocketAddr, state: WebState) -> Result<Self, WebError> {
         let listener = TcpListener::bind(address).await?;
+        #[cfg(test)]
         let address = listener.local_addr()?;
         let (shutdown, receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -320,12 +329,14 @@ impl RunningWebServer {
             .await
         });
         Ok(Self {
+            #[cfg(test)]
             address,
             shutdown,
             task,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn address(&self) -> SocketAddr {
         self.address
     }
@@ -350,30 +361,6 @@ impl RunningWebServer {
             }
         }
     }
-}
-
-pub(crate) fn router() -> Router {
-    router_with_state(WebState {
-        public: None,
-        accounts: None,
-        jobs: Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS)),
-        requests: Arc::new(Semaphore::new(1024)),
-        login_attempts: login_attempt_limiter(),
-        account_attempts: login_attempt_limiter(),
-        max_request_bytes: 1024 * 1024,
-        telemetry: Telemetry::default(),
-        key_reloader: None,
-        login: None,
-        ssh_login_target: None,
-        repositories: None,
-        issues: None,
-        pull_requests: None,
-        feeds: None,
-        search: None,
-        watches: None,
-        readiness: None,
-        secure_cookies: false,
-    })
 }
 
 fn router_with_state(state: WebState) -> Router {
@@ -520,11 +507,12 @@ async fn request_guard(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let address = request
+    let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|peer| peer.0.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let address = client_address(peer, request.headers(), state.trusted_proxy);
     request.extensions_mut().insert(ClientAddress(address));
     let permit = match tokio::time::timeout(
         CONCURRENCY_WAIT,
@@ -544,6 +532,20 @@ async fn request_guard(
             "Request time limit exceeded.\n",
         ),
     }
+}
+
+fn client_address(peer: IpAddr, headers: &HeaderMap, trusted_proxy: Option<IpAddr>) -> IpAddr {
+    if trusted_proxy != Some(peer) {
+        return peer;
+    }
+    headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .next_back()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit(',').next())
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(peer)
 }
 
 fn limit_response(status: StatusCode, message: &'static str) -> Response {
@@ -2495,4 +2497,30 @@ pub(crate) enum WebError {
     Session(#[from] SessionError),
     #[error("HTTP server task failed")]
     Join,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_forwarded_addresses_only_from_the_configured_proxy() {
+        let proxy = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let client: IpAddr = "192.0.2.10".parse().expect("parse a client address");
+        let direct: IpAddr = "203.0.113.5".parse().expect("parse a direct address");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.9, 192.0.2.10"),
+        );
+
+        assert_eq!(client_address(proxy, &headers, Some(proxy)), client);
+        assert_eq!(client_address(direct, &headers, Some(proxy)), direct);
+
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("not-an-address"),
+        );
+        assert_eq!(client_address(proxy, &headers, Some(proxy)), proxy);
+    }
 }

@@ -102,7 +102,8 @@ Use the technical nouns in this list:
   HTML, and statically linked code.
 - dependency audit, external test driver, fixture repository, loopback address,
   quality gate, Rust toolchain, standard error, and standard output.
-- advertised hostname, hostname, onion hostname, and proxy command.
+- advertised hostname, hostname, onion hostname, proxy, proxy command, and
+  trusted proxy.
 - database constraint, foreign key, online backup, prepared statement, and
   schema migration.
 - durability gate, local filesystem, migration backup, percentile, and

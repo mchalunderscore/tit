@@ -39,7 +39,9 @@ install -m 600 config.example.toml /srv/tit/config.toml
 Set `public_url`, the HTTP listener, and the SSH listener and advertised
 hostname in `/srv/tit/config.toml`. Use HTTPS for a public instance. The
 included files in `release/examples/` contain service definitions and a Caddy
-example for Linux, macOS, FreeBSD, OpenBSD, and NetBSD.
+example for Linux, macOS, FreeBSD, OpenBSD, and NetBSD. Set
+`http.trusted_proxy` to the Caddy connection address. Do not set this field when
+a client can connect directly to the HTTP listener.
 
 Create the first administrator:
 

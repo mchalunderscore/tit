@@ -2,10 +2,6 @@ pub mod app;
 
 pub(crate) mod account;
 pub(crate) mod admin;
-#[allow(
-    dead_code,
-    reason = "the current login flow does not use the legacy challenge API"
-)]
 pub(crate) mod auth;
 pub(crate) mod backup;
 pub(crate) mod bootstrap;
@@ -17,15 +13,7 @@ pub(crate) mod diagnostics;
 pub(crate) mod domain;
 pub(crate) mod feed;
 pub(crate) mod feed_token;
-#[allow(
-    dead_code,
-    reason = "the test suite exercises Git transports that the server composes indirectly"
-)]
 pub(crate) mod git;
-#[allow(
-    dead_code,
-    reason = "the test suite starts isolated Web servers through additional constructors"
-)]
 pub(crate) mod http;
 pub(crate) mod instance;
 pub(crate) mod issue;
@@ -39,10 +27,6 @@ pub(crate) mod repository;
 pub(crate) mod search;
 pub(crate) mod serve;
 pub(crate) mod session;
-#[allow(
-    dead_code,
-    reason = "the test suite starts isolated SSH servers through additional constructors"
-)]
 pub(crate) mod ssh;
 pub(crate) mod store;
 pub(crate) mod system;

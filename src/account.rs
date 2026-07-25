@@ -16,10 +16,6 @@ const INVITATION_PREFIX: &str = "tit-invite-v1:";
 const RECOVERY_PREFIX: &str = "tit-recovery-v1:";
 const SECRET_BYTES: usize = 32;
 const INVITATION_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
-#[allow(
-    dead_code,
-    reason = "the account integration test imports this module without the Web profile route"
-)]
 const PROFILE_REPOSITORY_PAGE_SIZE: usize = 20;
 
 #[derive(Clone)]
@@ -194,10 +190,6 @@ impl AccountService {
             .map_err(Into::into)
     }
 
-    #[allow(
-        dead_code,
-        reason = "the account integration test imports this module without the Web profile route"
-    )]
     pub(crate) fn profile_page(
         &self,
         username: &str,
@@ -229,19 +221,11 @@ impl AccountService {
             .map_err(Into::into)
     }
 
-    #[allow(
-        dead_code,
-        reason = "the account integration test imports this module without Web account routes"
-    )]
     pub(crate) fn keys(&self, username: &str) -> Result<Vec<KeyInspection>, AccountError> {
         validate_username(username)?;
         Ok(Store::open(&self.database)?.inspect_account(username)?.keys)
     }
 
-    #[allow(
-        dead_code,
-        reason = "the account integration test imports this module without Web account routes"
-    )]
     pub(crate) fn complete_key_add(
         &self,
         request: &AccountKeyRequest<'_>,
@@ -281,10 +265,6 @@ impl AccountService {
         result
     }
 
-    #[allow(
-        dead_code,
-        reason = "the account integration test imports this module without Web account routes"
-    )]
     pub(crate) fn complete_key_revoke(
         &self,
         request: &AccountKeyRequest<'_>,
@@ -341,10 +321,6 @@ impl AccountService {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "integration tests compile accounts without the server"
-    )]
     pub(crate) fn database(&self) -> &Path {
         &self.database
     }
@@ -405,10 +381,6 @@ fn validate_label(label: &str) -> Result<(), AccountError> {
     Ok(())
 }
 
-#[allow(
-    dead_code,
-    reason = "the account integration test imports this module without Web account routes"
-)]
 fn validate_token(token: &str) -> Result<(), AccountError> {
     if token.len() != SECRET_BYTES * 2 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(AccountError::InvalidSecret);

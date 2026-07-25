@@ -8,194 +8,31 @@ use rusqlite::backup::Backup;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
-use thiserror::Error;
 
 use crate::codec::encode_lower_hex;
+
+mod error;
 mod event;
+mod schema;
+
+pub(crate) use error::StoreError;
+use schema::{MIGRATIONS, VERSION as SCHEMA_VERSION};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT_MILLISECONDS: i64 = 5_000;
 const MAX_ACTIVE_FEED_TOKENS: i64 = 1;
-const SCHEMA_VERSION: i64 = 24;
-#[allow(
-    dead_code,
-    reason = "the integration test imports this module without the CLI operation"
-)]
 pub(crate) const DATABASE_FILE: &str = "tit.sqlite3";
-#[allow(
-    dead_code,
-    reason = "some integration test crates import storage without migration operations"
-)]
-const MIGRATIONS: [&str; 24] = [
-    include_str!("migrations/001_initial.sql"),
-    include_str!("migrations/002_state.sql"),
-    include_str!("migrations/003_git_intents.sql"),
-    include_str!("migrations/004_identity.sql"),
-    include_str!("migrations/005_repository.sql"),
-    include_str!("migrations/006_repository_events.sql"),
-    include_str!("migrations/007_account_lifecycle.sql"),
-    include_str!("migrations/008_web_sessions.sql"),
-    include_str!("migrations/009_repository_authorization.sql"),
-    include_str!("migrations/010_audit_history.sql"),
-    include_str!("migrations/011_domain_events.sql"),
-    include_str!("migrations/012_issues.sql"),
-    include_str!("migrations/013_watches.sql"),
-    include_str!("migrations/014_feed_tokens.sql"),
-    include_str!("migrations/015_pull_requests.sql"),
-    include_str!("migrations/016_pull_request_reviews.sql"),
-    include_str!("migrations/017_pull_request_merges.sql"),
-    include_str!("migrations/018_streamlined_login.sql"),
-    include_str!("migrations/019_product_reduction.sql"),
-    include_str!("migrations/020_repository_profiles.sql"),
-    include_str!("migrations/021_pull_request_lifecycle.sql"),
-    include_str!("migrations/022_account_key_management.sql"),
-    include_str!("migrations/023_default_branch.sql"),
-    include_str!("migrations/024_default_branch_intents.sql"),
-];
-
-#[allow(
-    dead_code,
-    reason = "integration tests compile storage without every account operation"
-)]
-#[derive(Debug, Error)]
-pub(crate) enum StoreError {
-    #[error("SQLite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
-    #[error("cannot read migration path {path}: {source}")]
-    MigrationFilesystem {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[allow(
-        dead_code,
-        reason = "some integration test crates import storage without schema-version rejection"
-    )]
-    #[error("database schema version {0} is newer than this executable")]
-    NewerSchema(i64),
-    #[allow(
-        dead_code,
-        reason = "the integration test imports this module without the CLI operation"
-    )]
-    #[error("database schema version is {actual}, expected {expected}")]
-    SchemaVersion { expected: i64, actual: i64 },
-    #[error("database integrity check failed: {0}")]
-    Integrity(String),
-    #[error("SQLite setting {name} is {actual}, expected {expected}")]
-    Setting {
-        name: &'static str,
-        expected: &'static str,
-        actual: String,
-    },
-    #[error("Git operation intent {0} is not in the required state")]
-    IntentState(String),
-    #[error("the instance already has an administrator")]
-    AlreadyInitialized,
-    #[error("account does not exist or is not active: {0}")]
-    AccountNotFound(String),
-    #[error("username is not available: {0}")]
-    UsernameUnavailable(String),
-    #[error("signup invitation is invalid, expired, or already used")]
-    InvalidInvitation,
-    #[error("recovery credential is invalid")]
-    InvalidRecovery,
-    #[error("SSH public key already exists")]
-    KeyExists,
-    #[error("active SSH public key does not exist")]
-    KeyNotFound,
-    #[error("an account must have at least one active SSH public key")]
-    LastKey,
-    #[error("login identity does not exist or is not active")]
-    LoginIdentity,
-    #[error("too many login challenges are active")]
-    LoginNonceLimit,
-    #[error("login challenge is invalid, expired, or already used")]
-    InvalidLoginChallenge,
-    #[error("SSH login approval is invalid, expired, or already used")]
-    InvalidLoginApproval,
-    #[error("SSH login approval is waiting for SSH authentication")]
-    LoginApprovalPending,
-    #[error("Web session is invalid or expired")]
-    InvalidSession,
-    #[error("repository does not exist: {0}/{1}")]
-    RepositoryNotFound(String, String),
-    #[error("repository already exists: {0}/{1}")]
-    RepositoryExists(String, String),
-    #[error("repository ID already exists")]
-    RepositoryIdentifierCollision,
-    #[error("repository is already archived: {0}/{1}")]
-    RepositoryArchived(String, String),
-    #[error("repository visibility is not valid")]
-    InvalidRepositoryVisibility,
-    #[error("repository default branch is not valid")]
-    InvalidDefaultBranch,
-    #[error("repository default-branch intent {0} is not in the required state")]
-    DefaultBranchIntentState(String),
-    #[error("collaborator role is not valid")]
-    InvalidCollaboratorRole,
-    #[error("repository owner cannot be a collaborator")]
-    OwnerCollaborator,
-    #[error("collaborator account does not exist or is not active: {0}")]
-    CollaboratorNotFound(String),
-    #[allow(
-        dead_code,
-        reason = "some integration tests import storage without public event pages"
-    )]
-    #[error("repository event page limit is too large")]
-    EventLimit,
-    #[error("stored Git reference event is malformed")]
-    EventPayload,
-    #[error("audit event page limit is too large")]
-    AuditLimit,
-    #[error("issue does not exist: {0}/{1}#{2}")]
-    IssueNotFound(String, String, i64),
-    #[error("issue access is not authorized")]
-    IssueDenied,
-    #[error("issue is hidden by repository access policy")]
-    IssueHidden,
-    #[error("issue state is already {0}")]
-    IssueState(String),
-    #[error("pull request does not exist: {0}/{1}#{2}")]
-    PullRequestNotFound(String, String, i64),
-    #[error("pull-request access is not authorized")]
-    PullRequestDenied,
-    #[error("pull request is hidden by repository access policy")]
-    PullRequestHidden,
-    #[error("pull request is not open")]
-    PullRequestState,
-    #[error("pull-request revision does not exist")]
-    PullRequestRevisionNotFound,
-    #[error("pull-request review anchor does not match its revision")]
-    PullRequestReviewAnchor,
-    #[error("pull-request ref intent {0} is not in the required state")]
-    PullRequestIntentState(String),
-    #[error("repository watch access is not authorized")]
-    WatchDenied,
-    #[error("feed token is invalid or revoked")]
-    FeedTokenNotFound,
-    #[error("an account cannot have more than one active feed token")]
-    FeedTokenLimit,
-    #[error("feed token scope is not valid")]
-    InvalidFeedScope,
-}
 
 pub(crate) struct Store {
     connection: Connection,
 }
 
 impl Store {
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without audited services"
-    )]
     pub(crate) fn record_audit_event(&self, event: &NewAuditEvent<'_>) -> Result<(), StoreError> {
         insert_audit_event(&self.connection, event)?;
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without the audit CLI"
-    )]
     pub(crate) fn audit_events(&self, limit: usize) -> Result<Vec<AuditEventRecord>, StoreError> {
         if limit == 0 || limit > 1_000 {
             return Err(StoreError::AuditLimit);
@@ -221,10 +58,6 @@ impl Store {
             .map_err(Into::into)
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration test crates import storage without opening a database"
-    )]
     pub(crate) fn open(path: &Path) -> Result<Self, StoreError> {
         let mut store = Self::open_unmigrated(path)?;
         let current = store.schema_version()?;
@@ -235,10 +68,6 @@ impl Store {
         Ok(store)
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration test crates import storage without migration setup"
-    )]
     pub(crate) fn open_unmigrated(path: &Path) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
         configure(&connection)?;
@@ -255,18 +84,10 @@ impl Store {
         Ok(Self { connection })
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration test crates import storage without direct migration"
-    )]
     pub(crate) fn migrate(&mut self) -> Result<(), StoreError> {
         self.migrate_with_hook(|_| {})
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration test crates import storage without migration hooks"
-    )]
     pub(crate) fn migrate_with_hook(
         &mut self,
         mut after_migration: impl FnMut(i64),
@@ -336,10 +157,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration test crates import storage without backup operations"
-    )]
     pub(crate) fn backup(&self, path: &Path) -> Result<(), StoreError> {
         let mut destination = Connection::open(path)?;
         let backup = Backup::new(&self.connection, &mut destination)?;
@@ -372,7 +189,6 @@ impl Store {
     }
 
     #[cfg(test)]
-    #[allow(dead_code, reason = "integration storage tests use this test boundary")]
     pub(crate) fn checkpoint(&self) -> Result<(), StoreError> {
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
@@ -380,24 +196,17 @@ impl Store {
     }
 
     #[cfg(test)]
-    #[allow(dead_code, reason = "integration storage tests use this test boundary")]
     pub(crate) fn vacuum(&self) -> Result<(), StoreError> {
         self.connection.execute_batch("VACUUM")?;
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "integration storage tests use this database test boundary"
-    )]
+    #[cfg(test)]
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
     }
 
-    #[allow(
-        dead_code,
-        reason = "integration storage tests use this mutable database test boundary"
-    )]
+    #[cfg(test)]
     pub(crate) fn connection_mut(&mut self) -> &mut Connection {
         &mut self.connection
     }
@@ -630,10 +439,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without receive-pack"
-    )]
     pub(crate) fn git_intent_completed(&self, id: &str) -> Result<bool, StoreError> {
         Ok(self
             .connection
@@ -714,10 +519,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without accounts"
-    )]
     pub(crate) fn create_signup_invitation(
         &self,
         code_hash: &[u8; 32],
@@ -732,10 +533,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without accounts"
-    )]
     pub(crate) fn create_account_with_invitation(
         &mut self,
         account: &InvitedAccount<'_>,
@@ -785,10 +582,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without accounts"
-    )]
     pub(crate) fn recover_account(
         &mut self,
         recovery: &AccountRecovery<'_>,
@@ -858,10 +651,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without accounts"
-    )]
     pub(crate) fn add_account_key(
         &mut self,
         username: &str,
@@ -892,10 +681,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without accounts"
-    )]
     pub(crate) fn revoke_account_key(
         &mut self,
         username: &str,
@@ -1033,10 +818,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without accounts"
-    )]
     pub(crate) fn suspend_account(
         &mut self,
         username: &str,
@@ -1084,10 +865,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without Web login"
-    )]
     pub(crate) fn create_login_nonce(
         &mut self,
         nonce: &NewLoginNonce<'_>,
@@ -1130,10 +907,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without Web login"
-    )]
     pub(crate) fn consume_login_nonce(
         &mut self,
         login: &NewWebSession<'_>,
@@ -1355,10 +1128,6 @@ impl Store {
         Ok(username)
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without Web login"
-    )]
     pub(crate) fn web_session(
         &self,
         session_hash: &[u8; 32],
@@ -1367,8 +1136,7 @@ impl Store {
     ) -> Result<WebSessionRecord, StoreError> {
         self.connection
             .query_row(
-                "SELECT account.username, account.is_administrator, web_session.expires_at,
-                        web_session.ssh_public_key_id
+                "SELECT account.username, account.is_administrator
                  FROM web_session
                  JOIN account ON account.id = web_session.account_id
                  WHERE web_session.session_hash = ?1 AND web_session.ended_at IS NULL
@@ -1379,8 +1147,6 @@ impl Store {
                     Ok(WebSessionRecord {
                         username: row.get(0)?,
                         is_administrator: row.get(1)?,
-                        expires_at: row.get(2)?,
-                        ssh_public_key_id: row.get(3)?,
                     })
                 },
             )
@@ -1388,10 +1154,6 @@ impl Store {
             .ok_or(StoreError::InvalidSession)
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without Web login"
-    )]
     pub(crate) fn end_account_sessions(
         &mut self,
         username: &str,
@@ -1614,10 +1376,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without admin commands"
-    )]
     pub(crate) fn set_repository_visibility(
         &mut self,
         owner: &str,
@@ -1658,10 +1416,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without admin commands"
-    )]
     pub(crate) fn set_repository_collaborator(
         &mut self,
         owner: &str,
@@ -1722,10 +1476,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without admin commands"
-    )]
     pub(crate) fn remove_repository_collaborator(
         &mut self,
         owner: &str,
@@ -2032,20 +1782,17 @@ impl Store {
             .ok_or_else(|| StoreError::Integrity(format!("repository {repository_id} disappeared")))
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "an audited repository settings change includes repository identity and audit context"
-    )]
     pub(crate) fn update_repository_settings(
         &mut self,
-        owner: &str,
-        slug: &str,
-        actor: &str,
-        description: &str,
-        visibility: &str,
-        changed_at: i64,
-        correlation_id: &str,
+        update: &RepositorySettingsUpdate<'_>,
     ) -> Result<(), StoreError> {
+        let owner = update.owner;
+        let slug = update.slug;
+        let actor = update.actor;
+        let description = update.description;
+        let visibility = update.visibility;
+        let changed_at = update.changed_at;
+        let correlation_id = update.correlation_id;
         if !matches!(visibility, "public" | "private") {
             return Err(StoreError::InvalidRepositoryVisibility);
         }
@@ -2081,20 +1828,17 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "an audited collaborator change includes repository identity and audit context"
-    )]
     pub(crate) fn update_repository_collaborator(
         &mut self,
-        owner: &str,
-        slug: &str,
-        actor: &str,
-        username: &str,
-        role: Option<&str>,
-        changed_at: i64,
-        correlation_id: &str,
+        update: &RepositoryCollaboratorUpdate<'_>,
     ) -> Result<(), StoreError> {
+        let owner = update.owner;
+        let slug = update.slug;
+        let actor = update.actor;
+        let username = update.username;
+        let role = update.role;
+        let changed_at = update.changed_at;
+        let correlation_id = update.correlation_id;
         if role.is_some_and(|role| !matches!(role, "maintainer" | "writer" | "reader")) {
             return Err(StoreError::InvalidCollaboratorRole);
         }
@@ -2281,10 +2025,6 @@ impl Store {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without authorization"
-    )]
     pub(crate) fn repository_authorization(
         &self,
         owner: &str,
@@ -2444,12 +2184,14 @@ impl Store {
         insert_pull_request_intent(
             &transaction,
             intent,
-            &access.repository.id,
-            actor_id,
-            number,
-            1,
-            None,
-            "open",
+            &PullRequestIntentInsertion {
+                repository_id: &access.repository.id,
+                author_account_id: actor_id,
+                pull_request_number: number,
+                revision_number: 1,
+                old_head_object_id: None,
+                operation: "open",
+            },
         )?;
         transaction.commit()?;
         Ok(PullRequestRefIntentRecord::from_new(
@@ -2531,12 +2273,14 @@ impl Store {
         insert_pull_request_intent(
             &transaction,
             intent,
-            &access.repository.id,
-            actor_id,
-            number,
-            revision,
-            Some(&old_head),
-            "revise",
+            &PullRequestIntentInsertion {
+                repository_id: &access.repository.id,
+                author_account_id: actor_id,
+                pull_request_number: number,
+                revision_number: revision,
+                old_head_object_id: Some(&old_head),
+                operation: "revise",
+            },
         )?;
         transaction.commit()?;
         Ok(PullRequestRefIntentRecord::from_new(
@@ -2619,14 +2363,16 @@ impl Store {
         };
         let event = event::pull_request(
             kind,
-            &intent.pull_request_id,
-            intent.pull_request_number,
-            intent.revision_number,
-            &intent.title,
-            &intent.base_ref,
-            &intent.head_ref,
-            &intent.base_object_id,
-            &intent.head_object_id,
+            &event::PullRequestRevision {
+                pull_request_id: &intent.pull_request_id,
+                number: intent.pull_request_number,
+                revision: intent.revision_number,
+                title: &intent.title,
+                base_ref: &intent.base_ref,
+                head_ref: &intent.head_ref,
+                base_object_id: &intent.base_object_id,
+                head_object_id: &intent.head_object_id,
+            },
         );
         insert_domain_event(
             &transaction,
@@ -2693,26 +2439,24 @@ impl Store {
         self.pull_request_with_activity(owner, repository, number, actor, None)
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the pull-request detail has independent review and timeline pages"
-    )]
     pub(crate) fn pull_request_detail_page(
         &self,
         owner: &str,
         repository: &str,
         number: i64,
         actor: Option<&str>,
-        reviews_page: usize,
-        timeline_page: usize,
-        page_size: usize,
+        pagination: TimelinePagination,
     ) -> Result<PullRequestDetail, StoreError> {
         self.pull_request_with_activity(
             owner,
             repository,
             number,
             actor,
-            Some((reviews_page, timeline_page, page_size)),
+            Some((
+                pagination.primary_page,
+                pagination.timeline_page,
+                pagination.page_size,
+            )),
         )
     }
 
@@ -2961,15 +2705,17 @@ impl Store {
         };
         let event = event::pull_request_review(
             kind,
-            &pull_request.0,
-            review.number,
-            &id,
-            review.revision,
-            review.body,
-            review.commit_object_id,
-            review.path,
-            review.side,
-            review.line,
+            &event::PullRequestReview {
+                pull_request_id: &pull_request.0,
+                number: review.number,
+                review_id: &id,
+                revision: review.revision,
+                body: review.body,
+                commit_object_id: review.commit_object_id,
+                path: review.path,
+                side: review.side,
+                line: review.line,
+            },
         );
         insert_pull_request_event(
             &transaction,
@@ -2981,34 +2727,6 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(id)
-    }
-
-    pub(crate) fn pull_requests(
-        &self,
-        owner: &str,
-        repository: &str,
-        actor: Option<&str>,
-    ) -> Result<(RepositoryRecord, Vec<PullRequestRecord>, bool), StoreError> {
-        let access = repository_issue_access(&self.connection, owner, repository, actor)?;
-        if !access.can_read() {
-            return Err(StoreError::PullRequestHidden);
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT pull_request.id, pull_request.number, pull_request.title,
-                    pull_request.body, pull_request.state, author.username,
-                    pull_request.base_ref, pull_request.head_ref,
-                    pull_request.base_object_id, pull_request.head_object_id,
-                    pull_request.created_at, pull_request.updated_at
-             FROM pull_request
-             JOIN account AS author ON author.id = pull_request.author_account_id
-             WHERE pull_request.repository_id = ?1
-             ORDER BY pull_request.number DESC",
-        )?;
-        let pull_requests = statement
-            .query_map([&access.repository.id], pull_request_from_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        let can_create = access.can_write_repository();
-        Ok((access.repository, pull_requests, can_create))
     }
 
     pub(crate) fn pull_request_page(
@@ -3064,20 +2782,17 @@ impl Store {
         ))
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "a pull-request edit includes repository identity, content, actor, and time"
-    )]
     pub(crate) fn edit_pull_request(
         &mut self,
-        owner: &str,
-        repository: &str,
-        number: i64,
-        actor: &str,
-        title: &str,
-        body: &str,
-        changed_at: i64,
+        edit: &PullRequestEdit<'_>,
     ) -> Result<(), StoreError> {
+        let owner = edit.owner;
+        let repository = edit.repository;
+        let number = edit.number;
+        let actor = edit.actor;
+        let title = edit.title;
+        let body = edit.body;
+        let changed_at = edit.changed_at;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3392,20 +3107,19 @@ impl Store {
         ))
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the issue detail has independent comment and timeline pages"
-    )]
     pub(crate) fn issue_detail(
         &self,
         owner: &str,
         repository: &str,
         number: i64,
         actor: Option<&str>,
-        comments_page: usize,
-        timeline_page: usize,
-        page_size: usize,
+        pagination: TimelinePagination,
     ) -> Result<IssueDetail, StoreError> {
+        let TimelinePagination {
+            primary_page: comments_page,
+            timeline_page,
+            page_size,
+        } = pagination;
         let access = repository_issue_access(&self.connection, owner, repository, actor)?;
         if !access.can_read() {
             return Err(StoreError::IssueHidden);
@@ -3794,26 +3508,6 @@ impl Store {
         Ok(false)
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without authorization"
-    )]
-    pub(crate) fn active_repositories(&self) -> Result<Vec<RepositoryRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT repository.id, account.username, repository.slug,
-                    repository.visibility, repository.state, repository.object_format,
-                    repository.created_at, repository.archived_at
-             FROM repository
-             JOIN account ON account.id = repository.owner_account_id
-             WHERE repository.state = 'active'
-             ORDER BY account.username, repository.slug",
-        )?;
-        statement
-            .query_map([], repository_from_row)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
-    }
-
     pub(crate) fn all_repositories(&self) -> Result<Vec<RepositoryRecord>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT repository.id, account.username, repository.slug,
@@ -3981,10 +3675,7 @@ impl Store {
             .map_err(Into::into)
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests import the store without public HTTP routes"
-    )]
+    #[cfg(test)]
     pub(crate) fn public_repository(
         &self,
         owner: &str,
@@ -4011,10 +3702,7 @@ impl Store {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests import storage without the server"
-    )]
+    #[cfg(test)]
     pub(crate) fn active_ssh_public_keys(&self) -> Result<Vec<String>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT ssh_public_key.canonical_key
@@ -4029,10 +3717,6 @@ impl Store {
             .map_err(Into::into)
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile storage without the production SSH server"
-    )]
     pub(crate) fn active_ssh_identities(&self) -> Result<Vec<ActiveSshIdentity>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT account.username, ssh_public_key.canonical_key,
@@ -4050,26 +3734,6 @@ impl Store {
                     fingerprint: row.get(2)?,
                 })
             })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
-    }
-
-    #[allow(
-        dead_code,
-        reason = "some integration tests import storage without the server"
-    )]
-    pub(crate) fn active_public_repositories(&self) -> Result<Vec<RepositoryRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT repository.id, account.username, repository.slug,
-                    repository.visibility, repository.state, repository.object_format,
-                    repository.created_at, repository.archived_at
-             FROM repository
-             JOIN account ON account.id = repository.owner_account_id
-             WHERE repository.visibility = 'public' AND repository.state = 'active'
-             ORDER BY account.username, repository.slug",
-        )?;
-        statement
-            .query_map([], repository_from_row)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
@@ -4236,10 +3900,7 @@ impl Store {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests import storage without public event pages"
-    )]
+    #[cfg(test)]
     pub(crate) fn public_repository_events(
         &self,
         owner: &str,
@@ -4251,10 +3912,6 @@ impl Store {
         self.repository_events_for(repository, before, limit, false)
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests use only public event queries"
-    )]
     pub(crate) fn repository_events(
         &self,
         owner: &str,
@@ -4325,20 +3982,12 @@ pub(crate) struct InitialAdministrator<'a> {
     pub(crate) created_at: i64,
 }
 
-#[allow(
-    dead_code,
-    reason = "some integration tests compile storage without accounts"
-)]
 pub(crate) struct NewSshKey<'a> {
     pub(crate) canonical_key: &'a str,
     pub(crate) fingerprint: &'a str,
     pub(crate) label: &'a str,
 }
 
-#[allow(
-    dead_code,
-    reason = "some integration tests compile storage without accounts"
-)]
 pub(crate) struct InvitedAccount<'a> {
     pub(crate) invitation_hash: &'a [u8; 32],
     pub(crate) username: &'a str,
@@ -4348,10 +3997,6 @@ pub(crate) struct InvitedAccount<'a> {
     pub(crate) correlation_id: &'a str,
 }
 
-#[allow(
-    dead_code,
-    reason = "some integration tests compile storage without accounts"
-)]
 pub(crate) struct AccountRecovery<'a> {
     pub(crate) username: &'a str,
     pub(crate) old_recovery_hash: &'a [u8; 32],
@@ -4361,10 +4006,6 @@ pub(crate) struct AccountRecovery<'a> {
     pub(crate) correlation_id: &'a str,
 }
 
-#[allow(
-    dead_code,
-    reason = "some integration tests compile storage without Web login"
-)]
 pub(crate) struct NewLoginNonce<'a> {
     pub(crate) nonce_hash: &'a [u8; 32],
     pub(crate) csrf_hash: &'a [u8; 32],
@@ -4408,10 +4049,6 @@ pub(crate) struct NewApprovedWebSession<'a> {
     pub(crate) correlation_id: &'a str,
 }
 
-#[allow(
-    dead_code,
-    reason = "some integration tests compile storage without Web login"
-)]
 pub(crate) struct NewWebSession<'a> {
     pub(crate) nonce_hash: &'a [u8; 32],
     pub(crate) login_csrf_hash: &'a [u8; 32],
@@ -4424,15 +4061,9 @@ pub(crate) struct NewWebSession<'a> {
     pub(crate) correlation_id: &'a str,
 }
 
-#[allow(
-    dead_code,
-    reason = "some integration tests compile storage without Web login"
-)]
 pub(crate) struct WebSessionRecord {
     pub(crate) username: String,
     pub(crate) is_administrator: bool,
-    pub(crate) expires_at: i64,
-    pub(crate) ssh_public_key_id: Option<i64>,
 }
 
 pub(crate) struct NewRepository<'a> {
@@ -4459,10 +4090,13 @@ pub(crate) struct RecordPage<T> {
 }
 
 #[derive(Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "some integration tests create repositories without the import operation"
-)]
+pub(crate) struct TimelinePagination {
+    pub(crate) primary_page: usize,
+    pub(crate) timeline_page: usize,
+    pub(crate) page_size: usize,
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum RepositoryOrigin {
     Created,
     Imported,
@@ -4519,9 +4153,29 @@ pub(crate) struct RepositorySettings {
     pub(crate) branches: Vec<String>,
 }
 
+pub(crate) struct RepositorySettingsUpdate<'a> {
+    pub(crate) owner: &'a str,
+    pub(crate) slug: &'a str,
+    pub(crate) actor: &'a str,
+    pub(crate) description: &'a str,
+    pub(crate) visibility: &'a str,
+    pub(crate) changed_at: i64,
+    pub(crate) correlation_id: &'a str,
+}
+
 pub(crate) struct RepositoryCollaboratorRecord {
     pub(crate) username: String,
     pub(crate) role: String,
+}
+
+pub(crate) struct RepositoryCollaboratorUpdate<'a> {
+    pub(crate) owner: &'a str,
+    pub(crate) slug: &'a str,
+    pub(crate) actor: &'a str,
+    pub(crate) username: &'a str,
+    pub(crate) role: Option<&'a str>,
+    pub(crate) changed_at: i64,
+    pub(crate) correlation_id: &'a str,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -4627,29 +4281,17 @@ struct TableColumn {
     primary_key: i64,
 }
 
-#[allow(
-    dead_code,
-    reason = "some integration tests compile storage without authorization"
-)]
 pub(crate) struct RepositoryAuthorizationRecord {
     pub(crate) repository: RepositoryRecord,
     pub(crate) role: Option<String>,
 }
 
-#[allow(
-    dead_code,
-    reason = "some integration tests compile storage without the production SSH server"
-)]
 pub(crate) struct ActiveSshIdentity {
     pub(crate) username: String,
     pub(crate) canonical_key: String,
     pub(crate) fingerprint: String,
 }
 
-#[allow(
-    dead_code,
-    reason = "some integration tests import storage without public event pages"
-)]
 pub(crate) struct RepositoryEventRecord {
     pub(crate) event_id: String,
     pub(crate) sequence: i64,
@@ -4781,6 +4423,16 @@ pub(crate) struct PullRequestDetail {
     pub(crate) can_merge: bool,
 }
 
+pub(crate) struct PullRequestEdit<'a> {
+    pub(crate) owner: &'a str,
+    pub(crate) repository: &'a str,
+    pub(crate) number: i64,
+    pub(crate) actor: &'a str,
+    pub(crate) title: &'a str,
+    pub(crate) body: &'a str,
+    pub(crate) changed_at: i64,
+}
+
 pub(crate) struct NewPullRequestReview<'a> {
     pub(crate) owner: &'a str,
     pub(crate) repository: &'a str,
@@ -4833,7 +4485,6 @@ pub(crate) struct PullRequestRefIntentRecord {
 }
 
 impl PullRequestRefIntentRecord {
-    #[allow(clippy::too_many_arguments)]
     fn from_new(
         intent: &NewPullRequestRefIntent<'_>,
         repository_id: String,
@@ -4957,10 +4608,6 @@ pub(crate) struct AuditContext<'a> {
     pub(crate) created_at: i64,
 }
 
-#[allow(
-    dead_code,
-    reason = "some integration tests compile storage without the audit CLI"
-)]
 pub(crate) struct AuditEventRecord {
     pub(crate) id: i64,
     pub(crate) action: String,
@@ -4998,10 +4645,6 @@ pub(crate) struct NewDefaultBranchIntent<'a> {
     pub(crate) changed_at: i64,
 }
 
-#[allow(
-    dead_code,
-    reason = "some integration tests compile storage without accounts"
-)]
 fn insert_ssh_key(
     transaction: &rusqlite::Transaction<'_>,
     account_id: i64,
@@ -5185,16 +4828,19 @@ fn repository_issue_access(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn insert_pull_request_intent(
-    transaction: &rusqlite::Transaction<'_>,
-    intent: &NewPullRequestRefIntent<'_>,
-    repository_id: &str,
+struct PullRequestIntentInsertion<'a> {
+    repository_id: &'a str,
     author_account_id: i64,
     pull_request_number: i64,
     revision_number: i64,
-    old_head_object_id: Option<&str>,
-    operation: &str,
+    old_head_object_id: Option<&'a str>,
+    operation: &'a str,
+}
+
+fn insert_pull_request_intent(
+    transaction: &rusqlite::Transaction<'_>,
+    intent: &NewPullRequestRefIntent<'_>,
+    insertion: &PullRequestIntentInsertion<'_>,
 ) -> Result<(), StoreError> {
     transaction.execute(
         "INSERT INTO pull_request_ref_intent
@@ -5205,19 +4851,19 @@ fn insert_pull_request_intent(
                  ?13, ?14, ?15, 'pending', ?16)",
         rusqlite::params![
             intent.id,
-            repository_id,
+            insertion.repository_id,
             intent.pull_request_id,
-            pull_request_number,
-            revision_number,
-            operation,
+            insertion.pull_request_number,
+            insertion.revision_number,
+            insertion.operation,
             intent.title,
             intent.body,
-            author_account_id,
+            insertion.author_account_id,
             intent.actor,
             intent.base_ref,
             intent.head_ref,
             intent.base_object_id,
-            old_head_object_id,
+            insertion.old_head_object_id,
             intent.head_object_id,
             intent.created_at,
         ],
@@ -5971,10 +5617,6 @@ fn backfill_default_branches(
     Ok(())
 }
 
-#[allow(
-    dead_code,
-    reason = "the integration test imports this module without the CLI operation"
-)]
 pub(crate) fn doctor(instance_dir: &Path) -> Result<(), StoreError> {
     let path = instance_dir.join(DATABASE_FILE);
     let store = Store::open_read_only(&path)?;
@@ -5988,10 +5630,6 @@ pub(crate) fn doctor(instance_dir: &Path) -> Result<(), StoreError> {
     store.integrity_check()
 }
 
-#[allow(
-    dead_code,
-    reason = "some integration test crates import storage without migration backup paths"
-)]
 fn migration_backup_path(path: &Path, version: i64) -> PathBuf {
     let mut backup = OsString::from(path.as_os_str());
     backup.push(format!(".v{version}.backup"));

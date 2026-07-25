@@ -3,15 +3,11 @@ use crate::auth;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Barrier};
-use std::thread;
 
 use auth::{
-    AuthError, LoginChallenges, SshPublicKey, format_keyless_login_challenge,
-    verify_keyless_login_challenge,
+    AuthError, SshPublicKey, format_keyless_login_challenge, verify_keyless_login_challenge,
 };
 use tempfile::TempDir;
-use url::Url;
 
 const ISSUED_AT: u64 = 1_750_000_000;
 const LIFETIME: u64 = 120;
@@ -42,6 +38,10 @@ fn normalizes_supported_openssh_keys_and_matches_stock_fingerprints() {
 fn rejects_unsupported_and_undersized_keys() {
     let directory = TempDir::new().expect("create a key directory");
 
+    assert!(matches!(
+        SshPublicKey::parse(&"x".repeat(16 * 1024 + 1)),
+        Err(AuthError::InputTooLarge("SSH public key"))
+    ));
     assert!(matches!(
         SshPublicKey::parse(DSA_PUBLIC_KEY),
         Err(AuthError::UnsupportedKeyAlgorithm)
@@ -75,33 +75,6 @@ fn rejects_unsupported_and_undersized_keys() {
 }
 
 #[test]
-fn verifies_stock_sshsig_envelopes_for_each_supported_key() {
-    let directory = TempDir::new().expect("create a key directory");
-    for fixture in [KeyFixture::Ed25519, KeyFixture::EcdsaP256] {
-        let private_key = directory.path().join(fixture.name());
-        generate_key(&private_key, fixture);
-        let key = parse_public_key(&private_key).expect("parse the public key");
-        let challenges = issuer("https://tit.example/");
-        let challenge = challenges
-            .issue("alice", &key, ISSUED_AT, LIFETIME)
-            .expect("issue a login challenge");
-        let signature = sign(
-            &directory,
-            fixture.name(),
-            &private_key,
-            "tit-auth",
-            &challenge,
-        );
-
-        let verified = challenges
-            .verify(&challenge, &signature, "alice", &key, ISSUED_AT + 1)
-            .expect("verify the stock SSHSIG envelope");
-        assert_eq!(verified.username, "alice");
-        assert_eq!(verified.fingerprint, key.fingerprint());
-    }
-}
-
-#[test]
 fn derives_the_key_from_a_keyless_stock_sshsig_envelope() {
     let directory = TempDir::new().expect("create a key directory");
     let private_key = directory.path().join("keyless");
@@ -129,261 +102,92 @@ fn derives_the_key_from_a_keyless_stock_sshsig_envelope() {
 }
 
 #[test]
-fn rejects_replay_expiry_wrong_context_and_malformed_envelopes() {
+fn rejects_invalid_keyless_login_challenges() {
     let directory = TempDir::new().expect("create a key directory");
     let private_key = directory.path().join("ed25519");
     generate_key(&private_key, KeyFixture::Ed25519);
-    let key = parse_public_key(&private_key).expect("parse the public key");
-
-    let replay_issuer = issuer("https://tit.example/");
-    let replay_challenge = replay_issuer
-        .issue("alice", &key, ISSUED_AT, LIFETIME)
-        .expect("issue a replay challenge");
-    let replay_signature = sign(
-        &directory,
-        "replay",
-        &private_key,
-        "tit-auth",
-        &replay_challenge,
+    let challenge = format_keyless_login_challenge(
+        "https://tit.example",
+        "alice",
+        &[7_u8; 32],
+        ISSUED_AT,
+        ISSUED_AT + LIFETIME,
     );
-    replay_issuer
-        .verify(
-            &replay_challenge,
-            &replay_signature,
-            "alice",
-            &key,
-            ISSUED_AT + 1,
-        )
-        .expect("verify the challenge one time");
-    assert!(matches!(
-        replay_issuer.verify(
-            &replay_challenge,
-            &replay_signature,
-            "alice",
-            &key,
-            ISSUED_AT + 1
-        ),
-        Err(AuthError::ConsumedChallenge)
-    ));
+    let signature = sign(&directory, "valid", &private_key, "tit-auth", &challenge);
 
-    let expired_issuer = issuer("https://tit.example/");
-    let expired_challenge = expired_issuer
-        .issue("alice", &key, ISSUED_AT, LIFETIME)
-        .expect("issue an expiring challenge");
-    let expired_signature = sign(
-        &directory,
-        "expired",
-        &private_key,
-        "tit-auth",
-        &expired_challenge,
-    );
     assert!(matches!(
-        expired_issuer.verify(
-            &expired_challenge,
-            &expired_signature,
+        verify_keyless_login_challenge(
+            "https://other.example",
+            &challenge,
+            &signature,
             "alice",
-            &key,
-            ISSUED_AT + LIFETIME + 1
-        ),
-        Err(AuthError::ExpiredChallenge)
-    ));
-
-    let namespace_issuer = issuer("https://tit.example/");
-    let namespace_challenge = namespace_issuer
-        .issue("alice", &key, ISSUED_AT, LIFETIME)
-        .expect("issue a namespace challenge");
-    let wrong_namespace = sign(
-        &directory,
-        "namespace",
-        &private_key,
-        "other",
-        &namespace_challenge,
-    );
-    assert!(matches!(
-        namespace_issuer.verify(
-            &namespace_challenge,
-            &wrong_namespace,
-            "alice",
-            &key,
-            ISSUED_AT + 1
-        ),
-        Err(AuthError::SignatureVerification(_))
-    ));
-
-    let origin_issuer = issuer("https://tit.example/");
-    let origin_challenge = origin_issuer
-        .issue("alice", &key, ISSUED_AT, LIFETIME)
-        .expect("issue an origin challenge");
-    let origin_signature = sign(
-        &directory,
-        "origin",
-        &private_key,
-        "tit-auth",
-        &origin_challenge,
-    );
-    assert!(matches!(
-        issuer("https://other.example/").verify(
-            &origin_challenge,
-            &origin_signature,
-            "alice",
-            &key,
             ISSUED_AT + 1
         ),
         Err(AuthError::WrongOrigin)
     ));
-
-    let malformed_issuer = issuer("https://tit.example/");
-    let malformed_challenge = malformed_issuer
-        .issue("alice", &key, ISSUED_AT, LIFETIME)
-        .expect("issue a malformed-envelope challenge");
     assert!(matches!(
-        malformed_issuer.verify(
-            &malformed_challenge,
+        verify_keyless_login_challenge(
+            "https://tit.example",
+            &challenge,
+            &signature,
+            "bob",
+            ISSUED_AT + 1,
+        ),
+        Err(AuthError::WrongUsername)
+    ));
+    assert!(matches!(
+        verify_keyless_login_challenge(
+            "https://tit.example",
+            &challenge,
+            &signature,
+            "alice",
+            ISSUED_AT + LIFETIME + 1,
+        ),
+        Err(AuthError::ExpiredChallenge)
+    ));
+
+    let wrong_namespace = sign(&directory, "namespace", &private_key, "other", &challenge);
+    assert!(matches!(
+        verify_keyless_login_challenge(
+            "https://tit.example",
+            &challenge,
+            &wrong_namespace,
+            "alice",
+            ISSUED_AT + 1,
+        ),
+        Err(AuthError::SignatureVerification(_))
+    ));
+    assert!(matches!(
+        verify_keyless_login_challenge(
+            "https://tit.example",
+            &challenge,
             "not an SSHSIG envelope",
             "alice",
-            &key,
-            ISSUED_AT + 1
+            ISSUED_AT + 1,
         ),
         Err(AuthError::SignatureEnvelope(_))
     ));
-}
-
-#[test]
-fn rejects_wrong_key_username_and_rsa_keys() {
-    let directory = TempDir::new().expect("create a key directory");
-    let first_private = directory.path().join("first");
-    let second_private = directory.path().join("second");
-    generate_key(&first_private, KeyFixture::Ed25519);
-    generate_key(&second_private, KeyFixture::Ed25519);
-    let first_key = parse_public_key(&first_private).expect("parse the first public key");
-    let second_key = parse_public_key(&second_private).expect("parse the second public key");
-    let challenges = issuer("https://tit.example/");
-    let challenge = challenges
-        .issue("alice", &first_key, ISSUED_AT, LIFETIME)
-        .expect("issue a key challenge");
-    let signature = sign(
-        &directory,
-        "wrong-key",
-        &first_private,
-        "tit-auth",
-        &challenge,
-    );
 
     assert!(matches!(
-        challenges.verify(&challenge, &signature, "alice", &second_key, ISSUED_AT + 1),
-        Err(AuthError::WrongKey)
-    ));
-    assert!(matches!(
-        challenges.verify(&challenge, &signature, "bob", &first_key, ISSUED_AT + 1),
-        Err(AuthError::WrongUsername)
-    ));
-
-    let rsa_private = directory.path().join("rsa");
-    generate_key(&rsa_private, KeyFixture::Rsa3072);
-    assert!(matches!(
-        parse_public_key(&rsa_private),
-        Err(AuthError::UnsupportedKeyAlgorithm)
-    ));
-}
-
-#[test]
-fn consumes_a_nonce_atomically() {
-    let directory = TempDir::new().expect("create a key directory");
-    let private_key = directory.path().join("ed25519");
-    generate_key(&private_key, KeyFixture::Ed25519);
-    let key = parse_public_key(&private_key).expect("parse the public key");
-    let challenges = Arc::new(issuer("https://tit.example/"));
-    let challenge = challenges
-        .issue("alice", &key, ISSUED_AT, LIFETIME)
-        .expect("issue a concurrent challenge");
-    let signature = sign(
-        &directory,
-        "concurrent",
-        &private_key,
-        "tit-auth",
-        &challenge,
-    );
-    let barrier = Arc::new(Barrier::new(8));
-
-    let workers: Vec<_> = (0..8)
-        .map(|_| {
-            let challenges = Arc::clone(&challenges);
-            let barrier = Arc::clone(&barrier);
-            let challenge = challenge.clone();
-            let signature = signature.clone();
-            let key = key.clone();
-            thread::spawn(move || {
-                barrier.wait();
-                challenges
-                    .verify(&challenge, &signature, "alice", &key, ISSUED_AT + 1)
-                    .is_ok()
-            })
-        })
-        .collect();
-
-    let successes = workers
-        .into_iter()
-        .map(|worker| worker.join().expect("join a verifier"))
-        .filter(|success| *success)
-        .count();
-    assert_eq!(successes, 1);
-}
-
-#[test]
-fn enforces_input_and_active_challenge_limits() {
-    let directory = TempDir::new().expect("create a key directory");
-    let private_key = directory.path().join("ed25519");
-    generate_key(&private_key, KeyFixture::Ed25519);
-    let key = parse_public_key(&private_key).expect("parse the public key");
-
-    assert!(matches!(
-        SshPublicKey::parse(&"x".repeat(16 * 1024 + 1)),
-        Err(AuthError::InputTooLarge("SSH public key"))
-    ));
-
-    let challenges = issuer("https://tit.example/");
-    let challenge = challenges
-        .issue("alice", &key, ISSUED_AT, LIFETIME)
-        .expect("issue a size-limit challenge");
-    assert!(matches!(
-        challenges.verify(
+        verify_keyless_login_challenge(
+            "https://tit.example",
             &"x".repeat(4 * 1024 + 1),
             "signature",
             "alice",
-            &key,
-            ISSUED_AT + 1
+            ISSUED_AT + 1,
         ),
         Err(AuthError::InputTooLarge("login challenge"))
     ));
     assert!(matches!(
-        challenges.verify(
+        verify_keyless_login_challenge(
+            "https://tit.example",
             &challenge,
             &"x".repeat(16 * 1024 + 1),
             "alice",
-            &key,
-            ISSUED_AT + 1
+            ISSUED_AT + 1,
         ),
         Err(AuthError::InputTooLarge("SSHSIG envelope"))
     ));
-
-    let bounded = issuer("https://tit.example/");
-    for _ in 0..1_024 {
-        bounded
-            .issue("alice", &key, ISSUED_AT, LIFETIME)
-            .expect("fill the active challenge store");
-    }
-    assert!(matches!(
-        bounded.issue("alice", &key, ISSUED_AT, LIFETIME),
-        Err(AuthError::NonceLimit)
-    ));
-    bounded
-        .issue("alice", &key, ISSUED_AT + LIFETIME + 1, LIFETIME)
-        .expect("prune expired challenges before issuing another one");
-}
-
-fn issuer(origin: &str) -> LoginChallenges {
-    LoginChallenges::new(&Url::parse(origin).expect("parse the test origin"))
-        .expect("create a login challenge issuer")
 }
 
 fn parse_public_key(private_key: &Path) -> Result<SshPublicKey, AuthError> {

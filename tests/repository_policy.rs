@@ -74,17 +74,11 @@ fn enforces_the_repository_role_matrix() {
     assert_allowed(&policy, Some("maintainer"), RepositoryOperation::Read);
     assert_allowed(&policy, Some("maintainer"), RepositoryOperation::Write);
     assert_allowed(&policy, Some("maintainer"), RepositoryOperation::Maintain);
-    assert_denied(&policy, Some("maintainer"), RepositoryOperation::Own);
     assert_allowed(&policy, Some("writer"), RepositoryOperation::Read);
     assert_allowed(&policy, Some("writer"), RepositoryOperation::Write);
     assert_denied(&policy, Some("writer"), RepositoryOperation::Maintain);
-    assert_denied(&policy, Some("writer"), RepositoryOperation::Own);
     assert_allowed(&policy, Some("reader"), RepositoryOperation::Read);
-    for operation in [
-        RepositoryOperation::Write,
-        RepositoryOperation::Maintain,
-        RepositoryOperation::Own,
-    ] {
+    for operation in [RepositoryOperation::Write, RepositoryOperation::Maintain] {
         assert_denied(&policy, Some("reader"), operation);
     }
     for actor in [None, Some("stranger"), Some("suspended"), Some("missing")] {
@@ -124,23 +118,10 @@ fn applies_role_visibility_and_archive_changes_immediately() {
         })
         .expect("create a policy repository");
     let policy = RepositoryPolicy::new(&database);
-    assert_eq!(
-        policy
-            .public_repositories()
-            .expect("list repositories")
-            .len(),
-        1
-    );
 
     store
         .set_repository_visibility("owner", "project", "private", 3, "admin-cli", "test")
         .expect("make the repository private");
-    assert!(
-        policy
-            .public_repositories()
-            .expect("list repositories")
-            .is_empty()
-    );
     store
         .set_repository_collaborator("owner", "project", "member", "writer", &audit(3))
         .expect("add a writer");
@@ -378,12 +359,11 @@ fn recovers_a_default_branch_change_after_git_moves_first() {
     );
 }
 
-fn operations() -> [RepositoryOperation; 4] {
+fn operations() -> [RepositoryOperation; 3] {
     [
         RepositoryOperation::Read,
         RepositoryOperation::Write,
         RepositoryOperation::Maintain,
-        RepositoryOperation::Own,
     ]
 }
 

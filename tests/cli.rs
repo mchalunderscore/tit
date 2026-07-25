@@ -1,3 +1,4 @@
+mod ssh_fixture;
 mod support;
 
 use std::fs;
@@ -6,10 +7,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
-use support::{
-    TestInstance, create_bare_git_fixture, create_ssh_key_fixture, free_address,
-    read_stock_ssh_configuration,
-};
+use ssh_fixture::create_ssh_key as create_ssh_key_fixture;
+use support::{TestInstance, create_bare_git_fixture, free_address, read_stock_ssh_configuration};
 use tempfile::TempDir;
 
 const CURRENT_DATABASE: &str = concat!(

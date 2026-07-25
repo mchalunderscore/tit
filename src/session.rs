@@ -82,10 +82,6 @@ impl WebLoginService {
         Ok(IssuedLoginApproval { secret, login_csrf })
     }
 
-    #[allow(
-        dead_code,
-        reason = "the Web session integration test imports this module without account routes"
-    )]
     pub(crate) fn issue_account_approval(
         &self,
         username: &str,
@@ -233,10 +229,6 @@ impl WebLoginService {
             .map_err(Into::into)
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile login without HTTP handlers"
-    )]
     pub(crate) fn record_login_failure(
         &self,
         username: &str,
@@ -323,7 +315,6 @@ pub(crate) enum SessionError {
     Random,
     #[error("system clock is before the Unix epoch")]
     Clock,
-    #[allow(dead_code, reason = "integration tests use the service without HTTP")]
     #[error("Web login service is not available")]
     Unavailable,
 }

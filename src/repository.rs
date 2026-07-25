@@ -9,8 +9,9 @@ use crate::domain::repository::{RepositoryNameError, validate_slug};
 use crate::git::repository::{GitRepository, GitRepositoryError};
 use crate::maintenance::MaintenanceGate;
 use crate::store::{
-    HomeRepositoryRecord, NewAuditEvent, NewDefaultBranchIntent, NewRepository, RepositoryOrigin,
-    RepositoryRecord, RepositorySettings, Store, StoreError,
+    HomeRepositoryRecord, NewAuditEvent, NewDefaultBranchIntent, NewRepository,
+    RepositoryCollaboratorUpdate, RepositoryOrigin, RepositoryRecord, RepositorySettings,
+    RepositorySettingsUpdate, Store, StoreError,
 };
 use crate::system::{random_lower_hex, unix_timestamp};
 
@@ -103,6 +104,7 @@ impl RepositoryService {
         validate_slug(repository)?;
         validate_username(actor)?;
         let _maintenance = self.maintenance.mutation();
+        let _operation = self.maintenance.git_operation();
         let changed_at = timestamp()?;
         let intent_id = random_id()?;
         let mut store = Store::open(&self.database)?;
@@ -132,6 +134,7 @@ impl RepositoryService {
 
     pub(crate) fn recover(&self) -> Result<(), RepositoryServiceError> {
         let _maintenance = self.maintenance.mutation();
+        let _operation = self.maintenance.git_operation();
         let mut store = Store::open(&self.database)?;
         for intent in store.incomplete_repository_default_branches()? {
             let git =
@@ -162,15 +165,15 @@ impl RepositoryService {
         validate_username(actor)?;
         validate_description(description)?;
         let mut store = Store::open(&self.database)?;
-        store.update_repository_settings(
+        store.update_repository_settings(&RepositorySettingsUpdate {
             owner,
-            repository,
+            slug: repository,
             actor,
             description,
             visibility,
-            timestamp()?,
-            &random_id()?,
-        )?;
+            changed_at: timestamp()?,
+            correlation_id: &random_id()?,
+        })?;
         Ok(())
     }
 
@@ -187,15 +190,15 @@ impl RepositoryService {
         validate_username(actor)?;
         validate_username(username)?;
         let mut store = Store::open(&self.database)?;
-        store.update_repository_collaborator(
+        store.update_repository_collaborator(&RepositoryCollaboratorUpdate {
             owner,
-            repository,
+            slug: repository,
             actor,
             username,
             role,
-            timestamp()?,
-            &random_id()?,
-        )?;
+            changed_at: timestamp()?,
+            correlation_id: &random_id()?,
+        })?;
         Ok(())
     }
 
@@ -286,13 +289,15 @@ impl RepositoryService {
         let target = format!("{owner}/{slug}");
         let result = self.create_inner(
             &mut store,
-            actor,
-            owner,
-            slug,
-            object_format,
-            object_format_name,
-            correlation_id,
-            created_at,
+            &RepositoryCreation {
+                actor,
+                owner,
+                slug,
+                object_format,
+                object_format_name,
+                correlation_id,
+                created_at,
+            },
         );
         if result.is_err() {
             store.record_audit_event(&NewAuditEvent {
@@ -307,18 +312,18 @@ impl RepositoryService {
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn create_inner(
         &self,
         store: &mut Store,
-        actor: &str,
-        owner: &str,
-        slug: &str,
-        object_format: Kind,
-        object_format_name: &str,
-        correlation_id: &str,
-        created_at: i64,
+        creation: &RepositoryCreation<'_>,
     ) -> Result<RepositoryRecord, RepositoryServiceError> {
+        let actor = creation.actor;
+        let owner = creation.owner;
+        let slug = creation.slug;
+        let object_format = creation.object_format;
+        let object_format_name = creation.object_format_name;
+        let correlation_id = creation.correlation_id;
+        let created_at = creation.created_at;
         let id = random_id()?;
         let pending_path = self.root.join(format!(".pending-{id}.git"));
         let final_path = self.root.join(format!("{id}.git"));
@@ -378,6 +383,16 @@ impl RepositoryService {
             archived_at: None,
         })
     }
+}
+
+struct RepositoryCreation<'a> {
+    actor: &'a str,
+    owner: &'a str,
+    slug: &'a str,
+    object_format: Kind,
+    object_format_name: &'a str,
+    correlation_id: &'a str,
+    created_at: i64,
 }
 
 fn random_id() -> Result<String, RepositoryServiceError> {

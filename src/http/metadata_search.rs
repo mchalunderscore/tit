@@ -138,6 +138,10 @@ struct MetadataSearchTemplate<'a> {
     query: &'a str,
     searched: bool,
     rows_scanned: usize,
+    #[allow(
+        dead_code,
+        reason = "the Askama template reads this field through generated code"
+    )]
     bytes_scanned: usize,
     truncated: bool,
     results: Vec<MetadataSearchResultView<'a>>,

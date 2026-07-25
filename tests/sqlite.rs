@@ -10,7 +10,8 @@ use std::{env, ffi::OsString, fs};
 use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
 use store::{
     AuditContext, GitOperationIntent, InitialAdministrator, IssueChange, NewAuditEvent, NewIssue,
-    NewRepository, NewRepositoryReference, RepositoryOrigin, Store, StoreError,
+    NewRepository, NewRepositoryReference, RepositoryCollaboratorUpdate, RepositoryOrigin,
+    RepositorySettingsUpdate, Store, StoreError, TimelinePagination,
 };
 use tempfile::TempDir;
 
@@ -697,26 +698,26 @@ fn creates_renames_archives_and_reads_owned_repositories() {
         )
         .expect("create a collaborator");
     store
-        .update_repository_settings(
-            "alice",
-            "project",
-            "alice",
-            "A small public repository.",
-            "private",
-            23,
-            "settings",
-        )
+        .update_repository_settings(&RepositorySettingsUpdate {
+            owner: "alice",
+            slug: "project",
+            actor: "alice",
+            description: "A small public repository.",
+            visibility: "private",
+            changed_at: 23,
+            correlation_id: "settings",
+        })
         .expect("update repository settings");
     store
-        .update_repository_collaborator(
-            "alice",
-            "project",
-            "alice",
-            "bob",
-            Some("reader"),
-            24,
-            "collaborator",
-        )
+        .update_repository_collaborator(&RepositoryCollaboratorUpdate {
+            owner: "alice",
+            slug: "project",
+            actor: "alice",
+            username: "bob",
+            role: Some("reader"),
+            changed_at: 24,
+            correlation_id: "collaborator",
+        })
         .expect("add a repository collaborator");
     let settings = store
         .repository_settings("alice", "project", "alice")
@@ -730,15 +731,15 @@ fn creates_renames_archives_and_reads_owned_repositories() {
         Err(StoreError::PullRequestDenied)
     ));
     store
-        .update_repository_settings(
-            "alice",
-            "project",
-            "alice",
-            "A small public repository.",
-            "public",
-            25,
-            "settings-public",
-        )
+        .update_repository_settings(&RepositorySettingsUpdate {
+            owner: "alice",
+            slug: "project",
+            actor: "alice",
+            description: "A small public repository.",
+            visibility: "public",
+            changed_at: 25,
+            correlation_id: "settings-public",
+        })
         .expect("restore public visibility");
 
     assert!(matches!(
@@ -969,7 +970,17 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
         .expect("reopen an issue as a writer");
 
     let detail = store
-        .issue_detail("alice", "project", 1, Some("maintainer"), 1, 1, 50)
+        .issue_detail(
+            "alice",
+            "project",
+            1,
+            Some("maintainer"),
+            TimelinePagination {
+                primary_page: 1,
+                timeline_page: 1,
+                page_size: 50,
+            },
+        )
         .expect("read the issue timeline");
     assert_eq!(detail.repository.slug, "project");
     assert_eq!(detail.issue.title, "Writer edit");
@@ -1000,14 +1011,34 @@ fn runs_the_issue_workflow_with_atomic_events_and_repository_roles() {
             .all(|events| events[0].sequence < events[1].sequence)
     );
     let first_activity_page = store
-        .issue_detail("alice", "project", 1, Some("maintainer"), 1, 1, 1)
+        .issue_detail(
+            "alice",
+            "project",
+            1,
+            Some("maintainer"),
+            TimelinePagination {
+                primary_page: 1,
+                timeline_page: 1,
+                page_size: 1,
+            },
+        )
         .expect("read the first bounded activity page");
     assert_eq!(first_activity_page.comments.len(), 1);
     assert!(!first_activity_page.comments_has_next);
     assert_eq!(first_activity_page.timeline.len(), 1);
     assert!(first_activity_page.timeline_has_next);
     let second_timeline_page = store
-        .issue_detail("alice", "project", 1, Some("maintainer"), 1, 2, 1)
+        .issue_detail(
+            "alice",
+            "project",
+            1,
+            Some("maintainer"),
+            TimelinePagination {
+                primary_page: 1,
+                timeline_page: 2,
+                page_size: 1,
+            },
+        )
         .expect("read the second timeline page");
     assert_eq!(second_timeline_page.timeline_page, 2);
     assert_eq!(second_timeline_page.timeline.len(), 1);

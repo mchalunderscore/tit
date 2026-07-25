@@ -69,28 +69,6 @@ impl RepositoryPolicy {
             RepositoryOperation::Maintain,
         )
     }
-
-    #[allow(
-        dead_code,
-        reason = "policy tests verify anonymous catalog behavior independently"
-    )]
-    pub(crate) fn public_repositories(&self) -> Result<Vec<RepositoryRecord>, PolicyError> {
-        Store::open(&self.database)?
-            .active_repositories()?
-            .into_iter()
-            .filter_map(|repository| {
-                let record = RepositoryAuthorizationRecord {
-                    repository,
-                    role: None,
-                };
-                match allows(&record, RepositoryOperation::Read) {
-                    Ok(true) => Some(Ok(record.repository)),
-                    Ok(false) => None,
-                    Err(error) => Some(Err(error)),
-                }
-            })
-            .collect()
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,15 +81,10 @@ pub(crate) enum RefChange {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(
-    dead_code,
-    reason = "subsequent transports use the complete repository operation matrix"
-)]
 pub(crate) enum RepositoryOperation {
     Read,
     Write,
     Maintain,
-    Own,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,7 +113,6 @@ fn allows(
             role,
             Some(RepositoryRole::Owner | RepositoryRole::Maintainer)
         )),
-        RepositoryOperation::Own => Ok(role == Some(RepositoryRole::Owner)),
     }
 }
 

@@ -28,6 +28,7 @@ pub(crate) fn encode_flush(output: &mut Vec<u8>) {
     output.extend_from_slice(b"0000");
 }
 
+#[cfg(test)]
 pub(crate) fn encode_delimiter(output: &mut Vec<u8>) {
     output.extend_from_slice(b"0001");
 }

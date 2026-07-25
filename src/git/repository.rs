@@ -281,6 +281,7 @@ impl GitRepository {
         write_merge_commit(&self.repository, base, head, actor, created_at, message)
     }
 
+    #[cfg(test)]
     pub(crate) fn make_pack(
         &self,
         wants: &[ObjectId],
@@ -615,8 +616,6 @@ pub(crate) enum GitRepositoryError {
     },
     #[error("Git object count or decoded size exceeds the limit")]
     ObjectLimit,
-    #[error("generated Git pack exceeds the limit")]
-    PackLimit,
     #[error("Git pack generation was cancelled")]
     Cancelled,
     #[error("cannot generate Git pack: {0}")]

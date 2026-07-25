@@ -30,10 +30,7 @@ pub(crate) struct RunningControlServer {
 }
 
 impl RunningControlServer {
-    #[allow(
-        dead_code,
-        reason = "the production server uses the backup-enabled constructor"
-    )]
+    #[cfg(test)]
     pub(crate) fn start(
         instance_dir: &Path,
         accounts: AccountService,

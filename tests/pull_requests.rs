@@ -1,17 +1,16 @@
-use crate::{git, pull_request, store};
+use crate::{git, maintenance::MaintenanceGate, pull_request, store};
 
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::time::Duration;
 
 use git::read::{Mergeability, ReadCancellation, ReadError, ReadLimits, RepositoryReadService};
 use git::repository::GitRepository;
 use gix::hash::ObjectId;
-use pull_request::{PullRequestError, PullRequestService};
+use pull_request::{NewPullRequest, PullRequestError, PullRequestReview, PullRequestService};
 use rusqlite::params;
 use store::{GitOperationIntent, NewPullRequestMerge, NewPullRequestRefIntent, Store, StoreError};
 use tempfile::TempDir;
@@ -22,15 +21,15 @@ fn creates_revises_and_recovers_numbered_pull_request_refs_for_both_hashes() {
         let fixture = Fixture::new(object_format, index);
         let service = PullRequestService::new(&fixture.database, &fixture.repositories);
         let opened = service
-            .open(
-                "alice",
-                "project",
-                "alice",
-                "Add the feature",
-                "Keep the revision context.",
-                "refs/heads/main",
-                "refs/heads/feature",
-            )
+            .open(&NewPullRequest {
+                owner: "alice",
+                repository: "project",
+                actor: "alice",
+                title: "Add the feature",
+                body: "Keep the revision context.",
+                base_ref: "refs/heads/main",
+                head_ref: "refs/heads/feature",
+            })
             .expect("open a pull request");
         assert_eq!(opened.number, 1);
         assert_eq!(fixture.pull_ref(1), opened.head_object_id);
@@ -101,15 +100,15 @@ fn creates_revises_and_recovers_numbered_pull_request_refs_for_both_hashes() {
             opened.head_object_id
         );
         assert!(matches!(
-            service.open(
-                "alice",
-                "project",
-                "bob",
-                "Reader change",
-                "Readers cannot open pull requests.",
-                "refs/heads/main",
-                "refs/heads/feature",
-            ),
+            service.open(&NewPullRequest {
+                owner: "alice",
+                repository: "project",
+                actor: "bob",
+                title: "Reader change",
+                body: "Readers cannot open pull requests.",
+                base_ref: "refs/heads/main",
+                head_ref: "refs/heads/feature",
+            }),
             Err(PullRequestError::Store(StoreError::PullRequestDenied))
         ));
 
@@ -219,25 +218,39 @@ fn creates_revises_and_recovers_numbered_pull_request_refs_for_both_hashes() {
             pending_revision.revision_number
         );
 
-        let service = Arc::new(service);
-        let handles = ["Concurrent A", "Concurrent B"].map(|title| {
-            let service = Arc::clone(&service);
-            std::thread::spawn(move || {
-                service
-                    .open(
-                        "alice",
-                        "project",
-                        "alice",
-                        title,
-                        "Use one stable number.",
-                        "refs/heads/main",
-                        "refs/heads/feature",
-                    )
-                    .expect("open a concurrent pull request")
-                    .number
+        let gate = MaintenanceGate::default();
+        let services = [
+            PullRequestService::new_with_gate(
+                &fixture.database,
+                &fixture.repositories,
+                gate.clone(),
+            ),
+            PullRequestService::new_with_gate(&fixture.database, &fixture.repositories, gate),
+        ];
+        let handles = ["Concurrent A", "Concurrent B"]
+            .into_iter()
+            .zip(services)
+            .map(|(title, service)| {
+                std::thread::spawn(move || {
+                    service
+                        .open(&NewPullRequest {
+                            owner: "alice",
+                            repository: "project",
+                            actor: "alice",
+                            title,
+                            body: "Use one stable number.",
+                            base_ref: "refs/heads/main",
+                            head_ref: "refs/heads/feature",
+                        })
+                        .expect("open a concurrent pull request")
+                        .number
+                })
             })
-        });
-        let mut numbers = handles.map(|handle| handle.join().expect("join an opener"));
+            .collect::<Vec<_>>();
+        let mut numbers = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("join an opener"))
+            .collect::<Vec<_>>();
         numbers.sort_unstable();
         assert_eq!(numbers, [3, 4]);
         assert_eq!(fixture.pull_ref(3), next_head.to_string());
@@ -278,15 +291,15 @@ fn fast_forwards_pull_requests_with_one_durable_merge_event_for_both_hashes() {
         let fixture = Fixture::new(object_format, index + 30);
         let service = PullRequestService::new(&fixture.database, &fixture.repositories);
         let opened = service
-            .open(
-                "alice",
-                "project",
-                "alice",
-                "Fast-forward the feature",
-                "Move the base ref to the reviewed head.",
-                "refs/heads/main",
-                "refs/heads/feature",
-            )
+            .open(&NewPullRequest {
+                owner: "alice",
+                repository: "project",
+                actor: "alice",
+                title: "Fast-forward the feature",
+                body: "Move the base ref to the reviewed head.",
+                base_ref: "refs/heads/main",
+                head_ref: "refs/heads/feature",
+            })
             .expect("open a fast-forward pull request");
         assert!(matches!(
             service.merge("alice", "project", 1, "bob", "fast-forward"),
@@ -352,15 +365,15 @@ fn rejects_a_merge_when_the_base_moved_after_the_revision() {
     let fixture = Fixture::new("sha1", 40);
     let service = PullRequestService::new(&fixture.database, &fixture.repositories);
     service
-        .open(
-            "alice",
-            "project",
-            "alice",
-            "Stale base",
-            "Do not merge a stale comparison.",
-            "refs/heads/main",
-            "refs/heads/feature",
-        )
+        .open(&NewPullRequest {
+            owner: "alice",
+            repository: "project",
+            actor: "alice",
+            title: "Stale base",
+            body: "Do not merge a stale comparison.",
+            base_ref: "refs/heads/main",
+            head_ref: "refs/heads/feature",
+        })
         .expect("open a pull request");
     fixture.commit_on("main", "base.txt", "new base\n", "move the base");
     assert!(matches!(
@@ -424,15 +437,15 @@ fn creates_worktree_free_merge_commits_with_deterministic_parents_for_both_hashe
 
         let service = PullRequestService::new(&fixture.database, &fixture.repositories);
         service
-            .open(
-                "alice",
-                "project",
-                "alice",
-                "Merge the rename",
-                "Keep the rename and executable mode.",
-                "refs/heads/main",
-                "refs/heads/feature",
-            )
+            .open(&NewPullRequest {
+                owner: "alice",
+                repository: "project",
+                actor: "alice",
+                title: "Merge the rename",
+                body: "Keep the rename and executable mode.",
+                base_ref: "refs/heads/main",
+                head_ref: "refs/heads/feature",
+            })
             .expect("open a divergent pull request");
         service
             .merge("alice", "project", 1, "alice", "merge-commit")
@@ -469,15 +482,15 @@ fn rejects_a_conflicting_server_merge_without_moving_the_base() {
     let base = rev_parse(&fixture.bare, "refs/heads/main");
     let service = PullRequestService::new(&fixture.database, &fixture.repositories);
     service
-        .open(
-            "alice",
-            "project",
-            "alice",
-            "Conflicting merge",
-            "Do not create a conflict commit.",
-            "refs/heads/main",
-            "refs/heads/feature",
-        )
+        .open(&NewPullRequest {
+            owner: "alice",
+            repository: "project",
+            actor: "alice",
+            title: "Conflicting merge",
+            body: "Do not create a conflict commit.",
+            base_ref: "refs/heads/main",
+            head_ref: "refs/heads/feature",
+        })
         .expect("open a conflicting pull request");
     assert!(matches!(
         service.merge("alice", "project", 1, "alice", "merge-commit"),
@@ -501,15 +514,15 @@ fn recovers_a_completed_merge_and_abandons_a_concurrent_base_change() {
     let fixture = Fixture::new("sha1", 70);
     let service = PullRequestService::new(&fixture.database, &fixture.repositories);
     service
-        .open(
-            "alice",
-            "project",
-            "alice",
-            "Recover this merge",
-            "Complete metadata after the ref update.",
-            "refs/heads/main",
-            "refs/heads/feature",
-        )
+        .open(&NewPullRequest {
+            owner: "alice",
+            repository: "project",
+            actor: "alice",
+            title: "Recover this merge",
+            body: "Complete metadata after the ref update.",
+            base_ref: "refs/heads/main",
+            head_ref: "refs/heads/feature",
+        })
         .expect("open a recoverable pull request");
     begin_test_merge_intent(&fixture, 1, "71000000000000000000000000000000");
     let git = GitRepository::open(&fixture.bare).expect("open the recovery repository");
@@ -534,15 +547,15 @@ fn recovers_a_completed_merge_and_abandons_a_concurrent_base_change() {
     let concurrent = Fixture::new("sha1", 71);
     let service = PullRequestService::new(&concurrent.database, &concurrent.repositories);
     service
-        .open(
-            "alice",
-            "project",
-            "alice",
-            "Race the base",
-            "A concurrent base update wins before this ref moves.",
-            "refs/heads/main",
-            "refs/heads/feature",
-        )
+        .open(&NewPullRequest {
+            owner: "alice",
+            repository: "project",
+            actor: "alice",
+            title: "Race the base",
+            body: "A concurrent base update wins before this ref moves.",
+            base_ref: "refs/heads/main",
+            head_ref: "refs/heads/feature",
+        })
         .expect("open a concurrent pull request");
     begin_test_merge_intent(&concurrent, 1, "72000000000000000000000000000000");
     concurrent.commit_on("main", "raced.txt", "concurrent\n", "race the merge");
@@ -593,15 +606,15 @@ fn classifies_clean_conflicting_and_already_merged_revisions_for_both_hashes() {
         );
         let service = PullRequestService::new(&fixture.database, &fixture.repositories);
         service
-            .open(
-                "alice",
-                "project",
-                "alice",
-                "Clean divergence",
-                "The branches change different paths.",
-                "refs/heads/main",
-                "refs/heads/feature",
-            )
+            .open(&NewPullRequest {
+                owner: "alice",
+                repository: "project",
+                actor: "alice",
+                title: "Clean divergence",
+                body: "The branches change different paths.",
+                base_ref: "refs/heads/main",
+                head_ref: "refs/heads/feature",
+            })
             .expect("open a clean divergent pull request");
         let object_state = git_object_state(&fixture.bare);
         let clean = service
@@ -619,15 +632,15 @@ fn classifies_clean_conflicting_and_already_merged_revisions_for_both_hashes() {
             "change feature content",
         );
         service
-            .open(
-                "alice",
-                "project",
-                "alice",
-                "Conflicting divergence",
-                "The branches change the same line.",
-                "refs/heads/main",
-                "refs/heads/feature",
-            )
+            .open(&NewPullRequest {
+                owner: "alice",
+                repository: "project",
+                actor: "alice",
+                title: "Conflicting divergence",
+                body: "The branches change the same line.",
+                base_ref: "refs/heads/main",
+                head_ref: "refs/heads/feature",
+            })
             .expect("open a conflicting pull request");
         let object_state = git_object_state(&fixture.bare);
         let conflicting = service
@@ -641,15 +654,15 @@ fn classifies_clean_conflicting_and_already_merged_revisions_for_both_hashes() {
 
         fixture.merge_feature_into_main();
         service
-            .open(
-                "alice",
-                "project",
-                "alice",
-                "Merged head",
-                "The head is already in the base.",
-                "refs/heads/main",
-                "refs/heads/feature",
-            )
+            .open(&NewPullRequest {
+                owner: "alice",
+                repository: "project",
+                actor: "alice",
+                title: "Merged head",
+                body: "The head is already in the base.",
+                base_ref: "refs/heads/main",
+                head_ref: "refs/heads/feature",
+            })
             .expect("open an already merged pull request");
         let merged = service
             .compare("alice", "project", 3, None, None)
@@ -658,15 +671,15 @@ fn classifies_clean_conflicting_and_already_merged_revisions_for_both_hashes() {
 
         fixture.create_unrelated_branch();
         service
-            .open(
-                "alice",
-                "project",
-                "alice",
-                "Unrelated head",
-                "The branches do not have a common commit.",
-                "refs/heads/main",
-                "refs/heads/unrelated",
-            )
+            .open(&NewPullRequest {
+                owner: "alice",
+                repository: "project",
+                actor: "alice",
+                title: "Unrelated head",
+                body: "The branches do not have a common commit.",
+                base_ref: "refs/heads/main",
+                head_ref: "refs/heads/unrelated",
+            })
             .expect("open an unrelated pull request");
         let unrelated = service
             .compare("alice", "project", 4, None, None)
@@ -726,76 +739,85 @@ fn records_review_actions_and_immutable_line_anchors_for_both_hashes() {
         fixture.commit_bytes_on("feature", byte_path, b"byte path\n", "add a byte path");
         let service = PullRequestService::new(&fixture.database, &fixture.repositories);
         service
-            .open(
-                "alice",
-                "project",
-                "alice",
-                "Review anchors",
-                "Keep each review action.",
-                "refs/heads/main",
-                "refs/heads/feature",
-            )
+            .open(&NewPullRequest {
+                owner: "alice",
+                repository: "project",
+                actor: "alice",
+                title: "Review anchors",
+                body: "Keep each review action.",
+                base_ref: "refs/heads/main",
+                head_ref: "refs/heads/feature",
+            })
             .expect("open a reviewed pull request");
         service
-            .review(
-                "alice",
-                "project",
-                1,
-                1,
-                "bob",
-                "comment",
-                "A **general** comment.",
-                None,
-                None,
-                None,
-            )
+            .review(&PullRequestReview {
+                owner: "alice",
+                repository: "project",
+                number: 1,
+                revision: 1,
+                actor: "bob",
+                kind: "comment",
+                body: "A **general** comment.",
+                path: None,
+                side: None,
+                line: None,
+            })
             .expect("add a reader comment");
         service
-            .review(
-                "alice", "project", 1, 1, "bob", "approved", "", None, None, None,
-            )
+            .review(&PullRequestReview {
+                owner: "alice",
+                repository: "project",
+                number: 1,
+                revision: 1,
+                actor: "bob",
+                kind: "approved",
+                body: "",
+                path: None,
+                side: None,
+                line: None,
+            })
             .expect("approve the revision");
         service
-            .review(
-                "alice",
-                "project",
-                1,
-                1,
-                "alice",
-                "changes-requested",
-                "Change this line.",
-                None,
-                None,
-                None,
-            )
+            .review(&PullRequestReview {
+                owner: "alice",
+                repository: "project",
+                number: 1,
+                revision: 1,
+                actor: "alice",
+                kind: "changes-requested",
+                body: "Change this line.",
+                path: None,
+                side: None,
+                line: None,
+            })
             .expect("request changes");
         let line_id = service
-            .review(
-                "alice",
-                "project",
-                1,
-                1,
-                "bob",
-                "line-comment",
-                "Use a clearer value.",
-                Some(byte_path),
-                Some("head"),
-                Some(1),
-            )
+            .review(&PullRequestReview {
+                owner: "alice",
+                repository: "project",
+                number: 1,
+                revision: 1,
+                actor: "bob",
+                kind: "line-comment",
+                body: "Use a clearer value.",
+                path: Some(byte_path),
+                side: Some("head"),
+                line: Some(1),
+            })
             .expect("add a line comment");
         assert!(matches!(
-            service.review(
-                "alice",
-                "project",
-                1,
-                1,
-                "bob",
-                "line-comment",
-                "This line does not exist.",
-                Some(byte_path),
-                Some("head"),
-                Some(2),
-            ),
+            service.review(&PullRequestReview {
+                owner: "alice",
+                repository: "project",
+                number: 1,
+                revision: 1,
+                actor: "bob",
+                kind: "line-comment",
+                body: "This line does not exist.",
+                path: Some(byte_path),
+                side: Some("head"),
+                line: Some(2),
+            }),
             Err(PullRequestError::ReviewAnchor)
         ));
 
@@ -839,14 +861,34 @@ fn records_review_actions_and_immutable_line_anchors_for_both_hashes() {
 
         let store = Store::open(&fixture.database).expect("open the review policy store");
         let first_page = store
-            .pull_request_detail_page("alice", "project", 1, Some("bob"), 1, 1, 2)
+            .pull_request_detail_page(
+                "alice",
+                "project",
+                1,
+                Some("bob"),
+                crate::store::TimelinePagination {
+                    primary_page: 1,
+                    timeline_page: 1,
+                    page_size: 2,
+                },
+            )
             .expect("read the first bounded review page");
         assert_eq!(first_page.reviews.len(), 2);
         assert!(first_page.reviews_has_next);
         assert_eq!(first_page.timeline.len(), 2);
         assert!(first_page.timeline_has_next);
         let second_page = store
-            .pull_request_detail_page("alice", "project", 1, Some("bob"), 2, 2, 2)
+            .pull_request_detail_page(
+                "alice",
+                "project",
+                1,
+                Some("bob"),
+                crate::store::TimelinePagination {
+                    primary_page: 2,
+                    timeline_page: 2,
+                    page_size: 2,
+                },
+            )
             .expect("read the second bounded review page");
         assert_eq!(second_page.reviews_page, 2);
         assert_eq!(second_page.reviews.len(), 2);
@@ -867,18 +909,18 @@ fn records_review_actions_and_immutable_line_anchors_for_both_hashes() {
             )
             .expect("remove the reader");
         assert!(matches!(
-            service.review(
-                "alice",
-                "project",
-                1,
-                2,
-                "bob",
-                "comment",
-                "This must stay hidden.",
-                None,
-                None,
-                None,
-            ),
+            service.review(&PullRequestReview {
+                owner: "alice",
+                repository: "project",
+                number: 1,
+                revision: 2,
+                actor: "bob",
+                kind: "comment",
+                body: "This must stay hidden.",
+                path: None,
+                side: None,
+                line: None,
+            }),
             Err(PullRequestError::Store(StoreError::PullRequestHidden))
         ));
     }

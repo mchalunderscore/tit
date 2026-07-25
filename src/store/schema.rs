@@ -1,0 +1,28 @@
+pub(super) const VERSION: i64 = 24;
+
+pub(super) const MIGRATIONS: [&str; 24] = [
+    include_str!("migrations/001_initial.sql"),
+    include_str!("migrations/002_state.sql"),
+    include_str!("migrations/003_git_intents.sql"),
+    include_str!("migrations/004_identity.sql"),
+    include_str!("migrations/005_repository.sql"),
+    include_str!("migrations/006_repository_events.sql"),
+    include_str!("migrations/007_account_lifecycle.sql"),
+    include_str!("migrations/008_web_sessions.sql"),
+    include_str!("migrations/009_repository_authorization.sql"),
+    include_str!("migrations/010_audit_history.sql"),
+    include_str!("migrations/011_domain_events.sql"),
+    include_str!("migrations/012_issues.sql"),
+    include_str!("migrations/013_watches.sql"),
+    include_str!("migrations/014_feed_tokens.sql"),
+    include_str!("migrations/015_pull_requests.sql"),
+    include_str!("migrations/016_pull_request_reviews.sql"),
+    include_str!("migrations/017_pull_request_merges.sql"),
+    include_str!("migrations/018_streamlined_login.sql"),
+    include_str!("migrations/019_product_reduction.sql"),
+    include_str!("migrations/020_repository_profiles.sql"),
+    include_str!("migrations/021_pull_request_lifecycle.sql"),
+    include_str!("migrations/022_account_key_management.sql"),
+    include_str!("migrations/023_default_branch.sql"),
+    include_str!("migrations/024_default_branch_intents.sql"),
+];

@@ -63,6 +63,7 @@ pub(crate) struct ReadCancellation {
 }
 
 impl ReadCancellation {
+    #[cfg(test)]
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
     }

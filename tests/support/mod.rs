@@ -65,19 +65,6 @@ pub(crate) fn create_bare_git_fixture(path: &Path, object_format: &str) {
     );
 }
 
-pub(crate) fn create_ssh_key_fixture(path: &Path) {
-    let output = Command::new("ssh-keygen")
-        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-        .arg(path)
-        .output()
-        .expect("run the stock ssh-keygen client");
-    assert!(
-        output.status.success(),
-        "create an SSH key fixture: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 pub(crate) fn read_stock_ssh_configuration() {
     let output = Command::new("ssh")
         .args(["-G", "-F", "/dev/null", "localhost"])

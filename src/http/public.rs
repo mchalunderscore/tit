@@ -27,7 +27,7 @@ use crate::feed::{FeedPage, PAGE_SIZE, RepositoryFeedKind};
 use crate::git::packetline::MAX_REQUEST_BYTES;
 use crate::git::patch::write_patch;
 use crate::git::read::{
-    BlameHunk, CommitInfo, DiffFile, ReadCancellation, ReadError, ReadLimits,
+    BlameHunk, CommitInfo, DiffFile, ReadCancellation, ReadError, ReadLimits, RefInfo,
     RepositoryReadService, SearchOutcome, TreeEntryInfo,
 };
 use crate::git::upload_pack::{ProtocolVersion, UploadPack};
@@ -1564,7 +1564,7 @@ impl RepositoryPage {
         page
     }
 
-    fn refs(record: RepositoryRecord, references: Vec<crate::git::read::RefInfo>) -> Self {
+    fn refs(record: RepositoryRecord, references: Vec<RefInfo>) -> Self {
         let mut page = Self::base(record, "refs", "Refs".to_owned());
         page.refs = references
             .into_iter()
@@ -1697,7 +1697,7 @@ impl RepositoryPage {
 
     fn search(
         record: RepositoryRecord,
-        references: Vec<crate::git::read::RefInfo>,
+        references: Vec<RefInfo>,
         selected: Option<(Vec<u8>, ObjectId)>,
         query: String,
         outcome: Option<SearchOutcome>,
@@ -1860,6 +1860,10 @@ struct RefView {
 struct BlameView {
     start_line: u32,
     source_start_line: u32,
+    #[allow(
+        dead_code,
+        reason = "the Askama template reads this field through generated code"
+    )]
     line_count: u32,
     current_end_line: u32,
     source_end_line: u32,
@@ -1933,7 +1937,7 @@ impl From<ReadError> for RouteError {
 }
 
 fn select_search_ref(
-    references: &[crate::git::read::RefInfo],
+    references: &[RefInfo],
     requested: Option<&str>,
     default_branch: &str,
 ) -> Result<Option<(Vec<u8>, ObjectId)>, RouteError> {

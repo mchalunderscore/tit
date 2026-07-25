@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
 
@@ -6,6 +6,7 @@ use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRw
 pub(crate) struct MaintenanceGate {
     synchronous: Arc<RwLock<()>>,
     asynchronous: Arc<AsyncRwLock<()>>,
+    git_operations: Arc<Mutex<()>>,
 }
 
 impl MaintenanceGate {
@@ -17,6 +18,12 @@ impl MaintenanceGate {
 
     pub(crate) async fn mutation_async(&self) -> OwnedRwLockReadGuard<()> {
         self.asynchronous.clone().read_owned().await
+    }
+
+    pub(crate) fn git_operation(&self) -> MutexGuard<'_, ()> {
+        self.git_operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(crate) fn maintenance(&self) -> RwLockWriteGuard<'_, ()> {

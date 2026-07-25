@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "integration test crates use only the codec policies required by their imported modules"
-)]
-
 pub(crate) fn encode_lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));

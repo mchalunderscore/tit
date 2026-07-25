@@ -1,10 +1,10 @@
-use crate::{auth, git, ssh, store};
+use crate::{auth, backup::OnlineBackupService, git, maintenance::MaintenanceGate, ssh, store};
 
 use std::env;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,103 @@ use auth::SshPublicKey;
 use git::transport::GitRepositories;
 use ssh::RunningSshServer;
 use tempfile::TempDir;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn online_backup_waits_for_an_active_receive_pack() {
+    let directory = TempDir::new().expect("create a backup fixture directory");
+    let repositories_root = directory.path().join("repositories");
+    let bare = repositories_root.join("alice/example.git");
+    fs::create_dir_all(bare.parent().expect("a bare repository parent"))
+        .expect("create a repository owner directory");
+    run(Command::new("git")
+        .args(["init", "-q", "--bare", "--object-format", "sha1"])
+        .arg(&bare));
+
+    let private_key = directory.path().join("id_ed25519");
+    create_key(&private_key);
+    let key = parse_key(&private_key);
+    let database = directory.path().join(store::DATABASE_FILE);
+    store::Store::open(&database).expect("create the backup database");
+    let config = directory.path().join("config.toml");
+    fs::write(
+        &config,
+        b"version = 1\npublic_url = \"http://localhost:3000/\"\n",
+    )
+    .expect("write the backup configuration");
+    let gate = MaintenanceGate::default();
+    let repositories =
+        GitRepositories::new_with_pushes_and_gate(&repositories_root, &database, gate.clone())
+            .expect("open the repository root");
+    let server = RunningSshServer::start_with_git_writes(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        std::slice::from_ref(&key),
+        std::slice::from_ref(&key),
+        repositories,
+    )
+    .await
+    .expect("start the SSH Git server");
+
+    let mut receive = Command::new("ssh")
+        .args([
+            "-F",
+            "/dev/null",
+            "-p",
+            &server.address().port().to_string(),
+            "-i",
+        ])
+        .arg(&private_key)
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "ignored@127.0.0.1",
+            "git-receive-pack '/alice/example'",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start receive-pack");
+    let quarantine = bare.join("objects/tit-quarantine");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fs::read_dir(&quarantine)
+        .map(|entries| entries.count() == 0)
+        .unwrap_or(true)
+    {
+        assert!(
+            receive.try_wait().expect("inspect receive-pack").is_none(),
+            "receive-pack stopped before it created quarantine"
+        );
+        assert!(Instant::now() < deadline, "receive-pack did not start");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let backup_directory = TempDir::new().expect("create a backup output directory");
+    let output = backup_directory.path().join("instance.tar");
+    let backup = OnlineBackupService::new(directory.path().to_owned(), config, gate);
+    let backup_task = tokio::spawn({
+        let output = output.clone();
+        async move { backup.create(output).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!output.exists(), "backup did not wait for receive-pack");
+
+    receive.kill().expect("stop receive-pack");
+    receive.wait().expect("wait for receive-pack");
+    backup_task
+        .await
+        .expect("join the backup task")
+        .expect("create the online backup");
+    assert!(output.exists());
+    server.shutdown().await.expect("stop the SSH Git server");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stock_git_creates_and_updates_branches_for_both_hash_formats_over_ssh() {

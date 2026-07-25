@@ -1,7 +1,3 @@
-use std::collections::HashMap;
-use std::sync::Mutex;
-
-use rand::TryRng;
 use sha2::{Digest, Sha256};
 use ssh_key::{Algorithm, EcdsaCurve, HashAlg, PublicKey, SshSig};
 use thiserror::Error;
@@ -9,7 +5,6 @@ use thiserror::Error;
 use crate::codec::{decode_lower_hex, encode_lower_hex};
 use url::Url;
 
-const CHALLENGE_HEADER: &str = "tit-auth-v1";
 const KEYLESS_CHALLENGE_HEADER: &str = "tit-auth-v2";
 const CHALLENGE_PURPOSE: &str = "web-login";
 const SIGNATURE_NAMESPACE: &str = "tit-auth";
@@ -17,7 +12,6 @@ const MAX_KEY_BYTES: usize = 16 * 1024;
 const MAX_CHALLENGE_BYTES: usize = 4 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
 const MAX_CHALLENGE_LIFETIME_SECONDS: u64 = 5 * 60;
-const MAX_OUTSTANDING_CHALLENGES: usize = 1_024;
 const NONCE_BYTES: usize = 32;
 const MINIMUM_RSA_BITS: u32 = 3_072;
 
@@ -115,98 +109,7 @@ pub(crate) fn verify_keyless_login_challenge(
         username: fields.username.to_owned(),
         fingerprint: key.fingerprint().to_owned(),
         nonce_hash: hash_nonce(&fields.nonce),
-        expires_at: fields.expires_at,
     })
-}
-
-#[derive(Debug)]
-pub(crate) struct LoginChallenges {
-    origin: String,
-    nonces: Mutex<HashMap<[u8; 32], u64>>,
-}
-
-impl LoginChallenges {
-    pub(crate) fn new(public_url: &Url) -> Result<Self, AuthError> {
-        Ok(Self {
-            origin: login_origin(public_url)?,
-            nonces: Mutex::new(HashMap::new()),
-        })
-    }
-
-    pub(crate) fn issue(
-        &self,
-        username: &str,
-        key: &SshPublicKey,
-        issued_at: u64,
-        lifetime_seconds: u64,
-    ) -> Result<String, AuthError> {
-        validate_username(username)?;
-        if lifetime_seconds == 0 || lifetime_seconds > MAX_CHALLENGE_LIFETIME_SECONDS {
-            return Err(AuthError::InvalidLifetime);
-        }
-        let expires_at = issued_at
-            .checked_add(lifetime_seconds)
-            .ok_or(AuthError::InvalidLifetime)?;
-
-        let nonce = self.new_nonce(issued_at, expires_at)?;
-        Ok(format_login_challenge(
-            &self.origin,
-            username,
-            key,
-            &nonce,
-            issued_at,
-            expires_at,
-        ))
-    }
-
-    pub(crate) fn verify(
-        &self,
-        challenge: &str,
-        signature: &str,
-        expected_username: &str,
-        expected_key: &SshPublicKey,
-        now: u64,
-    ) -> Result<VerifiedLogin, AuthError> {
-        let verified = verify_login_challenge(
-            &self.origin,
-            challenge,
-            signature,
-            expected_username,
-            expected_key,
-            now,
-        )?;
-        let mut nonces = self.nonces.lock().map_err(|_| AuthError::NonceStore)?;
-        match nonces.get(&verified.nonce_hash) {
-            Some(stored_expiry) if *stored_expiry == verified.expires_at => {
-                nonces.remove(&verified.nonce_hash);
-            }
-            _ => return Err(AuthError::ConsumedChallenge),
-        }
-
-        Ok(VerifiedLogin {
-            username: verified.username,
-            fingerprint: verified.fingerprint,
-        })
-    }
-
-    fn new_nonce(&self, issued_at: u64, expires_at: u64) -> Result<[u8; NONCE_BYTES], AuthError> {
-        loop {
-            let mut nonce = [0_u8; NONCE_BYTES];
-            rand::rngs::SysRng
-                .try_fill_bytes(&mut nonce)
-                .map_err(|_| AuthError::Random)?;
-            let hash = hash_nonce(&nonce);
-            let mut nonces = self.nonces.lock().map_err(|_| AuthError::NonceStore)?;
-            nonces.retain(|_, stored_expiry| *stored_expiry >= issued_at);
-            if nonces.len() >= MAX_OUTSTANDING_CHALLENGES {
-                return Err(AuthError::NonceLimit);
-            }
-            if let std::collections::hash_map::Entry::Vacant(entry) = nonces.entry(hash) {
-                entry.insert(expires_at);
-                return Ok(nonce);
-            }
-        }
-    }
 }
 
 pub(crate) fn login_origin(public_url: &Url) -> Result<String, AuthError> {
@@ -223,79 +126,10 @@ pub(crate) fn login_origin(public_url: &Url) -> Result<String, AuthError> {
     Ok(public_url.origin().ascii_serialization())
 }
 
-pub(crate) fn format_login_challenge(
-    origin: &str,
-    username: &str,
-    key: &SshPublicKey,
-    nonce: &[u8; NONCE_BYTES],
-    issued_at: u64,
-    expires_at: u64,
-) -> String {
-    format!(
-        "{CHALLENGE_HEADER}\npurpose={CHALLENGE_PURPOSE}\norigin={origin}\nusername={username}\nfingerprint={}\nnonce={}\nissued-at={issued_at}\nexpires-at={expires_at}\n",
-        key.fingerprint(),
-        encode_lower_hex(nonce)
-    )
-}
-
-pub(crate) fn verify_login_challenge(
-    origin: &str,
-    challenge: &str,
-    signature: &str,
-    expected_username: &str,
-    expected_key: &SshPublicKey,
-    now: u64,
-) -> Result<PersistentVerifiedLogin, AuthError> {
-    if challenge.len() > MAX_CHALLENGE_BYTES {
-        return Err(AuthError::InputTooLarge("login challenge"));
-    }
-    if signature.len() > MAX_SIGNATURE_BYTES {
-        return Err(AuthError::InputTooLarge("SSHSIG envelope"));
-    }
-    validate_username(expected_username)?;
-    let fields = ChallengeFields::parse(challenge)?;
-    if fields.origin != origin {
-        return Err(AuthError::WrongOrigin);
-    }
-    if fields.username != expected_username {
-        return Err(AuthError::WrongUsername);
-    }
-    if fields.fingerprint != expected_key.fingerprint() {
-        return Err(AuthError::WrongKey);
-    }
-    if fields.expires_at <= fields.issued_at
-        || fields.expires_at - fields.issued_at > MAX_CHALLENGE_LIFETIME_SECONDS
-    {
-        return Err(AuthError::InvalidLifetime);
-    }
-    if now < fields.issued_at || now > fields.expires_at {
-        return Err(AuthError::ExpiredChallenge);
-    }
-    let sshsig = SshSig::from_pem(signature).map_err(AuthError::SignatureEnvelope)?;
-    validate_signature_algorithm(expected_key.public_key(), &sshsig)?;
-    expected_key
-        .public_key()
-        .verify(SIGNATURE_NAMESPACE, challenge.as_bytes(), &sshsig)
-        .map_err(AuthError::SignatureVerification)?;
-    Ok(PersistentVerifiedLogin {
-        username: fields.username.to_owned(),
-        fingerprint: fields.fingerprint.to_owned(),
-        nonce_hash: hash_nonce(&fields.nonce),
-        expires_at: fields.expires_at,
-    })
-}
-
 pub(crate) struct PersistentVerifiedLogin {
     pub(crate) username: String,
     pub(crate) fingerprint: String,
     pub(crate) nonce_hash: [u8; 32],
-    pub(crate) expires_at: u64,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct VerifiedLogin {
-    pub(crate) username: String,
-    pub(crate) fingerprint: String,
 }
 
 #[derive(Debug, Error)]
@@ -314,16 +148,12 @@ pub(crate) enum AuthError {
     InvalidOrigin,
     #[error("challenge lifetime is not valid")]
     InvalidLifetime,
-    #[error("cannot get random bytes")]
-    Random,
     #[error("login challenge is not valid")]
     MalformedChallenge,
     #[error("login challenge has the wrong origin")]
     WrongOrigin,
     #[error("login challenge has the wrong username")]
     WrongUsername,
-    #[error("login challenge has the wrong SSH key")]
-    WrongKey,
     #[error("login challenge has expired or is not active")]
     ExpiredChallenge,
     #[error("SSHSIG envelope is not valid: {0}")]
@@ -332,21 +162,6 @@ pub(crate) enum AuthError {
     UnsupportedSignatureAlgorithm,
     #[error("SSHSIG verification failed: {0}")]
     SignatureVerification(ssh_key::Error),
-    #[error("login challenge was consumed or was not issued")]
-    ConsumedChallenge,
-    #[error("login nonce store is not available")]
-    NonceStore,
-    #[error("too many login challenges are active")]
-    NonceLimit,
-}
-
-struct ChallengeFields<'a> {
-    origin: &'a str,
-    username: &'a str,
-    fingerprint: &'a str,
-    nonce: [u8; NONCE_BYTES],
-    issued_at: u64,
-    expires_at: u64,
 }
 
 struct KeylessChallengeFields<'a> {
@@ -380,41 +195,6 @@ impl<'a> KeylessChallengeFields<'a> {
         Ok(Self {
             origin,
             username,
-            nonce,
-            issued_at,
-            expires_at,
-        })
-    }
-}
-
-impl<'a> ChallengeFields<'a> {
-    fn parse(challenge: &'a str) -> Result<Self, AuthError> {
-        let body = challenge
-            .strip_suffix('\n')
-            .ok_or(AuthError::MalformedChallenge)?;
-        let mut lines = body.split('\n');
-        if lines.next() != Some(CHALLENGE_HEADER) || lines.next() != Some("purpose=web-login") {
-            return Err(AuthError::MalformedChallenge);
-        }
-        let origin = field(lines.next(), "origin=")?;
-        let username = field(lines.next(), "username=")?;
-        validate_username(username)?;
-        let fingerprint = field(lines.next(), "fingerprint=")?;
-        let nonce = decode_hex(field(lines.next(), "nonce=")?)?;
-        let issued_at = parse_time(field(lines.next(), "issued-at=")?)?;
-        let expires_at = parse_time(field(lines.next(), "expires-at=")?)?;
-        if lines.next().is_some()
-            || origin.is_empty()
-            || fingerprint.is_empty()
-            || origin.contains(['\r', '\n'])
-            || fingerprint.contains(['\r', '\n'])
-        {
-            return Err(AuthError::MalformedChallenge);
-        }
-        Ok(Self {
-            origin,
-            username,
-            fingerprint,
             nonce,
             issued_at,
             expires_at,

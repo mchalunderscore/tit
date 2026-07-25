@@ -20,6 +20,7 @@ pub(crate) struct Config {
     pub(crate) public_url: Url,
     pub(crate) instance_dir: PathBuf,
     pub(crate) http_listen: SocketAddr,
+    pub(crate) http_trusted_proxy: Option<IpAddr>,
     pub(crate) ssh_listen: SocketAddr,
     pub(crate) ssh_public_host: Host<String>,
     pub(crate) ssh_public_port: u16,
@@ -37,6 +38,12 @@ impl Config {
         validate_public_url(&self.public_url)?;
         if self.http_listen.port() == 0 {
             return Err(ConfigError::ZeroListenerPort("http.listen"));
+        }
+        if self
+            .http_trusted_proxy
+            .is_some_and(|address| address.is_unspecified() || address.is_multicast())
+        {
+            return Err(ConfigError::InvalidTrustedProxy);
         }
         if self.ssh_listen.port() == 0 {
             return Err(ConfigError::ZeroListenerPort("ssh.listen"));
@@ -122,6 +129,7 @@ struct ConfigFile {
 #[serde(default, deny_unknown_fields)]
 struct HttpConfig {
     listen: SocketAddr,
+    trusted_proxy: Option<IpAddr>,
 }
 
 impl Default for HttpConfig {
@@ -130,6 +138,7 @@ impl Default for HttpConfig {
             listen: "127.0.0.1:3000"
                 .parse()
                 .expect("the default HTTP address is valid"),
+            trusted_proxy: None,
         }
     }
 }
@@ -229,6 +238,8 @@ pub(crate) enum ConfigError {
     InvalidSshPublicAddress(IpAddr),
     #[error("listener port {0} must not be zero")]
     ZeroListenerPort(&'static str),
+    #[error("trusted proxy must not be an unspecified or multicast address")]
+    InvalidTrustedProxy,
     #[error("configuration limit {0} must not be zero")]
     ZeroLimit(&'static str),
     #[error("configuration limit {0} is too large")]
@@ -283,6 +294,7 @@ pub(crate) fn load(cli: &Cli) -> Result<Config, ConfigError> {
         public_url,
         instance_dir,
         http_listen,
+        http_trusted_proxy: file.http.trusted_proxy,
         ssh_listen,
         ssh_public_host,
         ssh_public_port,
@@ -405,6 +417,7 @@ policy = "invite"
         assert_eq!(config.public_url.as_str(), "https://tit.example/");
         assert_eq!(config.instance_dir, path.parent().expect("a parent"));
         assert_eq!(config.http_listen.to_string(), "127.0.0.1:3000");
+        assert_eq!(config.http_trusted_proxy, None);
         assert_eq!(config.ssh_listen.to_string(), "0.0.0.0:2222");
         assert_eq!(
             config.ssh_public_host,
@@ -525,6 +538,26 @@ policy = "invite"
         assert!(matches!(
             load(&cli(&path)),
             Err(ConfigError::InvalidSshPublicAddress(address)) if address.is_unspecified()
+        ));
+    }
+
+    #[test]
+    fn accepts_one_explicit_trusted_proxy_and_rejects_unsafe_addresses() {
+        let (_directory, path) = write_config(
+            "version = 1\npublic_url = \"https://tit.example/\"\n[http]\ntrusted_proxy = \"127.0.0.1\"\n",
+        );
+        let config = load(&cli(&path)).expect("load the trusted proxy");
+        assert_eq!(
+            config.http_trusted_proxy,
+            Some("127.0.0.1".parse().expect("parse the expected address"))
+        );
+
+        let (_directory, path) = write_config(
+            "version = 1\npublic_url = \"https://tit.example/\"\n[http]\ntrusted_proxy = \"0.0.0.0\"\n",
+        );
+        assert!(matches!(
+            load(&cli(&path)),
+            Err(ConfigError::InvalidTrustedProxy)
         ));
     }
 

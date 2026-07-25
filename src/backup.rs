@@ -870,7 +870,7 @@ mod tests {
             .unarchive_repository_for_owner("alice", "after", "alice", 5, "backup-unarchive")
             .expect("unarchive the backup repository");
         drop(store);
-        crate::git::repository::GitRepository::create_bare(
+        GitRepository::create_bare(
             &instance
                 .path()
                 .join(REPOSITORY_DIRECTORY)

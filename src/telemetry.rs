@@ -32,10 +32,6 @@ impl Drop for HttpInFlight {
 }
 
 impl Telemetry {
-    #[allow(
-        dead_code,
-        reason = "integration tests use disabled telemetry outside the production server"
-    )]
     pub(crate) fn enabled() -> Self {
         Self {
             counters: Arc::new(Counters::default()),
@@ -100,10 +96,6 @@ impl Telemetry {
         self.write_ssh_event("ssh.operation", operation_id, "started");
     }
 
-    #[allow(
-        dead_code,
-        reason = "some integration tests compile telemetry without process lifecycle"
-    )]
     pub(crate) fn lifecycle(&self, event: &'static str, outcome: &'static str) {
         self.write_event(&Event {
             timestamp_ms: timestamp_ms(),
