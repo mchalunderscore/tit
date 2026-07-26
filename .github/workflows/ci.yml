@@ -188,10 +188,36 @@ jobs:
       - name: Publish the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES: |
+            ## Setup
+
+            Download the archive and checksum file for your target. Verify the
+            checksum before you extract the archive.
+
+            Install the executable and create a private instance:
+
+            ```text
+            install -m 755 tit-*/bin/tit /usr/local/bin/tit
+            install -d -m 700 /srv/tit
+            install -m 600 tit-*/etc/tit/config.toml /srv/tit/config.toml
+            ```
+
+            Set the public URL, HTTP listener, and SSH listener in
+            `/srv/tit/config.toml`. Create the first administrator and start the
+            server:
+
+            ```text
+            tit --config /srv/tit/config.toml setup admin alice "SSH_PUBLIC_KEY"
+            tit --config /srv/tit/config.toml serve
+            ```
+
+            The archive includes the README, manual page, service files, and
+            Caddy examples for complete setup instructions.
         run: |
           set -- release-artifacts/tit-x86_64-unknown-linux-gnu/*.tar.gz
           case "$(basename "$1")" in
             "tit-${GITHUB_REF_NAME#v}-"*) ;;
             *) echo "The tag does not match the package version." >&2; exit 1 ;;
           esac
-          gh release create "$GITHUB_REF_NAME" release-artifacts/*/* --verify-tag --generate-notes
+          gh release create "$GITHUB_REF_NAME" release-artifacts/*/* \
+            --verify-tag --generate-notes --notes "$RELEASE_NOTES"
