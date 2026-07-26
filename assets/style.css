@@ -1023,26 +1023,154 @@ pre {
   border-bottom: 1px solid var(--border);
 }
 
-.pull-request-file > pre {
+.pull-request-line-comment {
+  max-width: none;
   margin: 0;
+}
+
+.pull-request-line-help {
+  margin: 0;
+  padding: 0.55rem 0.85rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg-muted);
+  font-size: 0.7rem;
+}
+
+.pull-request-file-diff {
+  margin: 0;
+  padding: 0;
   border: 0;
   background: var(--bg);
 }
 
-.pull-request-line-comment {
+.pull-request-diff-table {
+  min-width: 38rem;
+  table-layout: fixed;
+}
+
+.pull-request-diff-table th {
+  padding: 0.25rem 0.4rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  text-transform: none;
+}
+
+.pull-request-diff-table th:first-child,
+.pull-request-diff-table th:nth-child(2) {
+  width: 3.25rem;
+  text-align: center;
+}
+
+.pull-request-diff-table td {
+  height: 1.75rem;
+  padding: 0 0.5rem;
+  border-bottom: 0;
+  line-height: 1.45;
+}
+
+.pull-request-diff-table .diff-line-number {
+  padding: 0;
+  border-right: 1px solid var(--border);
+  color: var(--fg-muted);
+  text-align: center;
+  user-select: none;
+}
+
+.diff-line-number label {
+  display: block;
+  margin: 0;
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.7rem;
+  font-weight: 400;
+}
+
+.diff-line-number input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.diff-line-number span {
+  display: block;
+  min-height: 1.75rem;
+  padding: 0.2rem 0.25rem;
+}
+
+.diff-line-number label:hover span {
+  background: var(--surface-raised);
+  color: var(--fg);
+}
+
+.diff-line-number input:focus-visible + span {
+  outline: 0.125rem solid var(--fg);
+  outline-offset: -0.125rem;
+}
+
+.diff-line-number input:checked + span {
+  background: var(--fg);
+  color: var(--bg);
+  font-weight: 700;
+}
+
+.pull-request-diff-table .diff-code {
+  padding-inline: 0.65rem;
+  overflow: hidden;
+}
+
+.diff-code code,
+.diff-hunk code,
+.diff-meta code {
+  display: block;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.diff-marker {
+  display: inline-block;
+  width: 1.25rem;
+  color: var(--fg);
+  font-weight: 700;
+}
+
+.diff-addition,
+.diff-deletion {
+  background: var(--bg);
+}
+
+.diff-addition .diff-code {
+  border-left: 0.2rem solid var(--fg);
+}
+
+.diff-deletion .diff-code {
+  border-left: 0.2rem dashed var(--fg-dim);
+}
+
+.diff-context .diff-code {
+  border-left: 0.2rem solid transparent;
+}
+
+.diff-deletion .diff-code code,
+.diff-deletion .diff-marker {
+  color: var(--fg-dim);
+}
+
+.diff-hunk td,
+.diff-meta td {
+  padding: 0.35rem 0.65rem;
+  background: var(--surface-raised);
+  color: var(--fg-dim);
+}
+
+.pull-request-line-comment > details {
   margin: 0;
   padding: 0.65rem 0.85rem;
   border-top: 1px solid var(--border);
 }
 
-.pull-request-line-comment form {
+.pull-request-line-comment > details form {
   max-width: 42rem;
-}
-
-.pull-request-line-fields {
-  display: grid;
-  grid-template-columns: minmax(8rem, 0.4fr) minmax(8rem, 0.6fr);
-  gap: 0.75rem;
 }
 
 .pull-request-discussion {
@@ -1301,6 +1429,18 @@ pre {
   top: auto;
 }
 
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  border: 0;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
 .skip-link:focus {
   left: 1rem;
   top: 1rem;
@@ -1489,10 +1629,6 @@ footer {
 
   .pull-request-change-summary > div:last-child {
     border-bottom: 0;
-  }
-
-  .pull-request-line-fields {
-    grid-template-columns: 1fr;
   }
 
   dl {

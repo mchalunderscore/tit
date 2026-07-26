@@ -441,9 +441,7 @@ async fn create_review(
     let fields = match parse_named_form(
         &headers,
         &body,
-        &[
-            "csrf", "revision", "kind", "body", "path-hex", "side", "line",
-        ],
+        &["csrf", "revision", "kind", "body", "path-hex", "anchor"],
     ) {
         Ok(fields) => fields,
         Err(()) => return bad_request(&request_id.0),
@@ -465,14 +463,9 @@ async fn create_review(
             None => return bad_request(&request_id.0),
         }
     };
-    let side = (!fields[5].is_empty()).then(|| fields[5].clone());
-    let line = if fields[6].is_empty() {
-        None
-    } else {
-        match fields[6].parse::<i64>() {
-            Ok(line) => Some(line),
-            Err(_) => return bad_request(&request_id.0),
-        }
+    let (side, line) = match parse_review_anchor(&fields[5]) {
+        Ok(anchor) => anchor,
+        Err(()) => return bad_request(&request_id.0),
     };
     let Some(service) = state.pull_requests.clone() else {
         return internal(&request_id.0);
@@ -837,9 +830,21 @@ struct DiffView {
     path: String,
     path_hex: String,
     binary: bool,
+    lines: Vec<DiffLineView>,
+}
+
+struct DiffLineView {
+    kind: &'static str,
+    marker: &'static str,
+    text: String,
+    base_line: i64,
+    head_line: i64,
+    base_anchor: String,
+    head_anchor: String,
     has_base: bool,
     has_head: bool,
-    hunks: String,
+    is_hunk: bool,
+    is_meta: bool,
 }
 
 impl From<&Comparison> for ComparisonView {
@@ -875,11 +880,153 @@ impl From<&Comparison> for ComparisonView {
                     path: String::from_utf8_lossy(&file.path).into_owned(),
                     path_hex: encode_lower_hex(&file.path),
                     binary: file.binary,
-                    has_base: file.old_id.is_some(),
-                    has_head: file.new_id.is_some(),
-                    hunks: String::from_utf8_lossy(&file.hunks).into_owned(),
+                    lines: parse_diff_lines(&String::from_utf8_lossy(&file.hunks)),
                 })
                 .collect(),
         }
+    }
+}
+
+fn parse_review_anchor(value: &str) -> Result<(Option<String>, Option<i64>), ()> {
+    if value.is_empty() {
+        return Ok((None, None));
+    }
+    let (side, line) = value.split_once(':').ok_or(())?;
+    if !matches!(side, "base" | "head") || line.contains(':') {
+        return Err(());
+    }
+    let line = line.parse::<i64>().map_err(|_| ())?;
+    if line < 1 {
+        return Err(());
+    }
+    Ok((Some(side.to_owned()), Some(line)))
+}
+
+fn parse_diff_lines(hunks: &str) -> Vec<DiffLineView> {
+    let mut base_line = 0;
+    let mut head_line = 0;
+    let mut lines = Vec::new();
+    for source in hunks.lines() {
+        if source.starts_with("@@") {
+            if let Some((base, head)) = parse_hunk_starts(source) {
+                base_line = base;
+                head_line = head;
+            }
+            lines.push(diff_meta_line(source, true));
+        } else if let Some(text) = source.strip_prefix('-') {
+            lines.push(diff_content_line(
+                "deletion",
+                "-",
+                text,
+                Some(base_line),
+                None,
+            ));
+            base_line += 1;
+        } else if let Some(text) = source.strip_prefix('+') {
+            lines.push(diff_content_line(
+                "addition",
+                "+",
+                text,
+                None,
+                Some(head_line),
+            ));
+            head_line += 1;
+        } else if let Some(text) = source.strip_prefix(' ') {
+            lines.push(diff_content_line(
+                "context",
+                " ",
+                text,
+                Some(base_line),
+                Some(head_line),
+            ));
+            base_line += 1;
+            head_line += 1;
+        } else {
+            lines.push(diff_meta_line(source, false));
+        }
+    }
+    lines
+}
+
+fn parse_hunk_starts(header: &str) -> Option<(i64, i64)> {
+    let mut fields = header.split_whitespace();
+    (fields.next()? == "@@").then_some(())?;
+    let base = parse_hunk_start(fields.next()?, '-')?;
+    let head = parse_hunk_start(fields.next()?, '+')?;
+    Some((base, head))
+}
+
+fn parse_hunk_start(range: &str, prefix: char) -> Option<i64> {
+    range.strip_prefix(prefix)?.split(',').next()?.parse().ok()
+}
+
+fn diff_meta_line(text: &str, is_hunk: bool) -> DiffLineView {
+    DiffLineView {
+        kind: if is_hunk { "hunk" } else { "meta" },
+        marker: "",
+        text: text.to_owned(),
+        base_line: 0,
+        head_line: 0,
+        base_anchor: String::new(),
+        head_anchor: String::new(),
+        has_base: false,
+        has_head: false,
+        is_hunk,
+        is_meta: !is_hunk,
+    }
+}
+
+fn diff_content_line(
+    kind: &'static str,
+    marker: &'static str,
+    text: &str,
+    base: Option<i64>,
+    head: Option<i64>,
+) -> DiffLineView {
+    DiffLineView {
+        kind,
+        marker,
+        text: text.to_owned(),
+        base_line: base.unwrap_or_default(),
+        head_line: head.unwrap_or_default(),
+        base_anchor: base.map_or_else(String::new, |line| format!("base:{line}")),
+        head_anchor: head.map_or_else(String::new, |line| format!("head:{line}")),
+        has_base: base.is_some(),
+        has_head: head.is_some(),
+        is_hunk: false,
+        is_meta: false,
+    }
+}
+
+#[cfg(test)]
+mod diff_view_tests {
+    use super::{parse_diff_lines, parse_review_anchor};
+
+    #[test]
+    fn maps_unified_diff_lines_to_visible_comment_anchors() {
+        let lines = parse_diff_lines(
+            "@@ -2,3 +2,4 @@ heading\n unchanged\n-removed\n+added\n+second addition\n",
+        );
+
+        assert!(lines[0].is_hunk);
+        assert_eq!(lines[1].base_anchor, "base:2");
+        assert_eq!(lines[1].head_anchor, "head:2");
+        assert_eq!(lines[2].base_anchor, "base:3");
+        assert!(!lines[2].has_head);
+        assert_eq!(lines[3].head_anchor, "head:3");
+        assert!(!lines[3].has_base);
+        assert_eq!(lines[4].head_anchor, "head:4");
+    }
+
+    #[test]
+    fn accepts_only_explicit_positive_review_anchors() {
+        assert_eq!(
+            parse_review_anchor("head:12"),
+            Ok((Some("head".to_owned()), Some(12)))
+        );
+        assert_eq!(parse_review_anchor(""), Ok((None, None)));
+        assert!(parse_review_anchor("side:12").is_err());
+        assert!(parse_review_anchor("base:0").is_err());
+        assert!(parse_review_anchor("head:1:2").is_err());
     }
 }
