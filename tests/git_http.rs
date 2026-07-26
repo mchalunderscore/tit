@@ -280,7 +280,7 @@ async fn server_process_does_not_invoke_git() {
     let git_binary = command_output(Command::new("which").arg("git"));
     let git_exec_path = command_output(Command::new("git").arg("--exec-path"));
     let driver_path = std::env::var_os("PATH").expect("the test driver PATH");
-    let output = Command::new(std::env::current_exe().expect("find the test executable"))
+    let output = crate::test_process::current_exe()
         .args([
             "--exact",
             "git_http_tests::server_process_does_not_invoke_git",

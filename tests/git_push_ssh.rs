@@ -454,7 +454,7 @@ fn spawn_push_crash_child(
     private_key: &Path,
     ready: &Path,
 ) -> Child {
-    Command::new(env::current_exe().expect("find the integration test executable"))
+    crate::test_process::current_exe()
         .args([
             "--exact",
             "git_push_ssh_tests::git_push_crash_child",

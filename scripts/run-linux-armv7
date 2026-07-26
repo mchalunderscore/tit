@@ -1,4 +1,17 @@
 #!/bin/sh
 set -eu
 
+case "$0" in
+    /*) test_runner=$0 ;;
+    *) test_runner=$(pwd)/$0 ;;
+esac
+case "$1" in
+    /*) test_executable=$1 ;;
+    *) test_executable=$(pwd)/$1 ;;
+esac
+
+TIT_TEST_RUNNER=$test_runner
+TIT_TEST_EXECUTABLE=$test_executable
+export TIT_TEST_RUNNER TIT_TEST_EXECUTABLE
+
 exec /usr/bin/qemu-arm -L /usr/arm-linux-gnueabihf "$@"

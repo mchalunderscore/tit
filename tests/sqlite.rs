@@ -1,6 +1,6 @@
 use crate::store;
 
-use std::process::{Child, Command};
+use std::process::Child;
 use std::sync::mpsc;
 use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
 use std::thread;
@@ -140,7 +140,7 @@ fn spawn_crash_child(
     database_path: &std::path::Path,
     ready_path: &std::path::Path,
 ) -> Child {
-    Command::new(env::current_exe().expect("find the integration test executable"))
+    crate::test_process::current_exe()
         .args([
             "--exact",
             "sqlite_tests::crash_child",

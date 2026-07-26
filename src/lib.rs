@@ -76,6 +76,9 @@ mod sqlite_workload_tests;
 #[path = "../tests/ssh.rs"]
 mod ssh_tests;
 #[cfg(test)]
+#[path = "../tests/process.rs"]
+mod test_process;
+#[cfg(test)]
 #[path = "../tests/web_session.rs"]
 mod web_session_tests;
 #[cfg(test)]
