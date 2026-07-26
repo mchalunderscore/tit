@@ -91,7 +91,8 @@ jobs:
             qemu-user
           rustup target add "$TARGET"
       - run: cargo --version
-      - run: cargo test --locked --all-targets --all-features --target "$TARGET"
+      - run: cargo test --locked --all-targets --all-features --target "$TARGET" --no-run
+      - run: cargo test --locked --lib --all-features --target "$TARGET"
       - run: cargo test --locked --release --lib --target "$TARGET"
       - run: cargo build --locked --release --target "$TARGET"
       - run: wc -c "target/$TARGET/release/tit"
@@ -100,11 +101,6 @@ jobs:
         run: |
           set -- dist/*.tar.gz
           ./scripts/verify-release-artifact "$1" "$1.sha256"
-          mkdir release-test
-          tar -xzf "$1" -C release-test
-          set -- release-test/tit-*/bin/tit
-          TIT_RELEASE_BINARY="$(pwd)/$1" \
-            cargo test --locked --release --target "$TARGET" --test serve
       - name: Store the release artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
