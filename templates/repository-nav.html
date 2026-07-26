@@ -1,12 +1,26 @@
-    <nav aria-label="Repository">
-      <a href="/{{ owner }}/{{ repository }}">Summary</a>
-      <a href="/{{ owner }}/{{ repository }}/refs">Refs</a>
-      <a href="/{{ owner }}/{{ repository }}/issues">Issues</a>
-      <a href="/{{ owner }}/{{ repository }}/pulls">Pull requests</a>
-      <a href="/{{ owner }}/{{ repository }}/watch">Watch</a>
-      <a href="/{{ owner }}/{{ repository }}/rss.xml">RSS</a>
-      <a href="/{{ owner }}/{{ repository }}/search">Search</a>
-{% if signed_in %}
-      <a href="/{{ owner }}/{{ repository }}/settings">Settings</a>
+    <nav class="repository-navigation" aria-label="Repository">
+      <div class="repository-tabs">
+        <a href="/{{ owner }}/{{ repository }}"{% if nav_section == "summary" %} aria-current="page"{% endif %}>Summary</a>
+        <a href="/{{ owner }}/{{ repository }}/issues"{% if nav_section == "issues" %} aria-current="page"{% endif %}>Issues</a>
+        <a href="/{{ owner }}/{{ repository }}/pulls"{% if nav_section == "pulls" %} aria-current="page"{% endif %}>Pull requests</a>
+      </div>
+      <div class="repository-tools">
+        <a class="icon-link" href="/{{ owner }}/{{ repository }}/refs" aria-label="Refs" title="Refs"{% if nav_section == "refs" %} aria-current="page"{% endif %}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="5" r="2"></circle><circle cx="6" cy="19" r="2"></circle><circle cx="18" cy="12" r="2"></circle><path d="M6 7v10M8 5h3a7 7 0 0 1 7 7"></path></svg>
+        </a>
+        <a class="icon-link" href="/{{ owner }}/{{ repository }}/watch" aria-label="Watch" title="Watch"{% if nav_section == "watch" %} aria-current="page"{% endif %}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"></path><circle cx="12" cy="12" r="2.5"></circle></svg>
+        </a>
+        <a class="icon-link" href="/{{ owner }}/{{ repository }}/rss.xml" aria-label="RSS feed" title="RSS feed">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="19" r="1"></circle><path d="M4 11a9 9 0 0 1 9 9M4 5a15 15 0 0 1 15 15"></path></svg>
+        </a>
+        <a class="icon-link" href="/{{ owner }}/{{ repository }}/search" aria-label="Search repository" title="Search repository"{% if nav_section == "search" %} aria-current="page"{% endif %}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"></circle><path d="m16 16 4 4"></path></svg>
+        </a>
+{% if can_manage %}
+        <a class="icon-link" href="/{{ owner }}/{{ repository }}/settings" aria-label="Repository settings" title="Repository settings"{% if nav_section == "settings" %} aria-current="page"{% endif %}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"></path></svg>
+        </a>
 {% endif %}
+      </div>
     </nav>

@@ -18,7 +18,7 @@ use super::filters;
 use super::public::{patch_response, stream_patch};
 use super::{
     CSRF_COOKIE, RequestActor, RequestId, WebState, authenticate_mutation, cookie,
-    parse_named_form, render, render_error,
+    parse_named_form, render, render_error, repository_can_manage,
 };
 
 const MAX_PULL_REQUEST_BYTES: usize = 300 * 1024;
@@ -126,6 +126,13 @@ async fn pull_request_list(
     let repository = path.repository.clone();
     let signed_in = actor.0.is_some();
     let actor_name = actor.0;
+    let can_manage = repository_can_manage(
+        state.clone(),
+        actor_name.clone(),
+        owner.clone(),
+        repository.clone(),
+    )
+    .await;
     let actor_for_list = actor_name.clone();
     let state_filter = query.state.unwrap_or_else(|| "open".to_owned());
     let page_number = query.page.unwrap_or(1);
@@ -171,6 +178,7 @@ async fn pull_request_list(
                 &PullRequestListTemplate {
                     request_id: &request_id.0,
                     signed_in,
+                    can_manage,
                     owner: &record.owner,
                     repository: &record.slug,
                     pull_requests: page
@@ -218,6 +226,13 @@ async fn pull_request_detail(
     let owner = path.owner.clone();
     let repository = path.repository.clone();
     let signed_in = actor.0.is_some();
+    let can_manage = repository_can_manage(
+        state.clone(),
+        actor.0.clone(),
+        owner.clone(),
+        repository.clone(),
+    )
+    .await;
     let reviews_page = query.reviews_page.unwrap_or(1);
     let timeline_page = query.timeline_page.unwrap_or(1);
     if reviews_page == 0 || timeline_page == 0 {
@@ -247,6 +262,7 @@ async fn pull_request_detail(
                 &PullRequestTemplate {
                     request_id: &request_id.0,
                     signed_in,
+                    can_manage,
                     owner: &detail.repository.owner,
                     repository: &detail.repository.slug,
                     pull_request,
@@ -257,7 +273,6 @@ async fn pull_request_detail(
                         .iter()
                         .map(|review| ReviewView {
                             id: &review.id,
-                            revision: review.revision,
                             author: &review.author,
                             kind: &review.kind,
                             body_html: markdown::render(&review.body),
@@ -723,6 +738,7 @@ struct ListQuery {
 struct PullRequestListTemplate<'a> {
     request_id: &'a str,
     signed_in: bool,
+    can_manage: bool,
     owner: &'a str,
     repository: &'a str,
     pull_requests: Vec<PullRequestListItem<'a>>,
@@ -754,6 +770,7 @@ struct PullRequestListItem<'a> {
 struct PullRequestTemplate<'a> {
     request_id: &'a str,
     signed_in: bool,
+    can_manage: bool,
     owner: &'a str,
     repository: &'a str,
     pull_request: &'a crate::store::PullRequestRecord,
@@ -784,7 +801,6 @@ struct PullRequestTemplate<'a> {
 
 struct ReviewView<'a> {
     id: &'a str,
-    revision: i64,
     author: &'a str,
     kind: &'a str,
     body_html: RenderedMarkdown,

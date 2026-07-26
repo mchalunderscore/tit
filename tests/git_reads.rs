@@ -75,18 +75,25 @@ fn reads_repository_content_for_both_object_formats() {
                 .map(|entry| entry.name.as_slice())
                 .collect::<Vec<_>>(),
             [
+                b"docs".as_slice(),
+                b"src".as_slice(),
                 b"README.md".as_slice(),
                 b"binary".as_slice(),
-                b"docs".as_slice(),
                 b"mode.sh".as_slice(),
-                b"renamed.txt".as_slice(),
-                b"src".as_slice()
+                b"renamed.txt".as_slice()
             ]
         );
         let (root_prefix, truncated) = service
             .tree_prefix(fixture.second, b"", 2, &cancellation)
             .expect("read a root-tree prefix");
         assert_eq!(root_prefix.len(), 2);
+        assert_eq!(
+            root_prefix
+                .iter()
+                .map(|entry| entry.name.as_slice())
+                .collect::<Vec<_>>(),
+            [b"docs".as_slice(), b"src".as_slice()]
+        );
         assert!(truncated);
         let metadata = service
             .commit_metadata(&[fixture.first, fixture.second], &cancellation)

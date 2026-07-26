@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Account · tit{% endblock %}
+{% block content %}
+  <section class="account-entry" aria-labelledby="account-heading">
+    <h1 id="account-heading">Account</h1>
+    <p>Create an account, recover an account, or log in with an SSH key.</p>
+    <div class="account-options">
+      <a href="/login">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M10 5H5v14h5"/>
+          <path d="M14 8l4 4-4 4"/>
+          <path d="M8 12h10"/>
+        </svg>
+        <strong>Log in</strong>
+        <span>Use an SSH key that is active on your account.</span>
+      </a>
+      <a href="/signup">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="9" cy="8" r="4"/>
+          <path d="M2 21a7 7 0 0 1 14 0"/>
+          <path d="M19 8v6"/>
+          <path d="M16 11h6"/>
+        </svg>
+        <strong>Create account</strong>
+        <span>Use a signup code and an SSH public key.</span>
+      </a>
+      <a href="/recover">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M15 12h7"/>
+          <path d="M19 12v3"/>
+          <path d="M22 12v2"/>
+          <path d="M9 12H5a3 3 0 1 1 0-6h5"/>
+        </svg>
+        <strong>Recover account</strong>
+        <span>Replace all SSH keys with a recovery code.</span>
+      </a>
+    </div>
+  </section>
+{% endblock %}

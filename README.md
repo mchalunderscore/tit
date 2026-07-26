@@ -292,3 +292,5 @@ cargo test --locked --release --lib sqlite_workload_tests:: \
 ```
 
 `tit` is licensed under the MIT License. See [LICENSE](LICENSE).
+Space Mono is licensed under the SIL Open Font License, Version 1.1. See
+[assets/SpaceMono-LICENSE.txt](assets/SpaceMono-LICENSE.txt).

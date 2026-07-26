@@ -3,6 +3,7 @@
 {% block content %}
   <header class="repository-header">
     <h1><a href="/{{ owner }}">{{ owner }}</a>/<a href="/{{ owner }}/{{ repository }}">{{ repository }}</a></h1>
+{% let nav_section = "issues" %}
 {% include "repository-nav.html" %}
   </header>
 
@@ -25,7 +26,7 @@
 {% endfor %}
 {% endif %}
 {% if comments_has_previous || comments_has_next %}
-    <nav aria-label="Comment pages">
+    <nav class="pagination" aria-label="Comment pages">
 {% if comments_has_previous %}
       <a href="?comments_page={{ comments_previous_page }}&amp;timeline_page={{ timeline_page }}">Newer comments</a>
 {% endif %}
@@ -44,7 +45,7 @@
 {% endfor %}
     </ol>
 {% if timeline_has_previous || timeline_has_next %}
-    <nav aria-label="Timeline pages">
+    <nav class="pagination" aria-label="Timeline pages">
 {% if timeline_has_previous %}
       <a href="?comments_page={{ comments_page }}&amp;timeline_page={{ timeline_previous_page }}">Newer events</a>
 {% endif %}

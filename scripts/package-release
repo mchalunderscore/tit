@@ -62,6 +62,7 @@ install -d -m 755 \
     "$root/share/fish/vendor_completions.d"
 install -m 755 "$binary" "$root/bin/tit"
 install -m 644 "$project_dir/LICENSE" "$root/LICENSE"
+install -m 644 "$project_dir/assets/SpaceMono-LICENSE.txt" "$root/LICENSE-SpaceMono"
 install -m 644 "$project_dir/README.md" "$root/README.md"
 install -m 600 "$project_dir/config.example.toml" "$root/etc/tit/config.toml"
 install -m 644 "$project_dir/release/examples/Caddyfile" "$root/share/doc/tit/examples/Caddyfile"

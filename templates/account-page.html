@@ -35,11 +35,22 @@
     </p>
     <button type="submit">Create repository</button>
   </form>
+  </section>
+  </div>
+  <div class="two-column account-utilities">
+  <section>
   <h2>Feeds</h2>
   <p><a href="/feeds">Manage private feed tokens</a></p>
+  </section>
+  <section>
   <h2>Sessions</h2>
-  <p><a href="/logout">Log out all sessions</a></p>
-  <h2>SSH keys</h2>
+  <p><a class="danger-link" href="/logout">Log out all sessions</a></p>
+  </section>
+  </div>
+  <section class="account-keys" aria-labelledby="ssh-keys-heading">
+  <h2 id="ssh-keys-heading">SSH keys</h2>
+  <div class="account-key-layout">
+  <div>
   <ul class="key-list">
     {% for key in keys %}
     <li class="key-card">
@@ -59,7 +70,7 @@
       <form action="/account/keys/revoke" method="post">
         <input type="hidden" name="csrf" value="{{ csrf }}">
         <input type="hidden" name="fingerprint" value="{{ key.fingerprint }}">
-        <button type="submit">Revoke</button>
+        <button class="danger-action" type="submit">Revoke</button>
       </form>
           {% else %}
       <p>This is your final active key.</p>
@@ -68,6 +79,8 @@
     </li>
     {% endfor %}
   </ul>
+  </div>
+  <div>
   <h3>Add SSH key</h3>
   <form action="/account/keys/add" method="post">
     <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -81,6 +94,7 @@
     </div>
     <button type="submit">Add key</button>
   </form>
-  </section>
   </div>
+  </div>
+  </section>
 {% endblock %}

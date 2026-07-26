@@ -3,12 +3,15 @@
 {% block content %}
   <header class="repository-header">
     <h1><a href="/{{ owner }}">{{ owner }}</a>/<a href="/{{ owner }}/{{ repository }}">{{ repository }}</a></h1>
+{% let nav_section = "issues" %}
 {% include "repository-nav.html" %}
   </header>
 
   <header class="page-section-header">
     <h2>Issues</h2>
-    <a href="/{{ owner }}/{{ repository }}/issues/rss.xml">Issue RSS</a>
+    <a class="icon-link" href="/{{ owner }}/{{ repository }}/issues/rss.xml" aria-label="Issue RSS feed" title="Issue RSS feed">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="19" r="1"></circle><path d="M4 11a9 9 0 0 1 9 9M4 5a15 15 0 0 1 15 15"></path></svg>
+    </a>
   </header>
   <section class="collection-panel" aria-label="Issues">
     <form class="filter-form" method="get" action="/{{ owner }}/{{ repository }}/issues">

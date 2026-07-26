@@ -81,6 +81,21 @@ fn enforces_the_repository_role_matrix() {
     for operation in [RepositoryOperation::Write, RepositoryOperation::Maintain] {
         assert_denied(&policy, Some("reader"), operation);
     }
+    assert!(
+        store
+            .repository_can_maintain("owner", "project", "owner")
+            .expect("read owner permission")
+    );
+    assert!(
+        store
+            .repository_can_maintain("owner", "project", "maintainer")
+            .expect("read maintainer permission")
+    );
+    assert!(
+        !store
+            .repository_can_maintain("owner", "project", "writer")
+            .expect("read writer permission")
+    );
     for actor in [None, Some("stranger"), Some("suspended"), Some("missing")] {
         for operation in operations() {
             assert_denied(&policy, actor, operation);

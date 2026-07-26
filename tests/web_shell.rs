@@ -19,6 +19,7 @@ async fn serves_the_semantic_shell_without_javascript() {
     assert_eq!(home.header("content-type"), "text/html; charset=utf-8");
     assert_eq!(home.header("cache-control"), "no-store");
     assert!(home.body.contains("<header class=\"site-header\">"));
+    assert!(home.body.contains("<hr class=\"site-header-rule\">"));
     assert!(home.body.contains("<nav aria-label=\"Primary\">"));
     assert!(home.body.contains("<main id=\"main\">"));
     assert!(home.body.contains("<footer>"));
@@ -27,6 +28,18 @@ async fn serves_the_semantic_shell_without_javascript() {
     assert!(!home.body.to_ascii_lowercase().contains("<script"));
     assert_security_policy(&home);
     assert_snapshot(&home, include_str!("snapshots/web/home.html"));
+
+    let account = request(server.address(), "GET", "/account", &[]).await;
+    assert_eq!(account.status, 200);
+    assert!(
+        account
+            .body
+            .contains("<h1 id=\"account-heading\">Account</h1>")
+    );
+    assert!(account.body.contains("href=\"/login\""));
+    assert!(account.body.contains("href=\"/signup\""));
+    assert!(account.body.contains("href=\"/recover\""));
+    assert_security_policy(&account);
 
     let request_id = home.header("x-request-id");
     assert_request_id(request_id);
@@ -53,8 +66,12 @@ async fn serves_the_semantic_shell_without_javascript() {
     assert_eq!(css.header("content-type"), "text/css; charset=utf-8");
     assert_eq!(css.header("cache-control"), "no-cache");
     assert_eq!(css.body, include_str!("../assets/style.css"));
+    assert!(css.body.contains("font-family: \"Space Mono\""));
+    assert!(css.body.contains(".background-icon"));
     assert!(css.body.contains("@media (max-width: 44rem)"));
     assert!(css.body.contains(".two-column"));
+    assert!(css.body.contains(".home-grid > section"));
+    assert!(css.body.contains(".repository-navigation"));
     assert_security_policy(&css);
 
     let css_head = request(server.address(), "HEAD", "/assets/style.css", &[]).await;
@@ -64,6 +81,34 @@ async fn serves_the_semantic_shell_without_javascript() {
         css_head.header("content-length"),
         css.body.len().to_string()
     );
+
+    let regular_font = request(
+        server.address(),
+        "HEAD",
+        "/assets/SpaceMono-Regular.ttf",
+        &[],
+    )
+    .await;
+    assert_eq!(regular_font.status, 200);
+    assert_eq!(regular_font.header("content-type"), "font/ttf");
+    assert_eq!(
+        regular_font.header("content-length"),
+        include_bytes!("../assets/SpaceMono-Regular.ttf")
+            .len()
+            .to_string()
+    );
+    assert_security_policy(&regular_font);
+
+    let bold_font = request(server.address(), "HEAD", "/assets/SpaceMono-Bold.ttf", &[]).await;
+    assert_eq!(bold_font.status, 200);
+    assert_eq!(bold_font.header("content-type"), "font/ttf");
+    assert_eq!(
+        bold_font.header("content-length"),
+        include_bytes!("../assets/SpaceMono-Bold.ttf")
+            .len()
+            .to_string()
+    );
+    assert_security_policy(&bold_font);
 
     let signup = request(server.address(), "GET", "/signup", &[]).await;
     assert_eq!(signup.status, 200);
@@ -287,7 +332,7 @@ async fn request_with_declared_length(
 fn assert_security_policy(response: &HttpResponse) {
     assert_eq!(
         response.header("content-security-policy"),
-        "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+        "default-src 'none'; style-src 'self'; font-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
     );
     assert_eq!(response.header("x-content-type-options"), "nosniff");
     assert_eq!(response.header("x-frame-options"), "DENY");

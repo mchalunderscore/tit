@@ -12,7 +12,7 @@ use crate::watch::WatchError;
 
 use super::{
     CSRF_COOKIE, RequestActor, RequestId, WebState, authenticate_mutation, cookie,
-    parse_named_form, render, render_error,
+    parse_named_form, render, render_error, repository_can_manage,
 };
 
 pub(super) fn routes() -> Router<WebState> {
@@ -37,6 +37,13 @@ async fn watch_page(
     let owner = path.owner;
     let repository = path.repository;
     let authenticated = actor.0.is_some();
+    let can_manage = repository_can_manage(
+        state.clone(),
+        actor.0.clone(),
+        owner.clone(),
+        repository.clone(),
+    )
+    .await;
     let result = watch_job(state, move || {
         service.get(&owner, &repository, actor.0.as_deref())
     })
@@ -50,6 +57,7 @@ async fn watch_page(
                 &WatchTemplate {
                     request_id: &request_id.0,
                     signed_in: authenticated,
+                    can_manage,
                     owner: &record.owner,
                     repository: &record.slug,
                     csrf: &csrf,
@@ -168,6 +176,7 @@ struct RepositoryPath {
 struct WatchTemplate<'a> {
     request_id: &'a str,
     signed_in: bool,
+    can_manage: bool,
     owner: &'a str,
     repository: &'a str,
     csrf: &'a str,

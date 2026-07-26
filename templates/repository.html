@@ -3,20 +3,40 @@
 {% block content %}
   <header class="repository-header">
     <h1><a href="/{{ owner }}">{{ owner }}</a>/<a href="/{{ owner }}/{{ repository }}">{{ repository }}</a></h1>
+{% let nav_section = *page_kind %}
 {% include "repository-nav.html" %}
   </header>
 
 {% if has_head && page_kind != "summary" %}
-  <p><a href="/{{ owner }}/{{ repository }}/tree/{{ commit_id }}">Browse tree</a> · <a href="/{{ owner }}/{{ repository }}/commit/{{ commit_id }}">Show commit</a> · <a href="/{{ owner }}/{{ repository }}/archive/{{ commit_id }}.tar">Download archive</a></p>
+  <nav class="repository-toolbar" aria-label="Repository revision">
+    <div class="repository-context">
+      <a href="/{{ owner }}/{{ repository }}/commit/{{ commit_id }}" aria-label="Commit {{ commit_id }}"><code title="{{ commit_id }}">{{ commit_id|short_id }}</code></a>
+    </div>
+    <div class="repository-actions">
+{% if page_kind != "tree" %}
+      <a class="icon-link" href="/{{ owner }}/{{ repository }}/tree/{{ commit_id }}" aria-label="Browse tree" title="Browse tree">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5h7l2 2h9v10H3z"></path></svg>
+      </a>
+{% endif %}
+      <a class="icon-link" href="/{{ owner }}/{{ repository }}/archive/{{ commit_id }}.tar" aria-label="Download archive" title="Download archive">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M4 20h16"></path></svg>
+      </a>
+    </div>
+  </nav>
 {% endif %}
 
 {% if page_kind == "summary" %}
 {% if has_head %}
   <nav class="repository-toolbar" aria-label="Repository files">
-    <strong>{{ default_branch }}</strong>
-    <a href="/{{ owner }}/{{ repository }}/tree/{{ commit_id }}">Browse files</a>
-    <a href="/{{ owner }}/{{ repository }}/commit/{{ commit_id }}"><code title="{{ commit_id }}">{{ commit_id|short_id }}</code></a>
-    <a href="/{{ owner }}/{{ repository }}/archive/{{ commit_id }}.tar">Download archive</a>
+    <div class="repository-context">
+      <strong>{{ default_branch }}</strong>
+      <a href="/{{ owner }}/{{ repository }}/commit/{{ commit_id }}" aria-label="Commit {{ commit_id }}"><code title="{{ commit_id }}">{{ commit_id|short_id }}</code></a>
+    </div>
+    <div class="repository-actions">
+      <a class="icon-link" href="/{{ owner }}/{{ repository }}/archive/{{ commit_id }}.tar" aria-label="Download archive" title="Download archive">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M4 20h16"></path></svg>
+      </a>
+    </div>
   </nav>
 {% endif %}
   <div class="repository-summary-layout">
@@ -28,7 +48,7 @@
       <tbody>
 {% for item in entries %}
         <tr>
-          <th scope="row"><a href="/{{ owner }}/{{ repository }}/{{ item.href }}">{{ item.name }}</a></th>
+          <th scope="row"><a href="/{{ owner }}/{{ repository }}/{{ item.href }}">{{ item.name }}{% if item.kind == "tree" %}/{% endif %}</a></th>
           <td>{{ item.kind }}</td>
           <td><code title="{{ item.id }}">{{ item.id|short_id }}</code></td>
         </tr>
@@ -41,6 +61,16 @@
   </section>
 {% else %}
   <p>This repository has no commits.</p>
+{% endif %}
+{% if has_readme %}
+  <section class="repository-panel repository-readme" aria-labelledby="readme-heading">
+    <h2 id="readme-heading">{{ readme_path }}</h2>
+{% if readme_binary %}
+    <p>Binary README content cannot be shown.</p>
+{% else %}
+    <div class="markdown">{{ readme_html|safe }}</div>
+{% endif %}
+  </section>
 {% endif %}
   </div>
   <aside class="repository-sidebar" aria-label="Repository information">
@@ -90,16 +120,6 @@
   </section>
   </aside>
   </div>
-{% if has_readme %}
-  <section class="repository-panel repository-readme" aria-labelledby="readme-heading">
-    <h2 id="readme-heading">{{ readme_path }}</h2>
-{% if readme_binary %}
-    <p>Binary README content cannot be shown.</p>
-{% else %}
-    <div class="markdown">{{ readme_html|safe }}</div>
-{% endif %}
-  </section>
-{% endif %}
 {% endif %}
 
 {% if page_kind == "commits" %}
@@ -149,7 +169,7 @@
 {% for item in entries %}
       <tr>
         <td><code>{{ item.mode }}</code></td><td>{{ item.kind }}</td>
-        <th scope="row"><a href="/{{ owner }}/{{ repository }}/{{ item.href }}">{{ item.name }}</a></th>
+        <th scope="row"><a href="/{{ owner }}/{{ repository }}/{{ item.href }}">{{ item.name }}{% if item.kind == "tree" %}/{% endif %}</a></th>
         <td><code title="{{ item.id }}">{{ item.id|short_id }}</code></td>
       </tr>
 {% endfor %}

@@ -66,6 +66,7 @@ run_binary()
 for required in \
     "$binary" \
     "$package/LICENSE" \
+    "$package/LICENSE-SpaceMono" \
     "$package/README.md" \
     "$package/etc/tit/config.toml" \
     "$package/share/doc/tit/examples/Caddyfile" \

@@ -340,10 +340,9 @@ impl RepositoryReadService {
             return Err(ReadError::Limit("tree entries"));
         }
         let truncated = tree.entries.len() > maximum;
-        let entries = tree
+        let mut entries = tree
             .entries
             .into_iter()
-            .take(maximum)
             .map(|entry| {
                 budget.check()?;
                 Ok(TreeEntryInfo {
@@ -354,6 +353,12 @@ impl RepositoryReadService {
                 })
             })
             .collect::<Result<Vec<_>, ReadError>>()?;
+        entries.sort_by(|left, right| {
+            (!matches!(left.kind, EntryKind::Tree))
+                .cmp(&(!matches!(right.kind, EntryKind::Tree)))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        entries.truncate(maximum);
         Ok((entries, truncated))
     }
 

@@ -66,6 +66,7 @@ async fn settings(
                 &RepositorySettingsTemplate {
                     request_id: &request_id.0,
                     signed_in: true,
+                    can_manage: true,
                     owner: &settings.repository.owner,
                     repository: &settings.repository.slug,
                     description: &settings.description,
@@ -410,6 +411,7 @@ struct RepositoryPath {
 struct RepositorySettingsTemplate<'a> {
     request_id: &'a str,
     signed_in: bool,
+    can_manage: bool,
     owner: &'a str,
     repository: &'a str,
     description: &'a str,

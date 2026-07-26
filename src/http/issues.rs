@@ -14,7 +14,7 @@ use crate::store::{IssueDetail, StoreError};
 use super::filters;
 use super::{
     CSRF_COOKIE, RequestActor, RequestId, WebState, authenticate_mutation, cookie,
-    parse_named_form, render, render_error,
+    parse_named_form, render, render_error, repository_can_manage,
 };
 
 const MAX_ISSUE_REQUEST_BYTES: usize = 300 * 1024;
@@ -60,6 +60,13 @@ async fn issue_list(
     let owner = path.owner.clone();
     let repository = path.repository.clone();
     let authenticated = actor.0.is_some();
+    let can_manage = repository_can_manage(
+        state.clone(),
+        actor.0.clone(),
+        owner.clone(),
+        repository.clone(),
+    )
+    .await;
     let state_filter = query.state.unwrap_or_else(|| "open".to_owned());
     let page_number = query.page.unwrap_or(1);
     if page_number == 0 {
@@ -84,6 +91,7 @@ async fn issue_list(
                 &IssueListTemplate {
                     request_id: &request_id.0,
                     signed_in: authenticated,
+                    can_manage,
                     owner: &record.owner,
                     repository: &record.slug,
                     issues: page
@@ -133,6 +141,13 @@ async fn issue_detail(
     let owner = path.owner.clone();
     let repository = path.repository.clone();
     let number = path.number;
+    let can_manage = repository_can_manage(
+        state.clone(),
+        actor.0.clone(),
+        owner.clone(),
+        repository.clone(),
+    )
+    .await;
     let comments_page = query.comments_page.unwrap_or(1);
     let timeline_page = query.timeline_page.unwrap_or(1);
     if comments_page == 0 || timeline_page == 0 {
@@ -150,7 +165,7 @@ async fn issue_detail(
     })
     .await;
     match result {
-        Ok(detail) => render_issue(&request_id.0, &headers, &detail),
+        Ok(detail) => render_issue(&request_id.0, &headers, &detail, can_manage),
         Err(error) => issue_read_error(error, &request_id.0),
     }
 }
@@ -309,13 +324,19 @@ async fn issue_job<T: Send + 'static>(
     .map_err(|_| IssueError::Store(StoreError::Integrity("issue worker failed".to_owned())))?
 }
 
-fn render_issue(request_id: &str, headers: &HeaderMap, detail: &IssueDetail) -> Response {
+fn render_issue(
+    request_id: &str,
+    headers: &HeaderMap,
+    detail: &IssueDetail,
+    can_manage: bool,
+) -> Response {
     let csrf = cookie(headers, CSRF_COOKIE).unwrap_or_default();
     render(
         StatusCode::OK,
         &IssueTemplate {
             request_id,
             signed_in: !csrf.is_empty(),
+            can_manage,
             owner: &detail.repository.owner,
             repository: &detail.repository.slug,
             number: detail.issue.number,
@@ -479,6 +500,7 @@ struct ActivityQuery {
 struct IssueListTemplate<'a> {
     request_id: &'a str,
     signed_in: bool,
+    can_manage: bool,
     owner: &'a str,
     repository: &'a str,
     issues: Vec<IssueListItem<'a>>,
@@ -507,6 +529,7 @@ struct IssueListItem<'a> {
 struct IssueTemplate<'a> {
     request_id: &'a str,
     signed_in: bool,
+    can_manage: bool,
     owner: &'a str,
     repository: &'a str,
     number: i64,

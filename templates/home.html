@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{% if signed_in %}{{ username }}{% else %}Repositories{% endif %} · tit{% endblock %}
 {% block content %}
-  <div class="two-column">
+  <div class="two-column home-grid">
 {% if signed_in %}
   <section>
     <h1>{{ username }}</h1>
@@ -39,15 +39,10 @@
   <section class="home-intro">
     <h1>A small Git CDE</h1>
     <p>tit provides self-hosted Git repositories, issues, pull requests, and code review in one server.</p>
-    <nav class="home-actions" aria-label="Get started">
-      <a href="/signup">Create account</a>
-      <a href="/login">Log in</a>
-      <a href="/search">Search repositories</a>
-    </nav>
   </section>
 {% endif %}
   <section>
-    <h2>Recently updated public repositories</h2>
+    <h2>Recently updated</h2>
 {% if recent_repositories.is_empty() %}
 {% if signed_in %}
     <p>No public repositories are available.</p>

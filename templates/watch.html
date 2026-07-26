@@ -3,6 +3,7 @@
 {% block content %}
   <header class="repository-header">
     <h1><a href="/{{ owner }}">{{ owner }}</a>/<a href="/{{ owner }}/{{ repository }}">{{ repository }}</a></h1>
+{% let nav_section = "watch" %}
 {% include "repository-nav.html" %}
   </header>
 

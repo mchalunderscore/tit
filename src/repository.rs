@@ -71,6 +71,20 @@ impl RepositoryService {
             .map_err(Into::into)
     }
 
+    pub(crate) fn can_manage(
+        &self,
+        owner: &str,
+        repository: &str,
+        actor: &str,
+    ) -> Result<bool, RepositoryServiceError> {
+        validate_username(owner)?;
+        validate_slug(repository)?;
+        validate_username(actor)?;
+        Store::open(&self.database)?
+            .repository_can_maintain(owner, repository, actor)
+            .map_err(Into::into)
+    }
+
     pub(crate) fn settings(
         &self,
         owner: &str,

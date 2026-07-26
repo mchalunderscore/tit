@@ -4,38 +4,66 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Repositories · tit</title>
-  <link rel="stylesheet" href="/assets/style.css?v=2">
+  <link rel="stylesheet" href="/assets/style.css?v=10">
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
+  <div class="background-icon" aria-hidden="true">
+    <svg viewBox="0 0 24 24">
+      <circle cx="6" cy="5" r="2"/>
+      <circle cx="6" cy="19" r="2"/>
+      <circle cx="18" cy="12" r="2"/>
+      <path d="M6 7v10"/>
+      <path d="M8 7c0 3 2 5 8 5"/>
+    </svg>
+  </div>
   <header class="site-header">
-    <a class="brand" href="/" aria-label="tit home">tit</a>
+    <a class="brand" href="/" aria-label="tit home">
+      <svg class="brand-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="6" cy="5" r="2"/>
+        <circle cx="6" cy="19" r="2"/>
+        <circle cx="18" cy="12" r="2"/>
+        <path d="M6 7v10"/>
+        <path d="M8 7c0 3 2 5 8 5"/>
+      </svg>
+      tit
+    </a>
     <nav aria-label="Primary">
-      <a href="/">Home</a>
-      <a href="/search">Search</a>
+      <a class="icon-link" href="/" aria-label="Home" title="Home">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3 11.5 12 4l9 7.5"/>
+          <path d="M5.5 10.5V20h13v-9.5"/>
+          <path d="M9.5 20v-6h5v6"/>
+        </svg>
+      </a>
+      <a class="icon-link" href="/search" aria-label="Search" title="Search">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="11" cy="11" r="7"/>
+          <path d="m20 20-4-4"/>
+        </svg>
+      </a>
 
-      <a href="/signup">Create account</a>
-      <a href="/recover">Recover account</a>
-      <a href="/login">Log in</a>
+      <a class="icon-link" href="/account" aria-label="Account" title="Account">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="8" r="4"/>
+          <path d="M4 21a8 8 0 0 1 16 0"/>
+        </svg>
+      </a>
 
     </nav>
   </header>
+  <hr class="site-header-rule">
   <main id="main">
 
-  <div class="two-column">
+  <div class="two-column home-grid">
 
   <section class="home-intro">
     <h1>A small Git CDE</h1>
     <p>tit provides self-hosted Git repositories, issues, pull requests, and code review in one server.</p>
-    <nav class="home-actions" aria-label="Get started">
-      <a href="/signup">Create account</a>
-      <a href="/login">Log in</a>
-      <a href="/search">Search repositories</a>
-    </nav>
   </section>
 
   <section>
-    <h2>Recently updated public repositories</h2>
+    <h2>Recently updated</h2>
 
 
     <p>No repositories are available.</p>
@@ -65,6 +93,7 @@
 
   </main>
   <footer>
+    <small>tit · open source · MIT licensed</small>
     <small>Request <code><request-id></code></small>
   </footer>
 </body>

@@ -146,6 +146,38 @@ impl PublicWeb {
         .map_err(|_| RouteError::Internal)?
     }
 
+    async fn read_page<F>(
+        &self,
+        actor: Option<String>,
+        owner: String,
+        repository: String,
+        operation: F,
+    ) -> Result<RepositoryPage, RouteError>
+    where
+        F: FnOnce(RepositoryRecord, RepositoryReadService) -> Result<RepositoryPage, RouteError>
+            + Send
+            + 'static,
+    {
+        let policy = self.policy.clone();
+        let permission_actor = actor.clone();
+        let permission_owner = owner.clone();
+        let permission_repository = repository.clone();
+        self.read(actor, owner, repository, move |record, service| {
+            let can_manage = policy
+                .authorize(
+                    permission_actor.as_deref(),
+                    &permission_owner,
+                    &permission_repository,
+                    RepositoryOperation::Maintain,
+                )
+                .is_ok();
+            let mut page = operation(record, service)?;
+            page.can_manage = can_manage;
+            Ok(page)
+        })
+        .await
+    }
+
     async fn event_page(
         &self,
         actor: Option<String>,
@@ -426,7 +458,7 @@ async fn summary(
     let clone_urls = web.clone_urls(&path.owner, &path.repository);
     let database = web.database.clone();
     let result = web
-        .read(
+        .read_page(
             actor.0,
             path.owner,
             path.repository,
@@ -517,7 +549,7 @@ async fn refs(
     };
     let signed_in = actor.0.is_some();
     let result = web
-        .read(
+        .read_page(
             actor.0,
             path.owner,
             path.repository,
@@ -548,7 +580,7 @@ async fn commits(
         return route_error(RouteError::InvalidRequest, &request_id.0);
     }
     let result = web
-        .read(
+        .read_page(
             actor.0,
             path.owner,
             path.repository,
@@ -590,7 +622,7 @@ async fn search(
     let signed_in = actor.0.is_some();
     let database = web.database.clone();
     let result = web
-        .read(
+        .read_page(
             actor.0,
             path.owner,
             path.repository,
@@ -639,7 +671,7 @@ async fn commit(
     };
     let signed_in = actor.0.is_some();
     let result = web
-        .read(
+        .read_page(
             actor.0,
             path.owner,
             path.repository,
@@ -715,7 +747,7 @@ async fn diff(
     };
     let signed_in = actor.0.is_some();
     let result = web
-        .read(
+        .read_page(
             actor.0,
             path.owner,
             path.repository,
@@ -769,7 +801,7 @@ async fn tree_response(
     };
     let signed_in = actor.0.is_some();
     let result = web
-        .read(
+        .read_page(
             actor.0,
             path.owner,
             path.repository,
@@ -803,7 +835,7 @@ async fn blob(
     };
     let signed_in = actor.0.is_some();
     let result = web
-        .read(
+        .read_page(
             actor.0,
             path.owner,
             path.repository,
@@ -886,7 +918,7 @@ async fn blame(
     };
     let signed_in = actor.0.is_some();
     let result = web
-        .read(
+        .read_page(
             actor.0,
             path.owner,
             path.repository,
@@ -1409,6 +1441,7 @@ struct ArchivePath {
 struct RepositoryPage {
     request_id: String,
     signed_in: bool,
+    can_manage: bool,
     owner: String,
     repository: String,
     created_at: i64,
@@ -1470,6 +1503,7 @@ impl RepositoryPage {
         Self {
             request_id: String::new(),
             signed_in: false,
+            can_manage: false,
             owner: record.owner,
             repository: record.slug,
             created_at: record.created_at,

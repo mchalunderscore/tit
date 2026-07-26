@@ -1605,6 +1605,15 @@ impl Store {
         })
     }
 
+    pub(crate) fn repository_can_maintain(
+        &self,
+        owner: &str,
+        slug: &str,
+        actor: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(repository_issue_access(&self.connection, owner, slug, Some(actor))?.can_maintain())
+    }
+
     pub(crate) fn repository_default_branch(
         &self,
         owner: &str,

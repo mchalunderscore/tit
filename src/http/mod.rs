@@ -45,7 +45,9 @@ use crate::watch::WatchService;
 use self::public::PublicWeb;
 
 const STYLE: &str = include_str!("../../assets/style.css");
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+const SPACE_MONO_REGULAR: &[u8] = include_bytes!("../../assets/SpaceMono-Regular.ttf");
+const SPACE_MONO_BOLD: &[u8] = include_bytes!("../../assets/SpaceMono-Bold.ttf");
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'self'; font-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 const MAX_BLOCKING_WEB_JOBS: usize = 8;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONCURRENCY_WAIT: Duration = Duration::from_secs(1);
@@ -445,6 +447,8 @@ fn router_with_state(state: WebState) -> Router {
                 .layer(DefaultBodyLimit::max(1024)),
         )
         .route("/assets/style.css", get(style))
+        .route("/assets/SpaceMono-Regular.ttf", get(space_mono_regular))
+        .route("/assets/SpaceMono-Bold.ttf", get(space_mono_bold))
         .merge(feeds::routes())
         .merge(repository_routes)
         .route("/{username}", get(public_profile))
@@ -1220,7 +1224,13 @@ async fn account_page(
     headers: HeaderMap,
 ) -> Response {
     let Some(session_token) = cookie(&headers, SESSION_COOKIE) else {
-        return login_redirect(false);
+        return render(
+            StatusCode::OK,
+            &AccountEntryTemplate {
+                request_id: &request_id.0,
+                signed_in: false,
+            },
+        );
     };
     let Some(csrf) = cookie(&headers, CSRF_COOKIE) else {
         return login_redirect(true);
@@ -1813,6 +1823,22 @@ async fn repository_job<T: Send + 'static>(
     })?
 }
 
+async fn repository_can_manage(
+    state: WebState,
+    actor: Option<String>,
+    owner: String,
+    repository: String,
+) -> bool {
+    let Some(actor) = actor else {
+        return false;
+    };
+    repository_job(state, move |repositories| {
+        repositories.can_manage(&owner, &repository, &actor)
+    })
+    .await
+    .unwrap_or(false)
+}
+
 async fn authenticate_mutation(
     state: WebState,
     headers: &HeaderMap,
@@ -2112,6 +2138,23 @@ async fn style() -> Response {
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(STYLE))
         .expect("the embedded CSS response is valid")
+}
+
+async fn space_mono_regular() -> Response {
+    font_asset(SPACE_MONO_REGULAR)
+}
+
+async fn space_mono_bold() -> Response {
+    font_asset(SPACE_MONO_BOLD)
+}
+
+fn font_asset(bytes: &'static [u8]) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "font/ttf")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(Bytes::from_static(bytes)))
+        .expect("the embedded font response is valid")
 }
 
 async fn not_found(
@@ -2433,6 +2476,13 @@ struct AccountTemplate<'a> {
     contact_email: &'a str,
     keys: Vec<AccountKeyView<'a>>,
     active_key_count: usize,
+    signed_in: bool,
+}
+
+#[derive(Template)]
+#[template(path = "account-entry.html")]
+struct AccountEntryTemplate<'a> {
+    request_id: &'a str,
     signed_in: bool,
 }
 

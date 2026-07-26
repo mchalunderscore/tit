@@ -3,240 +3,318 @@
 {% block content %}
   <header class="repository-header">
     <h1><a href="/{{ owner }}">{{ owner }}</a>/<a href="/{{ owner }}/{{ repository }}">{{ repository }}</a></h1>
+{% let nav_section = "pulls" %}
 {% include "repository-nav.html" %}
   </header>
 
-  <article>
-    <h2>#{{ pull_request.number }} {{ pull_request.title }}</h2>
-    <p>{{ pull_request.state }} · opened by {{ pull_request.author }} at <time datetime="{{ pull_request.created_at }}">{{ pull_request.created_at|human_time }}</time> · updated <time datetime="{{ pull_request.updated_at }}">{{ pull_request.updated_at|human_time }}</time></p>
-    <p>Base: <code>{{ pull_request.base_ref }}</code> at <code title="{{ pull_request.base_object_id }}">{{ pull_request.base_object_id|short_id }}</code></p>
-    <p>Head: <code>{{ pull_request.head_ref }}</code> at <code title="{{ pull_request.head_object_id }}">{{ pull_request.head_object_id|short_id }}</code></p>
-    <p>Fetch: <code>git fetch origin refs/pull/{{ pull_request.number }}/head</code></p>
-    <div class="markdown">{{ body_html|safe }}</div>
+  <article class="pull-request-page">
+    <header class="pull-request-hero">
+      <div class="pull-request-title">
+        <div>
+          <p class="pull-request-kicker">Pull request #{{ pull_request.number }}</p>
+          <h2>{{ pull_request.title }}</h2>
+        </div>
+        <span class="pull-request-state">{{ pull_request.state }}</span>
+      </div>
+      <p class="pull-request-byline">Opened by <strong>{{ pull_request.author }}</strong> <time datetime="{{ pull_request.created_at }}">{{ pull_request.created_at|human_time }}</time> · updated <time datetime="{{ pull_request.updated_at }}">{{ pull_request.updated_at|human_time }}</time></p>
+      <div class="markdown pull-request-description">{{ body_html|safe }}</div>
+
+      <div class="pull-request-branches" aria-label="Pull request branches">
+        <div>
+          <span>From</span>
+          <code>{{ pull_request.head_ref }}</code>
+          <small title="{{ pull_request.head_object_id }}">{{ pull_request.head_object_id|short_id }}</small>
+        </div>
+        <span class="pull-request-direction" aria-hidden="true">→</span>
+        <div>
+          <span>Into</span>
+          <code>{{ pull_request.base_ref }}</code>
+          <small title="{{ pull_request.base_object_id }}">{{ pull_request.base_object_id|short_id }}</small>
+        </div>
+      </div>
+
+{% if can_edit || can_change_state %}
+      <div class="pull-request-actions">
 {% if can_edit %}
-    <details>
-      <summary>Edit pull request</summary>
-      <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/edit">
-        <input type="hidden" name="csrf" value="{{ csrf }}">
-        <div class="field">
-          <label for="pull-request-title">Title</label>
-          <input id="pull-request-title" name="title" value="{{ pull_request.title }}" maxlength="200" required>
-        </div>
-        <div class="field">
-          <label for="pull-request-body">Description (Markdown)</label>
-          <textarea id="pull-request-body" name="body" maxlength="262144" rows="10">{{ pull_request.body }}</textarea>
-        </div>
-        <button type="submit">Save pull request</button>
-      </form>
-    </details>
+        <details>
+          <summary>Edit details</summary>
+          <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/edit">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <div class="field">
+              <label for="pull-request-title">Title</label>
+              <input id="pull-request-title" name="title" value="{{ pull_request.title }}" maxlength="200" required>
+            </div>
+            <div class="field">
+              <label for="pull-request-body">Description (Markdown)</label>
+              <textarea id="pull-request-body" name="body" maxlength="262144" rows="10">{{ pull_request.body }}</textarea>
+            </div>
+            <button type="submit">Save details</button>
+          </form>
+        </details>
 {% endif %}
 {% if can_change_state %}
-    <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/state">
-      <input type="hidden" name="csrf" value="{{ csrf }}">
+        <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/state">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
 {% if is_open %}
-      <button type="submit" name="state" value="closed">Close pull request</button>
+          <button class="danger-action" type="submit" name="state" value="closed">Close pull request</button>
 {% else %}
-      <button type="submit" name="state" value="open">Reopen pull request</button>
+          <button type="submit" name="state" value="open">Reopen pull request</button>
 {% endif %}
-    </form>
+        </form>
 {% endif %}
-  </article>
+      </div>
+{% endif %}
+    </header>
 
-  <section aria-labelledby="revisions-heading">
-    <h2 id="revisions-heading">Revisions</h2>
-    <ol>
-{% for revision in revisions %}
-      <li value="{{ revision.number }}">
-        {{ revision.author }} recorded <code title="{{ revision.head_object_id }}">{{ revision.head_object_id|short_id }}</code> against <code title="{{ revision.base_object_id }}">{{ revision.base_object_id|short_id }}</code> at <time datetime="{{ revision.created_at }}">{{ revision.created_at|human_time }}</time>.
-        <a href="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/revisions/{{ revision.number }}.patch">Download patch</a>
-{% if revision.number == selected_revision %}
-        <strong>Selected</strong>
-{% else %}
-        <a href="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}?revision={{ revision.number }}">Compare this revision</a>
-{% endif %}
-      </li>
-{% endfor %}
-    </ol>
-  </section>
+    <section class="pull-request-section" aria-labelledby="changes-heading">
+      <div class="pull-request-section-heading">
+        <div>
+          <p class="pull-request-kicker">Revision {{ selected_revision }}</p>
+          <h2 id="changes-heading">Changes</h2>
+        </div>
+        <span class="pull-request-mergeability">{{ comparison.mergeability }}</span>
+      </div>
 
-  <section aria-labelledby="reviews-heading">
-    <h2 id="reviews-heading">Reviews</h2>
-{% if reviews.is_empty() %}
-    <p>This pull request has no review activity.</p>
-{% else %}
-{% for review in reviews %}
-    <article class="comment-card" id="review-{{ review.id }}">
-      <h3>{{ review.author }}: {{ review.kind|event_name }} at <time datetime="{{ review.created_at }}">{{ review.created_at|human_time }}</time></h3>
-      <p>Revision {{ review.revision }}
-{% if review.kind == "line-comment" %}
-        · <code title="{{ review.commit_object_id }}">{{ review.commit_object_id|short_id }}</code> · <code>{{ review.path }}</code> · {{ review.side }} line {{ review.line }}
-{% if review.outdated %}
-        · <strong>Outdated</strong>
-{% endif %}
-{% endif %}
-      </p>
-{% if review.has_body %}
-      <div class="markdown">{{ review.body_html|safe }}</div>
-{% endif %}
-    </article>
-{% endfor %}
-{% endif %}
-{% if reviews_has_previous || reviews_has_next %}
-    <nav aria-label="Review pages">
-{% if reviews_has_previous %}
-      <a href="?revision={{ selected_revision }}&amp;reviews_page={{ reviews_previous_page }}&amp;timeline_page={{ timeline_page }}">Newer reviews</a>
-{% endif %}
-{% if reviews_has_next %}
-      <a href="?revision={{ selected_revision }}&amp;reviews_page={{ reviews_next_page }}&amp;timeline_page={{ timeline_page }}">Older reviews</a>
-{% endif %}
-    </nav>
-{% endif %}
-  </section>
+      <dl class="pull-request-change-summary">
+        <div>
+          <dt>Commits</dt>
+          <dd>{{ comparison.commits.len() }}</dd>
+        </div>
+        <div>
+          <dt>Files changed</dt>
+          <dd>{{ comparison.files.len() }}</dd>
+        </div>
+        <div>
+          <dt>Merge base</dt>
+          <dd><code title="{{ comparison.merge_base }}">{{ comparison.merge_base|short_id }}</code></dd>
+        </div>
+      </dl>
 
-  <section aria-labelledby="timeline-heading">
-    <h2 id="timeline-heading">Timeline</h2>
-    <ol>
-{% for event in timeline %}
-      <li value="{{ event.sequence }}">{{ event.actor }} {{ event.kind|event_name }} at <time datetime="{{ event.created_at }}">{{ event.created_at|human_time }}</time></li>
-{% endfor %}
-    </ol>
-{% if timeline_has_previous || timeline_has_next %}
-    <nav aria-label="Timeline pages">
-{% if timeline_has_previous %}
-      <a href="?revision={{ selected_revision }}&amp;reviews_page={{ reviews_page }}&amp;timeline_page={{ timeline_previous_page }}">Newer events</a>
-{% endif %}
-{% if timeline_has_next %}
-      <a href="?revision={{ selected_revision }}&amp;reviews_page={{ reviews_page }}&amp;timeline_page={{ timeline_next_page }}">Older events</a>
-{% endif %}
-    </nav>
-{% endif %}
-  </section>
-
-  <section aria-labelledby="comparison-heading">
-    <h2 id="comparison-heading">Comparison for revision {{ selected_revision }}</h2>
-    <p>Merge base: <code title="{{ comparison.merge_base }}">{{ comparison.merge_base|short_id }}</code></p>
-    <p>Mergeability: {{ comparison.mergeability }}</p>
-
-    <h3>Commits</h3>
+      <div class="pull-request-change-index">
+        <div>
+          <h3>Commits</h3>
 {% if comparison.commits.is_empty() %}
-    <p>This revision has no commits that are not in the base.</p>
+          <p>This revision has no commits that are not in the base.</p>
 {% else %}
-    <ol>
+          <ol>
 {% for commit in comparison.commits %}
-      <li><code title="{{ commit.id }}">{{ commit.id|short_id }}</code> <span class="preserve-whitespace">{{ commit.message }}</span></li>
+            <li><code title="{{ commit.id }}">{{ commit.id|short_id }}</code> <span class="preserve-whitespace">{{ commit.message }}</span></li>
 {% endfor %}
-    </ol>
+          </ol>
 {% endif %}
-
-    <h3>Changed paths</h3>
+        </div>
+        <div>
+          <h3>Files</h3>
 {% if comparison.changed_paths.is_empty() %}
-    <p>This revision does not change a path.</p>
+          <p>This revision does not change a path.</p>
 {% else %}
-    <ul>
+          <ul>
 {% for path in comparison.changed_paths %}
-      <li><code>{{ path }}</code></li>
+            <li><code>{{ path }}</code></li>
 {% endfor %}
-    </ul>
+          </ul>
 {% endif %}
+        </div>
+      </div>
 
-    <h3>Diff</h3>
+      <div class="pull-request-diff">
 {% for file in comparison.files %}
-    <article>
-      <h4><code>{{ file.path }}</code></h4>
+        <article class="pull-request-file" id="diff-{{ file.path_hex }}">
+          <h3><code>{{ file.path }}</code></h3>
 {% if file.binary %}
-      <p>This file has binary content.</p>
+          <p>This file has binary content.</p>
 {% else %}
-      <pre>{{ file.hunks }}</pre>
+          <pre>{{ file.hunks }}</pre>
 {% if can_review %}
-      <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/reviews">
-        <input type="hidden" name="csrf" value="{{ csrf }}">
-        <input type="hidden" name="revision" value="{{ selected_revision }}">
-        <input type="hidden" name="kind" value="line-comment">
-        <input type="hidden" name="path-hex" value="{{ file.path_hex }}">
-        <div class="field">
-          <label for="review-side-{{ file.path_hex }}">Side</label>
-          <select id="review-side-{{ file.path_hex }}" name="side">
+          <details class="pull-request-line-comment">
+            <summary>Comment on a line</summary>
+            <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/reviews">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <input type="hidden" name="revision" value="{{ selected_revision }}">
+              <input type="hidden" name="kind" value="line-comment">
+              <input type="hidden" name="path-hex" value="{{ file.path_hex }}">
+              <div class="pull-request-line-fields">
+                <div class="field">
+                  <label for="review-side-{{ file.path_hex }}">Side</label>
+                  <select id="review-side-{{ file.path_hex }}" name="side">
 {% if file.has_base %}
-            <option value="base">Base</option>
+                    <option value="base">Base</option>
 {% endif %}
 {% if file.has_head %}
-            <option value="head">Head</option>
+                    <option value="head">Head</option>
 {% endif %}
-          </select>
-        </div>
-        <div class="field">
-          <label for="review-line-{{ file.path_hex }}">Line</label>
-          <input id="review-line-{{ file.path_hex }}" name="line" type="number" min="1" required>
-          <p class="field-help">Enter a line number from the selected side in the diff above.</p>
-        </div>
-        <div class="field">
-          <label for="review-body-{{ file.path_hex }}">Line comment (Markdown)</label>
-          <textarea id="review-body-{{ file.path_hex }}" name="body" maxlength="262144" rows="4" required></textarea>
-        </div>
-        <button type="submit">Add line comment</button>
-      </form>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="review-line-{{ file.path_hex }}">Line</label>
+                  <input id="review-line-{{ file.path_hex }}" name="line" type="number" min="1" required>
+                </div>
+              </div>
+              <p class="field-help">Use a line number from the selected side in the diff above.</p>
+              <div class="field">
+                <label for="review-body-{{ file.path_hex }}">Comment (Markdown)</label>
+                <textarea id="review-body-{{ file.path_hex }}" name="body" maxlength="262144" rows="4" required></textarea>
+              </div>
+              <button type="submit">Add line comment</button>
+            </form>
+          </details>
 {% endif %}
 {% endif %}
-    </article>
+        </article>
 {% endfor %}
-  </section>
+      </div>
+    </section>
+
+    <section class="pull-request-section" aria-labelledby="discussion-heading">
+      <div class="pull-request-section-heading">
+        <div>
+          <p class="pull-request-kicker">Review activity</p>
+          <h2 id="discussion-heading">Discussion</h2>
+        </div>
+      </div>
+{% if reviews.is_empty() %}
+      <p class="pull-request-empty">No review comments yet.</p>
+{% else %}
+      <div class="pull-request-discussion">
+{% for review in reviews %}
+        <article class="comment-card" id="review-{{ review.id }}">
+          <header>
+            <strong>{{ review.author }}</strong>
+            <span>{{ review.kind|event_name }} · <time datetime="{{ review.created_at }}">{{ review.created_at|human_time }}</time></span>
+          </header>
+{% if review.kind == "line-comment" %}
+          <p class="pull-request-comment-anchor"><code title="{{ review.commit_object_id }}">{{ review.commit_object_id|short_id }}</code> · <code>{{ review.path }}</code> · {{ review.side }} line {{ review.line }}{% if review.outdated %} · <strong>Outdated</strong>{% endif %}</p>
+{% endif %}
+{% if review.has_body %}
+          <div class="markdown">{{ review.body_html|safe }}</div>
+{% endif %}
+        </article>
+{% endfor %}
+      </div>
+{% endif %}
+{% if reviews_has_previous || reviews_has_next %}
+      <nav class="pagination" aria-label="Review pages">
+{% if reviews_has_previous %}
+        <a href="?revision={{ selected_revision }}&amp;reviews_page={{ reviews_previous_page }}&amp;timeline_page={{ timeline_page }}">Newer reviews</a>
+{% endif %}
+{% if reviews_has_next %}
+        <a href="?revision={{ selected_revision }}&amp;reviews_page={{ reviews_next_page }}&amp;timeline_page={{ timeline_page }}">Older reviews</a>
+{% endif %}
+      </nav>
+{% endif %}
+    </section>
+
+    <div class="pull-request-decision-grid">
+{% if can_review %}
+      <section class="pull-request-section" aria-labelledby="review-heading">
+        <p class="pull-request-kicker">Your decision</p>
+        <h2 id="review-heading">Review revision {{ selected_revision }}</h2>
+        <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/reviews">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="revision" value="{{ selected_revision }}">
+          <input type="hidden" name="path-hex" value="">
+          <input type="hidden" name="side" value="">
+          <input type="hidden" name="line" value="">
+          <div class="field">
+            <label for="review-body">Review comment (Markdown)</label>
+            <textarea id="review-body" name="body" maxlength="262144" rows="6"></textarea>
+          </div>
+          <div class="pull-request-review-actions">
+            <button name="kind" value="comment" type="submit">Comment</button>
+            <button name="kind" value="approved" type="submit">Approve</button>
+            <button class="danger-action" name="kind" value="changes-requested" type="submit">Request changes</button>
+          </div>
+        </form>
+      </section>
+{% endif %}
 
 {% if can_merge %}
 {% if comparison.mergeability == "fast-forward" %}
-  <section aria-labelledby="merge-heading">
-    <h2 id="merge-heading">Merge this pull request</h2>
-    <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/merge">
-      <input type="hidden" name="csrf" value="{{ csrf }}">
-      <input type="hidden" name="method" value="fast-forward">
-      <fieldset class="confirmation">
-        <legend>Merge this pull request?</legend>
-        <label><input type="radio" name="confirm" value="no" checked> No</label>
-        <label><input type="radio" name="confirm" value="yes"> Yes</label>
-      </fieldset>
-      <button type="submit">Fast-forward {{ pull_request.base_ref }}</button>
-    </form>
-  </section>
+      <section class="pull-request-section pull-request-merge" aria-labelledby="merge-heading">
+        <p class="pull-request-kicker">Ready to land</p>
+        <h2 id="merge-heading">Merge pull request</h2>
+        <p>This revision can be fast-forwarded into <code>{{ pull_request.base_ref }}</code>.</p>
+        <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/merge">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="method" value="fast-forward">
+          <fieldset class="confirmation">
+            <legend>Confirm merge</legend>
+            <label><input type="radio" name="confirm" value="no" checked> No</label>
+            <label><input type="radio" name="confirm" value="yes"> Yes</label>
+          </fieldset>
+          <button type="submit">Fast-forward merge</button>
+        </form>
+      </section>
 {% else if comparison.mergeability == "clean merge" %}
-  <section aria-labelledby="merge-heading">
-    <h2 id="merge-heading">Merge this pull request</h2>
-    <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/merge">
-      <input type="hidden" name="csrf" value="{{ csrf }}">
-      <input type="hidden" name="method" value="merge-commit">
-      <fieldset class="confirmation">
-        <legend>Merge this pull request?</legend>
-        <label><input type="radio" name="confirm" value="no" checked> No</label>
-        <label><input type="radio" name="confirm" value="yes"> Yes</label>
-      </fieldset>
-      <button type="submit">Create a merge commit on {{ pull_request.base_ref }}</button>
-    </form>
-  </section>
+      <section class="pull-request-section pull-request-merge" aria-labelledby="merge-heading">
+        <p class="pull-request-kicker">Ready to land</p>
+        <h2 id="merge-heading">Merge pull request</h2>
+        <p>This revision can be merged into <code>{{ pull_request.base_ref }}</code> with a merge commit.</p>
+        <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/merge">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="method" value="merge-commit">
+          <fieldset class="confirmation">
+            <legend>Confirm merge</legend>
+            <label><input type="radio" name="confirm" value="no" checked> No</label>
+            <label><input type="radio" name="confirm" value="yes"> Yes</label>
+          </fieldset>
+          <button type="submit">Create merge commit</button>
+        </form>
+      </section>
 {% endif %}
 {% endif %}
+    </div>
 
-{% if can_review %}
-  <section aria-labelledby="review-heading">
-    <h2 id="review-heading">Review this revision</h2>
-    <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/reviews">
-      <input type="hidden" name="csrf" value="{{ csrf }}">
-      <input type="hidden" name="revision" value="{{ selected_revision }}">
-      <input type="hidden" name="path-hex" value="">
-      <input type="hidden" name="side" value="">
-      <input type="hidden" name="line" value="">
-      <div class="field">
-        <label for="review-body">Review comment (Markdown)</label>
-        <textarea id="review-body" name="body" maxlength="262144" rows="8"></textarea>
+    <details class="pull-request-history">
+      <summary>History and Git details</summary>
+      <div class="pull-request-history-grid">
+        <section aria-labelledby="revisions-heading">
+          <h2 id="revisions-heading">Revisions</h2>
+          <ol>
+{% for revision in revisions %}
+            <li value="{{ revision.number }}">
+              <code title="{{ revision.head_object_id }}">{{ revision.head_object_id|short_id }}</code> against <code title="{{ revision.base_object_id }}">{{ revision.base_object_id|short_id }}</code>
+              <span>recorded by {{ revision.author }} <time datetime="{{ revision.created_at }}">{{ revision.created_at|human_time }}</time></span>
+              <a href="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/revisions/{{ revision.number }}.patch">Patch</a>
+{% if revision.number == selected_revision %}
+              <strong>Selected</strong>
+{% else %}
+              <a href="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}?revision={{ revision.number }}">Compare</a>
+{% endif %}
+            </li>
+{% endfor %}
+          </ol>
+        </section>
+
+        <section aria-labelledby="timeline-heading">
+          <h2 id="timeline-heading">Activity</h2>
+          <ol>
+{% for event in timeline %}
+            <li value="{{ event.sequence }}">{{ event.actor }} {{ event.kind|event_name }} <time datetime="{{ event.created_at }}">{{ event.created_at|human_time }}</time></li>
+{% endfor %}
+          </ol>
+{% if timeline_has_previous || timeline_has_next %}
+          <nav class="pagination" aria-label="Timeline pages">
+{% if timeline_has_previous %}
+            <a href="?revision={{ selected_revision }}&amp;reviews_page={{ reviews_page }}&amp;timeline_page={{ timeline_previous_page }}">Newer events</a>
+{% endif %}
+{% if timeline_has_next %}
+            <a href="?revision={{ selected_revision }}&amp;reviews_page={{ reviews_page }}&amp;timeline_page={{ timeline_next_page }}">Older events</a>
+{% endif %}
+          </nav>
+{% endif %}
+        </section>
       </div>
-      <button name="kind" value="comment" type="submit">Add comment</button>
-      <button name="kind" value="approved" type="submit">Approve</button>
-      <button name="kind" value="changes-requested" type="submit">Request changes</button>
-    </form>
-  </section>
-{% endif %}
-
+      <div class="pull-request-git-details">
+        <span>Fetch this pull request</span>
+        <code>git fetch origin refs/pull/{{ pull_request.number }}/head</code>
+      </div>
 {% if can_revise %}
-  <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/revisions">
-    <input type="hidden" name="csrf" value="{{ csrf }}">
-    <button type="submit">Record current branch heads</button>
-  </form>
+      <form method="post" action="/{{ owner }}/{{ repository }}/pulls/{{ pull_request.number }}/revisions">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit">Record current branch heads</button>
+      </form>
 {% endif %}
+    </details>
+  </article>
 {% endblock %}
