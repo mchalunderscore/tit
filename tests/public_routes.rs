@@ -2,8 +2,7 @@ use crate::{http, store};
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,6 +11,8 @@ use http::{PublicWebConfig, RunningWebServer};
 use sha2::{Digest, Sha256};
 use store::{InitialAdministrator, NewRepository, RepositoryOrigin, Store};
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -33,7 +34,7 @@ async fn renders_and_mutates_a_public_issue_without_javascript() {
     .await
     .expect("start the public Web server");
 
-    let summary = request(server.address(), "GET", "/alice/example", &[], &[]);
+    let summary = request(server.address(), "GET", "/alice/example", &[], &[]).await;
     assert_eq!(summary.status, 200);
     assert_html_policy(&summary);
     assert!(
@@ -45,7 +46,8 @@ async fn renders_and_mutates_a_public_issue_without_javascript() {
     assert!(!summary.text().to_ascii_lowercase().contains("<script"));
     assert!(summary.text().contains("/alice/example/issues"));
 
-    let anonymous_issues = request(server.address(), "GET", "/alice/example/issues", &[], &[]);
+    let anonymous_issues =
+        request(server.address(), "GET", "/alice/example/issues", &[], &[]).await;
     assert_eq!(anonymous_issues.status, 200);
     assert!(
         anonymous_issues
@@ -76,6 +78,7 @@ async fn renders_and_mutates_a_public_issue_without_javascript() {
             &headers,
             rejected.as_bytes(),
         )
+        .await
         .status,
         403
     );
@@ -91,7 +94,8 @@ async fn renders_and_mutates_a_public_issue_without_javascript() {
         "/alice/example/issues",
         &headers,
         issue.as_bytes(),
-    );
+    )
+    .await;
     assert_eq!(created.status, 303);
     assert_eq!(created.header("location"), "/alice/example/issues/1");
 
@@ -101,7 +105,8 @@ async fn renders_and_mutates_a_public_issue_without_javascript() {
         "/alice/example/issues/1",
         &[("Cookie", cookie.as_str())],
         &[],
-    );
+    )
+    .await;
     assert_eq!(detail.status, 200);
     assert!(detail.text().contains("#1 No JavaScript workflow"));
     assert!(detail.text().contains("<strong>safe</strong>"));
@@ -116,7 +121,9 @@ async fn renders_and_mutates_a_public_issue_without_javascript() {
         )
         .expect("make the repository private");
     assert_eq!(
-        request(server.address(), "GET", "/alice/example", &[], &[]).status,
+        request(server.address(), "GET", "/alice/example", &[], &[])
+            .await
+            .status,
         404
     );
     assert_eq!(
@@ -127,6 +134,7 @@ async fn renders_and_mutates_a_public_issue_without_javascript() {
             &[("Cookie", cookie.as_str())],
             &[],
         )
+        .await
         .status,
         200
     );
@@ -251,38 +259,43 @@ fn run(command: &mut Command) {
     );
 }
 
-fn request(
+async fn request(
     address: SocketAddr,
     method: &str,
     path: &str,
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> HttpResponse {
-    let mut stream = TcpStream::connect(address).expect("connect to the public Web server");
-    stream
-        .set_read_timeout(Some(RESPONSE_TIMEOUT))
-        .expect("set the response timeout");
-    stream
-        .set_write_timeout(Some(RESPONSE_TIMEOUT))
-        .expect("set the request timeout");
-    let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\n",
-        body.len()
-    );
-    for (name, value) in headers {
-        head.push_str(&format!("{name}: {value}\r\n"));
-    }
-    head.push_str("\r\n");
-    stream
-        .write_all(head.as_bytes())
-        .expect("write HTTP request headers");
-    stream.write_all(body).expect("write the HTTP request");
-    let mut response = Vec::new();
-    if let Err(error) = stream.read_to_end(&mut response)
-        && error.kind() != std::io::ErrorKind::ConnectionReset
-    {
-        panic!("read an HTTP response: {error}");
-    }
+    let response = tokio::time::timeout(RESPONSE_TIMEOUT, async {
+        let mut stream = TcpStream::connect(address)
+            .await
+            .expect("connect to the public Web server");
+        let mut head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str("\r\n");
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("write HTTP request headers");
+        stream
+            .write_all(body)
+            .await
+            .expect("write the HTTP request");
+        let mut response = Vec::new();
+        if let Err(error) = stream.read_to_end(&mut response).await
+            && error.kind() != std::io::ErrorKind::ConnectionReset
+        {
+            panic!("read an HTTP response: {error}");
+        }
+        response
+    })
+    .await
+    .expect("receive an HTTP response before the deadline");
     HttpResponse::parse(&response)
 }
 

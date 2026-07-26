@@ -1,16 +1,20 @@
 use crate::git::{http, packetline, transport, upload_pack};
 
 use std::fs;
-use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use http::RunningGitHttpServer;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use transport::GitRepositories;
 use upload_pack::{ProtocolVersion, UploadPack, UploadPackError};
+
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stock_git_clones_and_fetches_both_hash_formats_over_smart_http() {
@@ -111,13 +115,15 @@ async fn rejects_invalid_http_routes_and_oversized_requests() {
         "application/x-git-upload-pack-request",
         Some("version=2"),
         b"zzzz",
-    );
+    )
+    .await;
     assert!(malformed.starts_with(b"HTTP/1.1 400"));
 
     let wrong_service = raw_http_get(
         server.address(),
         "/alice/example/info/refs?service=git-receive-pack",
-    );
+    )
+    .await;
     assert!(wrong_service.starts_with(b"HTTP/1.1 400"));
 
     let wrong_content_type = raw_http_request(
@@ -126,7 +132,8 @@ async fn rejects_invalid_http_routes_and_oversized_requests() {
         "text/plain",
         Some("version=2"),
         b"0000",
-    );
+    )
+    .await;
     assert!(wrong_content_type.starts_with(b"HTTP/1.1 415"));
 
     let wrong_version = raw_http_request(
@@ -135,7 +142,8 @@ async fn rejects_invalid_http_routes_and_oversized_requests() {
         "application/x-git-upload-pack-request",
         Some("version=2:extra"),
         b"0000",
-    );
+    )
+    .await;
     assert!(wrong_version.starts_with(b"HTTP/1.1 400"));
 
     let oversized = raw_http_request(
@@ -144,7 +152,8 @@ async fn rejects_invalid_http_routes_and_oversized_requests() {
         "application/x-git-upload-pack-request",
         Some("version=2"),
         &vec![b'0'; packetline::MAX_REQUEST_BYTES + 1],
-    );
+    )
+    .await;
     assert!(oversized.starts_with(b"HTTP/1.1 413"));
     server.shutdown().await.expect("stop the Git HTTP server");
 }
@@ -310,43 +319,63 @@ fn command_output(command: &mut Command) -> String {
         .to_owned()
 }
 
-fn raw_http_request(
+async fn raw_http_request(
     address: SocketAddr,
     path: &str,
     content_type: &str,
     git_protocol: Option<&str>,
     body: &[u8],
 ) -> Vec<u8> {
-    let mut stream = std::net::TcpStream::connect(address).expect("connect to the Git HTTP server");
-    let protocol_header = git_protocol
-        .map(|value| format!("Git-Protocol: {value}\r\n"))
-        .unwrap_or_default();
-    write!(
-        stream,
-        "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: {content_type}\r\n{protocol_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )
-    .expect("write HTTP request headers");
-    stream.write_all(body).expect("write HTTP request body");
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .expect("read the Git HTTP response");
-    response
+    tokio::time::timeout(RESPONSE_TIMEOUT, async {
+        let mut stream = TcpStream::connect(address)
+            .await
+            .expect("connect to the Git HTTP server");
+        let protocol_header = git_protocol
+            .map(|value| format!("Git-Protocol: {value}\r\n"))
+            .unwrap_or_default();
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: {content_type}\r\n{protocol_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("write HTTP request headers");
+        stream
+            .write_all(body)
+            .await
+            .expect("write HTTP request body");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read the Git HTTP response");
+        response
+    })
+    .await
+    .expect("receive a Git HTTP response before the deadline")
 }
 
-fn raw_http_get(address: SocketAddr, path: &str) -> Vec<u8> {
-    let mut stream = std::net::TcpStream::connect(address).expect("connect to the Git HTTP server");
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
-    )
-    .expect("write HTTP request");
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .expect("read the Git HTTP response");
-    response
+async fn raw_http_get(address: SocketAddr, path: &str) -> Vec<u8> {
+    tokio::time::timeout(RESPONSE_TIMEOUT, async {
+        let mut stream = TcpStream::connect(address)
+            .await
+            .expect("connect to the Git HTTP server");
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write HTTP request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read the Git HTTP response");
+        response
+    })
+    .await
+    .expect("receive a Git HTTP response before the deadline")
 }
 
 fn create_fixture(worktree: &Path, bare: &Path, format: &str) {

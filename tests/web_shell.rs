@@ -1,18 +1,20 @@
 use crate::http;
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use http::RunningWebServer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serves_the_semantic_shell_without_javascript() {
     let server = start().await;
 
-    let home = request(server.address(), "GET", "/", &[]);
+    let home = request(server.address(), "GET", "/", &[]).await;
     assert_eq!(home.status, 200);
     assert_eq!(home.header("content-type"), "text/html; charset=utf-8");
     assert_eq!(home.header("cache-control"), "no-store");
@@ -35,17 +37,18 @@ async fn serves_the_semantic_shell_without_javascript() {
         "GET",
         "/go?owner=alice&repository=example",
         &[],
-    );
+    )
+    .await;
     assert_eq!(removed_repository_form.status, 404);
     assert_security_policy(&removed_repository_form);
 
-    let head = request(server.address(), "HEAD", "/", &[]);
+    let head = request(server.address(), "HEAD", "/", &[]).await;
     assert_eq!(head.status, 200);
     assert!(head.body.is_empty());
     assert_eq!(head.header("content-length"), home.body.len().to_string());
     assert_security_policy(&head);
 
-    let css = request(server.address(), "GET", "/assets/style.css", &[]);
+    let css = request(server.address(), "GET", "/assets/style.css", &[]).await;
     assert_eq!(css.status, 200);
     assert_eq!(css.header("content-type"), "text/css; charset=utf-8");
     assert_eq!(css.header("cache-control"), "no-cache");
@@ -54,7 +57,7 @@ async fn serves_the_semantic_shell_without_javascript() {
     assert!(css.body.contains(".two-column"));
     assert_security_policy(&css);
 
-    let css_head = request(server.address(), "HEAD", "/assets/style.css", &[]);
+    let css_head = request(server.address(), "HEAD", "/assets/style.css", &[]).await;
     assert_eq!(css_head.status, 200);
     assert!(css_head.body.is_empty());
     assert_eq!(
@@ -62,7 +65,7 @@ async fn serves_the_semantic_shell_without_javascript() {
         css.body.len().to_string()
     );
 
-    let signup = request(server.address(), "GET", "/signup", &[]);
+    let signup = request(server.address(), "GET", "/signup", &[]).await;
     assert_eq!(signup.status, 200);
     assert!(
         signup
@@ -70,7 +73,7 @@ async fn serves_the_semantic_shell_without_javascript() {
             .contains("<form action=\"/signup\" method=\"post\">")
     );
     assert!(signup.body.contains("name=\"invitation\""));
-    let recovery = request(server.address(), "GET", "/recover", &[]);
+    let recovery = request(server.address(), "GET", "/recover", &[]).await;
     assert_eq!(recovery.status, 200);
     assert!(
         recovery
@@ -79,7 +82,7 @@ async fn serves_the_semantic_shell_without_javascript() {
     );
     assert!(recovery.body.contains("name=\"recovery\""));
 
-    let wrong_signup_method = request(server.address(), "PUT", "/signup", &[]);
+    let wrong_signup_method = request(server.address(), "PUT", "/signup", &[]).await;
     assert_eq!(wrong_signup_method.status, 405);
     assert_eq!(wrong_signup_method.header("allow"), "GET, HEAD, POST");
 
@@ -90,14 +93,14 @@ async fn serves_the_semantic_shell_without_javascript() {
 async fn serves_useful_errors_and_owns_request_ids() {
     let server = start().await;
 
-    let missing = request(server.address(), "GET", "/missing", &[]);
+    let missing = request(server.address(), "GET", "/missing", &[]).await;
     assert_eq!(missing.status, 404);
     assert!(missing.body.contains("<h1>Page not found</h1>"));
     assert!(missing.body.contains("The requested page does not exist."));
     assert_security_policy(&missing);
     assert_snapshot(&missing, include_str!("snapshots/web/not-found.html"));
 
-    let missing_head = request(server.address(), "HEAD", "/missing", &[]);
+    let missing_head = request(server.address(), "HEAD", "/missing", &[]).await;
     assert_eq!(missing_head.status, 404);
     assert!(missing_head.body.is_empty());
     assert_eq!(
@@ -105,7 +108,7 @@ async fn serves_useful_errors_and_owns_request_ids() {
         missing.body.len().to_string()
     );
 
-    let method = request(server.address(), "POST", "/", &[]);
+    let method = request(server.address(), "POST", "/", &[]).await;
     assert_eq!(method.status, 405);
     assert_eq!(method.header("allow"), "GET, HEAD");
     assert!(method.body.contains("<h1>Method not allowed</h1>"));
@@ -125,8 +128,9 @@ async fn serves_useful_errors_and_owns_request_ids() {
         "GET",
         "/",
         &[("X-Request-ID", "attacker-controlled")],
-    );
-    let second = request(server.address(), "GET", "/", &[]);
+    )
+    .await;
+    let second = request(server.address(), "GET", "/", &[]).await;
     assert_request_id(first.header("x-request-id"));
     assert_request_id(second.header("x-request-id"));
     assert_ne!(first.header("x-request-id"), "attacker-controlled");
@@ -151,15 +155,16 @@ async fn enforces_request_and_login_attempt_limits() {
                     ("X-Forwarded-For", "198.51.100.1")
                 ]
             )
+            .await
             .status,
             400
         );
     }
-    let limited = request(server.address(), "POST", "/login", &[]);
+    let limited = request(server.address(), "POST", "/login", &[]).await;
     assert_eq!(limited.status, 429);
     assert_eq!(limited.body, "Login attempt limit exceeded.\n");
 
-    let oversized = request_with_declared_length(server.address(), "/", 1024 * 1024 + 1);
+    let oversized = request_with_declared_length(server.address(), "/", 1024 * 1024 + 1).await;
     assert_eq!(oversized.status, 413);
 
     server.shutdown().await.expect("stop the Web server");
@@ -170,9 +175,12 @@ async fn rate_limits_signup_and_recovery() {
     for path in ["/signup", "/recover"] {
         let server = start().await;
         for _ in 0..10 {
-            assert_eq!(request(server.address(), "POST", path, &[]).status, 400);
+            assert_eq!(
+                request(server.address(), "POST", path, &[]).await.status,
+                400
+            );
         }
-        let limited = request(server.address(), "POST", path, &[]);
+        let limited = request(server.address(), "POST", path, &[]).await;
         assert_eq!(limited.status, 429);
         assert_eq!(limited.body, "Account attempt limit exceeded.\n");
         server.shutdown().await.expect("stop the Web server");
@@ -216,44 +224,63 @@ async fn start() -> RunningWebServer {
         .expect("start the Web server")
 }
 
-fn request(
+async fn request(
     address: SocketAddr,
     method: &str,
     path: &str,
     headers: &[(&str, &str)],
 ) -> HttpResponse {
-    let mut stream = TcpStream::connect(address).expect("connect to the Web server");
-    let mut request =
-        format!("{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n");
-    for (name, value) in headers {
-        request.push_str(&format!("{name}: {value}\r\n"));
-    }
-    request.push_str("Content-Length: 0\r\n\r\n");
-    stream
-        .write_all(request.as_bytes())
-        .expect("write an HTTP request");
-    let mut bytes = Vec::new();
-    stream
-        .read_to_end(&mut bytes)
-        .expect("read an HTTP response");
+    let bytes = tokio::time::timeout(RESPONSE_TIMEOUT, async {
+        let mut stream = TcpStream::connect(address)
+            .await
+            .expect("connect to the Web server");
+        let mut request =
+            format!("{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n");
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("Content-Length: 0\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write an HTTP request");
+        let mut bytes = Vec::new();
+        stream
+            .read_to_end(&mut bytes)
+            .await
+            .expect("read an HTTP response");
+        bytes
+    })
+    .await
+    .expect("receive an HTTP response before the deadline");
     HttpResponse::parse(&bytes)
 }
 
-fn request_with_declared_length(
+async fn request_with_declared_length(
     address: SocketAddr,
     path: &str,
     content_length: usize,
 ) -> HttpResponse {
-    let mut stream = TcpStream::connect(address).expect("connect to the Web server");
-    write!(
-        stream,
-        "POST {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {content_length}\r\n\r\n"
-    )
-    .expect("write an HTTP request");
-    let mut bytes = Vec::new();
-    stream
-        .read_to_end(&mut bytes)
-        .expect("read an HTTP response");
+    let bytes = tokio::time::timeout(RESPONSE_TIMEOUT, async {
+        let mut stream = TcpStream::connect(address)
+            .await
+            .expect("connect to the Web server");
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {content_length}\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write an HTTP request");
+        let mut bytes = Vec::new();
+        stream
+            .read_to_end(&mut bytes)
+            .await
+            .expect("read an HTTP response");
+        bytes
+    })
+    .await
+    .expect("receive an HTTP response before the deadline");
     HttpResponse::parse(&bytes)
 }
 
