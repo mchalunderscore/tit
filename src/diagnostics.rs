@@ -16,6 +16,7 @@ use crate::store::{
 };
 
 const REQUIRED_INDEXES: &[&str] = &[
+    "account_id_username",
     "audit_event_correlation",
     "audit_event_history",
     "feed_token_account_active",
@@ -26,6 +27,8 @@ const REQUIRED_INDEXES: &[&str] = &[
     "login_nonce_active",
     "m1a_child_state_parent",
     "m1a_parent_created_at",
+    "namespace_id_kind",
+    "organization_member_account",
     "pull_request_ref_intent_incomplete",
     "pull_request_repository_state",
     "pull_request_review_status",
@@ -33,6 +36,7 @@ const REQUIRED_INDEXES: &[&str] = &[
     "pull_request_revision_history",
     "repository_collaborator_account",
     "repository_event_feed",
+    "repository_event_actor_activity",
     "repository_event_issue_timeline",
     "repository_event_pull_request_timeline",
     "signup_invitation_active",

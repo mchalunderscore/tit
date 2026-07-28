@@ -133,6 +133,40 @@ pub(crate) enum AdminCommand {
         #[command(subcommand)]
         command: AccountCommand,
     },
+    /// Administer organizations
+    Organization {
+        #[command(subcommand)]
+        command: OrganizationCommand,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum OrganizationCommand {
+    /// Create an organization
+    Create {
+        slug: String,
+        owner: String,
+        display_name: String,
+    },
+    /// Set an organization member role
+    MemberSet {
+        organization: String,
+        username: String,
+        role: OrganizationRole,
+    },
+    /// Remove an organization member
+    MemberRemove {
+        organization: String,
+        username: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum OrganizationRole {
+    Owner,
+    Maintainer,
+    Writer,
+    Reader,
 }
 
 #[derive(Clone, Debug, Subcommand)]

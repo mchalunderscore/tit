@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Create · tit{% endblock %}
+{% block content %}
+  <h1>Create</h1>
+  <div class="create-options">
+    <a href="/new/repository">
+      <strong>Repository</strong>
+      <span>Create a Git repository in your account or an organization.</span>
+    </a>
+    <a href="/new/organization">
+      <strong>Organization</strong>
+      <span>Create a shared namespace for repositories and members.</span>
+    </a>
+  </div>
+{% endblock %}

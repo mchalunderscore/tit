@@ -31,6 +31,18 @@ pub(crate) enum StoreError {
     AccountNotFound(String),
     #[error("username is not available: {0}")]
     UsernameUnavailable(String),
+    #[error("namespace does not exist or is not active: {0}")]
+    NamespaceNotFound(String),
+    #[error("namespace is not available: {0}")]
+    NamespaceUnavailable(String),
+    #[error("organization access is not authorized")]
+    OrganizationDenied,
+    #[error("organization member does not exist: {0}")]
+    OrganizationMemberNotFound(String),
+    #[error("an organization must have at least one owner")]
+    LastOrganizationOwner,
+    #[error("organization role is not valid")]
+    InvalidOrganizationRole,
     #[error("signup invitation is invalid, expired, or already used")]
     InvalidInvitation,
     #[error("recovery credential is invalid")]

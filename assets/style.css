@@ -247,6 +247,7 @@ main > ul,
 main > .field,
 main > .table-scroll,
 .two-column > section,
+.settings-lane > section,
 .auth-panel {
   margin-block: 1.5rem;
   padding: 1.25rem;
@@ -268,6 +269,7 @@ main > section > :first-child,
 main > ul > :first-child,
 main > .field > :first-child,
 .two-column > section > :first-child,
+.settings-lane > section > :first-child,
 .auth-panel > :first-child {
   margin-top: 0;
 }
@@ -281,6 +283,7 @@ main > section > :last-child,
 main > ul > :last-child,
 main > .field > :last-child,
 .two-column > section > :last-child,
+.settings-lane > section > :last-child,
 .auth-panel > :last-child {
   margin-bottom: 0;
 }
@@ -1266,6 +1269,72 @@ pre {
   overflow-wrap: anywhere;
 }
 
+.profile-activity .page-section-header {
+  margin-top: 0;
+}
+
+.profile-activity .page-section-header > span {
+  color: var(--fg-dim);
+  font-size: 0.75rem;
+}
+
+.activity-matrix-scroll {
+  max-width: 100%;
+  padding-bottom: 0.4rem;
+  overflow-x: auto;
+}
+
+.activity-matrix {
+  display: grid;
+  grid-template-rows: repeat(7, 0.75rem);
+  grid-auto-columns: 0.75rem;
+  grid-auto-flow: column;
+  gap: 0.2rem;
+  width: max-content;
+}
+
+.activity-cell {
+  display: block;
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 1px solid var(--border);
+  background: var(--surface-raised);
+}
+
+.activity-level-1 {
+  background: #3d3d3d;
+}
+
+.activity-level-2 {
+  background: #737373;
+}
+
+.activity-level-3 {
+  background: #aaa;
+}
+
+.activity-level-4 {
+  background: var(--fg);
+}
+
+.activity-legend {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.3rem;
+  margin-bottom: 0;
+  color: var(--fg-dim);
+  font-size: 0.65rem;
+}
+
+.activity-legend span:first-child {
+  margin-right: 0.2rem;
+}
+
+.activity-legend span:last-child {
+  margin-left: 0.2rem;
+}
+
 .field-help {
   color: var(--fg-dim);
   font-size: 0.8rem;
@@ -1282,6 +1351,25 @@ pre {
 
 .account-entry > p {
   color: var(--fg-dim);
+}
+
+.account-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 2.5rem;
+  margin-block: 0 1.5rem;
+  padding-block: 0.85rem;
+}
+
+.account-summary > div {
+  display: grid;
+  grid-template-columns: max-content max-content;
+  gap: 0.75rem;
+  align-items: baseline;
+}
+
+.account-profile {
+  max-width: 42rem;
 }
 
 .account-options {
@@ -1321,8 +1409,68 @@ pre {
   font-size: 0.8rem;
 }
 
-.account-utilities {
+.account-utilities,
+.create-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.75rem;
+  margin-block: 1.5rem;
+}
+
+.account-utilities a,
+.create-options a {
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.account-utilities a:hover,
+.create-options a:hover {
+  border-color: var(--border-strong);
+  text-decoration: none;
+}
+
+.account-utilities span,
+.create-options span {
+  color: var(--fg-dim);
+  font-size: 0.75rem;
+}
+
+.account-utilities .danger-link span,
+.account-utilities .danger-link strong {
+  color: var(--error);
+}
+
+.create-options {
+  max-width: 50rem;
+}
+
+.create-options a {
+  min-height: 7rem;
+  align-content: end;
+}
+
+.create-form {
+  max-width: 42rem;
+}
+
+.settings-lanes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.5rem;
+  align-items: start;
+}
+
+.settings-lane {
+  display: grid;
+  gap: 1.5rem;
+  align-content: start;
+}
+
+.settings-lane > section {
+  margin-block: 0;
 }
 
 .account-key-layout {
@@ -1485,6 +1633,7 @@ footer {
 
 @media (max-width: 52rem) {
   .two-column,
+  .settings-lanes,
   .repository-summary-layout,
   .account-key-layout,
   .pull-request-change-index,
@@ -1535,6 +1684,11 @@ footer {
   }
 
   .account-options {
+    grid-template-columns: 1fr;
+  }
+
+  .account-utilities,
+  .create-options {
     grid-template-columns: 1fr;
   }
 

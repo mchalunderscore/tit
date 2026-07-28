@@ -12,6 +12,16 @@
 {% if contact_email.is_empty() %}{% else %}
       <p>Contact: <a href="mailto:{{ contact_email }}">{{ contact_email }}</a></p>
 {% endif %}
+      <h2>Organizations</h2>
+{% if organizations.is_empty() %}
+      <p>This user is not a member of an organization.</p>
+{% else %}
+      <ul>
+{% for organization in organizations %}
+        <li><a href="/{{ organization.slug }}">{{ organization.display_name }}</a> · {{ organization.role }}</li>
+{% endfor %}
+      </ul>
+{% endif %}
     </section>
     <section aria-labelledby="repositories-heading">
       <h2 id="repositories-heading">Public repositories</h2>
@@ -36,4 +46,18 @@
 {% endif %}
     </section>
   </div>
+  <section class="profile-activity" aria-labelledby="activity-heading">
+    <header class="page-section-header">
+      <h2 id="activity-heading">Activity</h2>
+      <span>{{ active_days }} active {% if active_days == 1 %}day{% else %}days{% endif %} in the past year</span>
+    </header>
+    <div class="activity-matrix-scroll">
+    <div class="activity-matrix" role="img" aria-label="{{ activity_total }} public activities by {{ username }} in the last year">
+{% for day in activity %}
+      <time class="activity-cell activity-level-{{ day.level }}" datetime="{{ day.date }}" title="{{ day.date }} · {{ day.count }} {% if day.count == 1 %}activity{% else %}activities{% endif %}"></time>
+{% endfor %}
+    </div>
+    </div>
+    <p class="activity-legend" aria-hidden="true"><span>Less</span><i class="activity-cell activity-level-0"></i><i class="activity-cell activity-level-1"></i><i class="activity-cell activity-level-2"></i><i class="activity-cell activity-level-3"></i><i class="activity-cell activity-level-4"></i><span>More</span></p>
+  </section>
 {% endblock %}

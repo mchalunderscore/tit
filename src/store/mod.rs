@@ -117,18 +117,50 @@ impl Store {
         } else {
             None
         };
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Exclusive)?;
-        for version in (current + 1)..=SCHEMA_VERSION {
-            transaction.execute_batch(MIGRATIONS[(version - 1) as usize])?;
-            transaction.pragma_update(None, "user_version", version)?;
-            after_migration(version);
+        let repository_namespace_version = 25;
+        if current < repository_namespace_version - 1 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Exclusive)?;
+            for version in (current + 1)..repository_namespace_version {
+                transaction.execute_batch(MIGRATIONS[(version - 1) as usize])?;
+                transaction.pragma_update(None, "user_version", version)?;
+                after_migration(version);
+            }
+            if let Some(instance) = &instance {
+                backfill_default_branches(&transaction, instance)?;
+            }
+            transaction.commit()?;
         }
-        if let Some(instance) = instance {
-            backfill_default_branches(&transaction, &instance)?;
+        if current < repository_namespace_version {
+            self.connection.pragma_update(None, "foreign_keys", false)?;
+            let result = (|| {
+                let transaction = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Exclusive)?;
+                transaction
+                    .execute_batch(MIGRATIONS[(repository_namespace_version - 1) as usize])?;
+                verify_foreign_keys(&transaction)?;
+                transaction.pragma_update(None, "user_version", repository_namespace_version)?;
+                after_migration(repository_namespace_version);
+                transaction.commit()?;
+                Ok::<(), StoreError>(())
+            })();
+            self.connection.pragma_update(None, "foreign_keys", true)?;
+            result?;
         }
-        transaction.commit()?;
+        let current = self.schema_version()?;
+        if current < SCHEMA_VERSION {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Exclusive)?;
+            for version in (current + 1)..=SCHEMA_VERSION {
+                transaction.execute_batch(MIGRATIONS[(version - 1) as usize])?;
+                transaction.pragma_update(None, "user_version", version)?;
+                after_migration(version);
+            }
+            transaction.commit()?;
+        }
         Ok(())
     }
 
@@ -146,15 +178,7 @@ impl Store {
             return Err(StoreError::Integrity(result));
         }
 
-        let mut statement = self.connection.prepare("PRAGMA foreign_key_check")?;
-        let mut rows = statement.query([])?;
-        if let Some(row) = rows.next()? {
-            let table: String = row.get(0)?;
-            return Err(StoreError::Integrity(format!(
-                "foreign key violation in table {table}"
-            )));
-        }
-        Ok(())
+        verify_foreign_keys(&self.connection)
     }
 
     pub(crate) fn backup(&self, path: &Path) -> Result<(), StoreError> {
@@ -1175,6 +1199,326 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn create_organization(
+        &mut self,
+        slug: &str,
+        display_name: &str,
+        description: &str,
+        owner: &str,
+        created_at: i64,
+        correlation_id: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner_id = active_account_id(&transaction, owner)?;
+        let inserted = transaction.execute(
+            "INSERT INTO namespace (slug, kind, account_id, created_at)
+             VALUES (?1, 'organization', NULL, ?2)",
+            rusqlite::params![slug, created_at],
+        );
+        match inserted {
+            Ok(1) => {}
+            Err(error) if is_unique_constraint(&error) => {
+                return Err(StoreError::NamespaceUnavailable(slug.to_owned()));
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => unreachable!("an INSERT changes one row"),
+        }
+        let organization_id = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO organization
+             (namespace_id, display_name, description, state, created_at)
+             VALUES (?1, ?2, ?3, 'active', ?4)",
+            rusqlite::params![organization_id, display_name, description, created_at],
+        )?;
+        transaction.execute(
+            "INSERT INTO organization_member
+             (organization_id, account_id, role, created_at)
+             VALUES (?1, ?2, 'owner', ?3)",
+            rusqlite::params![organization_id, owner_id, created_at],
+        )?;
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "organization.create",
+                actor: owner,
+                target: slug,
+                outcome: "success",
+                correlation_id,
+                created_at,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn set_organization_member(
+        &mut self,
+        organization: &str,
+        actor: &str,
+        username: &str,
+        role: &str,
+        changed_at: i64,
+        correlation_id: &str,
+    ) -> Result<(), StoreError> {
+        if !matches!(role, "owner" | "maintainer" | "writer" | "reader") {
+            return Err(StoreError::InvalidOrganizationRole);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let organization_id = active_organization_id(&transaction, organization)?;
+        authorize_organization_owner(&transaction, organization_id, actor)?;
+        let account_id = match active_account_id(&transaction, username) {
+            Ok(id) => id,
+            Err(StoreError::AccountNotFound(_)) => {
+                return Err(StoreError::OrganizationMemberNotFound(username.to_owned()));
+            }
+            Err(error) => return Err(error),
+        };
+        if role != "owner" {
+            require_other_organization_owner(&transaction, organization_id, account_id)?;
+        }
+        transaction.execute(
+            "INSERT INTO organization_member
+             (organization_id, account_id, role, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (organization_id, account_id)
+             DO UPDATE SET role = excluded.role",
+            rusqlite::params![organization_id, account_id, role, changed_at],
+        )?;
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "organization.member.set",
+                actor,
+                target: &format!("{organization}:{username}:{role}"),
+                outcome: "success",
+                correlation_id,
+                created_at: changed_at,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn update_organization_profile(
+        &mut self,
+        organization: &str,
+        actor: &str,
+        display_name: &str,
+        description: &str,
+        changed_at: i64,
+        correlation_id: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let organization_id = active_organization_id(&transaction, organization)?;
+        authorize_namespace_maintainer(&transaction, organization_id, actor)?;
+        let changed = transaction.execute(
+            "UPDATE organization
+             SET display_name = ?2, description = ?3
+             WHERE namespace_id = ?1 AND state = 'active'",
+            rusqlite::params![organization_id, display_name, description],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::NamespaceNotFound(organization.to_owned()));
+        }
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "organization.profile",
+                actor,
+                target: organization,
+                outcome: "success",
+                correlation_id,
+                created_at: changed_at,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn remove_organization_member(
+        &mut self,
+        organization: &str,
+        actor: &str,
+        username: &str,
+        changed_at: i64,
+        correlation_id: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let organization_id = active_organization_id(&transaction, organization)?;
+        authorize_organization_owner(&transaction, organization_id, actor)?;
+        let account_id: Option<i64> = transaction
+            .query_row(
+                "SELECT id FROM account WHERE username = ?1",
+                [username],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(account_id) = account_id else {
+            return Err(StoreError::OrganizationMemberNotFound(username.to_owned()));
+        };
+        require_other_organization_owner(&transaction, organization_id, account_id)?;
+        let changed = transaction.execute(
+            "DELETE FROM organization_member
+             WHERE organization_id = ?1 AND account_id = ?2",
+            rusqlite::params![organization_id, account_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::OrganizationMemberNotFound(username.to_owned()));
+        }
+        insert_audit_event(
+            &transaction,
+            &NewAuditEvent {
+                action: "organization.member.remove",
+                actor,
+                target: &format!("{organization}:{username}"),
+                outcome: "success",
+                correlation_id,
+                created_at: changed_at,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn organization_profile(
+        &self,
+        slug: &str,
+        page: usize,
+        page_size: usize,
+    ) -> Result<OrganizationProfile, StoreError> {
+        let mut profile = self
+            .connection
+            .query_row(
+                "SELECT namespace.slug, organization.display_name,
+                        organization.description, organization.created_at
+                 FROM organization
+                 JOIN namespace ON namespace.id = organization.namespace_id
+                 WHERE namespace.slug = ?1 AND organization.state = 'active'",
+                [slug],
+                |row| {
+                    Ok(OrganizationProfile {
+                        slug: row.get(0)?,
+                        display_name: row.get(1)?,
+                        description: row.get(2)?,
+                        created_at: row.get(3)?,
+                        members: Vec::new(),
+                        repositories: Vec::new(),
+                        page,
+                        has_next: false,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NamespaceNotFound(slug.to_owned()))?;
+        let organization_id = active_organization_id(&self.connection, slug)?;
+        let mut members = self.connection.prepare(
+            "SELECT account.username, organization_member.role
+             FROM organization_member
+             JOIN account ON account.id = organization_member.account_id
+             WHERE organization_member.organization_id = ?1
+               AND account.state = 'active'
+             ORDER BY CASE organization_member.role
+                          WHEN 'owner' THEN 1
+                          WHEN 'maintainer' THEN 2
+                          WHEN 'writer' THEN 3
+                          ELSE 4
+                      END,
+                      account.username",
+        )?;
+        profile.members = members
+            .query_map([organization_id], |row| {
+                Ok(OrganizationMemberRecord {
+                    username: row.get(0)?,
+                    role: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let offset = page
+            .checked_sub(1)
+            .and_then(|value| value.checked_mul(page_size))
+            .ok_or(StoreError::EventLimit)?;
+        let limit = i64::try_from(page_size.checked_add(1).ok_or(StoreError::EventLimit)?)
+            .map_err(|_| StoreError::EventLimit)?;
+        let offset = i64::try_from(offset).map_err(|_| StoreError::EventLimit)?;
+        let mut repositories = self.connection.prepare(
+            "SELECT namespace.slug, repository.slug, repository.visibility, repository.state,
+                    COALESCE(repository_profile.description, ''),
+                    COALESCE(MAX(repository_event.created_at), repository.created_at)
+             FROM repository
+             JOIN namespace ON namespace.id = repository.owner_namespace_id
+             LEFT JOIN repository_profile ON repository_profile.repository_id = repository.id
+             LEFT JOIN repository_event ON repository_event.repository_id = repository.id
+             WHERE namespace.id = ?1
+               AND repository.state = 'active'
+               AND repository.visibility = 'public'
+             GROUP BY repository.id, namespace.slug, repository.slug,
+                      repository.visibility, repository.state, repository_profile.description,
+                      repository.created_at
+             ORDER BY 6 DESC, repository.slug
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let mut records = repositories
+            .query_map(
+                rusqlite::params![organization_id, limit, offset],
+                home_repository_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        profile.has_next = records.len() > page_size;
+        records.truncate(page_size);
+        profile.repositories = records;
+        Ok(profile)
+    }
+
+    pub(crate) fn maintained_namespaces(&self, username: &str) -> Result<Vec<String>, StoreError> {
+        let account_id = active_account_id(&self.connection, username)?;
+        let mut statement = self.connection.prepare(
+            "SELECT slug
+             FROM namespace
+             WHERE account_id = ?1
+             UNION ALL
+             SELECT namespace.slug
+             FROM organization_member
+             JOIN organization
+               ON organization.namespace_id = organization_member.organization_id
+             JOIN namespace ON namespace.id = organization.namespace_id
+             WHERE organization_member.account_id = ?1
+               AND organization_member.role IN ('owner', 'maintainer')
+               AND organization.state = 'active'
+             ORDER BY slug",
+        )?;
+        statement
+            .query_map([account_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn organization_member_role(
+        &self,
+        organization: &str,
+        username: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let organization_id = active_organization_id(&self.connection, organization)?;
+        let account_id = active_account_id(&self.connection, username)?;
+        self.connection
+            .query_row(
+                "SELECT role
+                 FROM organization_member
+                 WHERE organization_id = ?1 AND account_id = ?2",
+                rusqlite::params![organization_id, account_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub(crate) fn create_repository(
         &mut self,
         repository: &NewRepository<'_>,
@@ -1182,10 +1526,11 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owner_id = active_account_id(&transaction, repository.owner)?;
+        let owner_id = active_namespace_id(&transaction, repository.owner)?;
+        authorize_namespace_maintainer(&transaction, owner_id, repository.actor)?;
         let result = transaction.execute(
             "INSERT INTO repository
-             (id, owner_account_id, slug, visibility, state, object_format, created_at, archived_at)
+             (id, owner_namespace_id, slug, visibility, state, object_format, created_at, archived_at)
              VALUES (?1, ?2, ?3, 'public', 'active', ?4, ?5, NULL)",
             rusqlite::params![
                 repository.id,
@@ -1217,7 +1562,7 @@ impl Store {
                         issue_id: None,
                         pull_request_id: None,
                         event: &event,
-                        actor: repository.owner,
+                        actor: repository.actor,
                         ref_name: None,
                         old_target: None,
                         new_target: None,
@@ -1243,7 +1588,7 @@ impl Store {
                             issue_id: None,
                             pull_request_id: None,
                             event: &event,
-                            actor: repository.owner,
+                            actor: repository.actor,
                             ref_name: Some(&reference.name),
                             old_target: None,
                             new_target: Some(&reference.target),
@@ -1298,10 +1643,10 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owner_id = active_account_id(&transaction, owner)?;
+        let owner_id = active_namespace_id(&transaction, owner)?;
         let result = transaction.execute(
             "UPDATE repository SET slug = ?3
-             WHERE owner_account_id = ?1 AND slug = ?2 AND state = 'active'",
+             WHERE owner_namespace_id = ?1 AND slug = ?2 AND state = 'active'",
             rusqlite::params![owner_id, old_slug, new_slug],
         );
         match result {
@@ -1351,10 +1696,10 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owner_id = active_account_id(&transaction, owner)?;
+        let owner_id = active_namespace_id(&transaction, owner)?;
         let changed = transaction.execute(
             "UPDATE repository SET state = 'archived', archived_at = ?3
-             WHERE owner_account_id = ?1 AND slug = ?2 AND state = 'active'",
+             WHERE owner_namespace_id = ?1 AND slug = ?2 AND state = 'active'",
             rusqlite::params![owner_id, slug, archived_at],
         )?;
         if changed == 0 {
@@ -1391,10 +1736,10 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owner_id = active_account_id(&transaction, owner)?;
+        let owner_id = active_namespace_id(&transaction, owner)?;
         let changed = transaction.execute(
             "UPDATE repository SET visibility = ?3
-             WHERE owner_account_id = ?1 AND slug = ?2 AND state = 'active'",
+             WHERE owner_namespace_id = ?1 AND slug = ?2 AND state = 'active'",
             rusqlite::params![owner_id, slug, visibility],
         )?;
         if changed == 0 {
@@ -1430,11 +1775,11 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owner_id = active_account_id(&transaction, owner)?;
+        let owner_id = active_namespace_id(&transaction, owner)?;
         let repository_id: Option<String> = transaction
             .query_row(
                 "SELECT id FROM repository
-                 WHERE owner_account_id = ?1 AND slug = ?2 AND state = 'active'",
+                 WHERE owner_namespace_id = ?1 AND slug = ?2 AND state = 'active'",
                 rusqlite::params![owner_id, slug],
                 |row| row.get(0),
             )
@@ -1449,7 +1794,7 @@ impl Store {
             }
             Err(error) => return Err(error),
         };
-        if collaborator_id == owner_id {
+        if namespace_account_id(&transaction, owner_id)? == Some(collaborator_id) {
             return Err(StoreError::OwnerCollaborator);
         }
         transaction.execute(
@@ -1488,11 +1833,11 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owner_id = active_account_id(&transaction, owner)?;
+        let owner_id = active_namespace_id(&transaction, owner)?;
         let repository_id: Option<String> = transaction
             .query_row(
                 "SELECT id FROM repository
-                 WHERE owner_account_id = ?1 AND slug = ?2 AND state = 'active'",
+                 WHERE owner_namespace_id = ?1 AND slug = ?2 AND state = 'active'",
                 rusqlite::params![owner_id, slug],
                 |row| row.get(0),
             )
@@ -1510,7 +1855,7 @@ impl Store {
         let Some(collaborator_id) = collaborator_id else {
             return Err(StoreError::CollaboratorNotFound(username.to_owned()));
         };
-        if collaborator_id == owner_id {
+        if namespace_account_id(&transaction, owner_id)? == Some(collaborator_id) {
             return Err(StoreError::OwnerCollaborator);
         }
         let changed = transaction.execute(
@@ -1543,12 +1888,12 @@ impl Store {
         slug: &str,
     ) -> Result<RepositoryRecord, StoreError> {
         let result = self.connection.query_row(
-            "SELECT repository.id, account.username, repository.slug,
+            "SELECT repository.id, namespace.slug, repository.slug,
                     repository.visibility, repository.state, repository.object_format,
                     repository.created_at, repository.archived_at
              FROM repository
-             JOIN account ON account.id = repository.owner_account_id
-             WHERE account.username = ?1 AND repository.slug = ?2",
+             JOIN namespace ON namespace.id = repository.owner_namespace_id
+             WHERE namespace.slug = ?1 AND repository.slug = ?2",
             rusqlite::params![owner, slug],
             repository_from_row,
         );
@@ -1624,8 +1969,8 @@ impl Store {
                 "SELECT repository_default_branch.ref_name
                  FROM repository_default_branch
                  JOIN repository ON repository.id = repository_default_branch.repository_id
-                 JOIN account ON account.id = repository.owner_account_id
-                 WHERE account.username = ?1 AND repository.slug = ?2",
+                 JOIN namespace ON namespace.id = repository.owner_namespace_id
+                 WHERE namespace.slug = ?1 AND repository.slug = ?2",
                 rusqlite::params![owner, slug],
                 |row| row.get(0),
             )
@@ -1686,14 +2031,14 @@ impl Store {
             i64,
         ) = transaction
             .query_row(
-                "SELECT repository.id, account.username, repository.slug,
+                "SELECT repository.id, namespace.slug, repository.slug,
                         repository_default_branch_intent.actor,
                         repository_default_branch_intent.proposed_ref_name,
                         repository_default_branch_intent.created_at
                  FROM repository_default_branch_intent
                  JOIN repository
                    ON repository.id = repository_default_branch_intent.repository_id
-                 JOIN account ON account.id = repository.owner_account_id
+                 JOIN namespace ON namespace.id = repository.owner_namespace_id
                  WHERE repository_default_branch_intent.id = ?1",
                 [id],
                 |row| {
@@ -1950,14 +2295,17 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owner_id = active_account_id(&transaction, owner)?;
-        let actor_id = active_account_id(&transaction, actor)?;
-        if actor_id != owner_id {
-            return Err(StoreError::PullRequestDenied);
-        }
+        let owner_id = active_namespace_id(&transaction, owner)?;
+        authorize_namespace_maintainer(&transaction, owner_id, actor).map_err(|error| {
+            if matches!(error, StoreError::OrganizationDenied) {
+                StoreError::PullRequestDenied
+            } else {
+                error
+            }
+        })?;
         let result = transaction.execute(
             "UPDATE repository SET slug = ?3
-             WHERE owner_account_id = ?1 AND slug = ?2 AND state = 'active'",
+             WHERE owner_namespace_id = ?1 AND slug = ?2 AND state = 'active'",
             rusqlite::params![owner_id, old_slug, new_slug],
         );
         match result {
@@ -2005,15 +2353,18 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owner_id = active_account_id(&transaction, owner)?;
-        let actor_id = active_account_id(&transaction, actor)?;
-        if actor_id != owner_id {
-            return Err(StoreError::PullRequestDenied);
-        }
+        let owner_id = active_namespace_id(&transaction, owner)?;
+        authorize_namespace_maintainer(&transaction, owner_id, actor).map_err(|error| {
+            if matches!(error, StoreError::OrganizationDenied) {
+                StoreError::PullRequestDenied
+            } else {
+                error
+            }
+        })?;
         let changed = transaction.execute(
             "UPDATE repository
              SET state = 'active', archived_at = NULL
-             WHERE owner_account_id = ?1 AND slug = ?2 AND state = 'archived'",
+             WHERE owner_namespace_id = ?1 AND slug = ?2 AND state = 'archived'",
             rusqlite::params![owner_id, slug],
         )?;
         if changed != 1 {
@@ -2041,21 +2392,30 @@ impl Store {
         username: Option<&str>,
     ) -> Result<RepositoryAuthorizationRecord, StoreError> {
         let result = self.connection.query_row(
-            "SELECT repository.id, owner.username, repository.slug,
+            "SELECT repository.id, owner.slug, repository.slug,
                     repository.visibility, repository.state, repository.object_format,
                     repository.created_at, repository.archived_at,
                     CASE
                         WHEN actor.state != 'active' THEN NULL
-                        WHEN actor.id = repository.owner_account_id THEN 'owner'
-                        ELSE repository_collaborator.role
+                        WHEN owner.account_id = actor.id THEN 'owner'
+                        WHEN organization_member.role = 'owner' THEN 'owner'
+                        WHEN organization_member.role = 'maintainer'
+                          OR repository_collaborator.role = 'maintainer' THEN 'maintainer'
+                        WHEN organization_member.role = 'writer'
+                          OR repository_collaborator.role = 'writer' THEN 'writer'
+                        WHEN organization_member.role = 'reader'
+                          OR repository_collaborator.role = 'reader' THEN 'reader'
                     END
              FROM repository
-             JOIN account AS owner ON owner.id = repository.owner_account_id
+             JOIN namespace AS owner ON owner.id = repository.owner_namespace_id
              LEFT JOIN account AS actor ON actor.username = ?3
              LEFT JOIN repository_collaborator
                ON repository_collaborator.repository_id = repository.id
               AND repository_collaborator.account_id = actor.id
-             WHERE owner.username = ?1 AND repository.slug = ?2",
+             LEFT JOIN organization_member
+               ON organization_member.organization_id = owner.id
+              AND organization_member.account_id = actor.id
+             WHERE owner.slug = ?1 AND repository.slug = ?2",
             rusqlite::params![owner, slug, username],
             |row| {
                 Ok(RepositoryAuthorizationRecord {
@@ -3475,14 +3835,19 @@ impl Store {
         let query_limit = i64::try_from(query_limit).map_err(|_| StoreError::EventLimit)?;
         let mut statement = self.connection.prepare(
             "WITH visible_repository AS (
-                 SELECT repository.id, owner.username AS owner, repository.slug
+                 SELECT repository.id, owner.slug AS owner, repository.slug
                  FROM repository
-                 JOIN account AS owner ON owner.id = repository.owner_account_id
+                 JOIN namespace AS owner ON owner.id = repository.owner_namespace_id
                  LEFT JOIN account AS actor
                    ON actor.username = ?1 AND actor.state = 'active'
                  WHERE repository.state = 'active'
                    AND (repository.visibility = 'public'
-                        OR repository.owner_account_id = actor.id
+                        OR owner.account_id = actor.id
+                        OR EXISTS (
+                            SELECT 1 FROM organization_member
+                            WHERE organization_member.organization_id = owner.id
+                              AND organization_member.account_id = actor.id
+                        )
                         OR EXISTS (
                             SELECT 1 FROM repository_collaborator
                             WHERE repository_collaborator.repository_id = repository.id
@@ -3519,12 +3884,12 @@ impl Store {
 
     pub(crate) fn all_repositories(&self) -> Result<Vec<RepositoryRecord>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT repository.id, account.username, repository.slug,
+            "SELECT repository.id, namespace.slug, repository.slug,
                     repository.visibility, repository.state, repository.object_format,
                     repository.created_at, repository.archived_at
              FROM repository
-             JOIN account ON account.id = repository.owner_account_id
-             ORDER BY account.username, repository.slug",
+             JOIN namespace ON namespace.id = repository.owner_namespace_id
+             ORDER BY namespace.slug, repository.slug",
         )?;
         statement
             .query_map([], repository_from_row)?
@@ -3691,12 +4056,12 @@ impl Store {
         slug: &str,
     ) -> Result<RepositoryRecord, StoreError> {
         let result = self.connection.query_row(
-            "SELECT repository.id, account.username, repository.slug,
+            "SELECT repository.id, namespace.slug, repository.slug,
                     repository.visibility, repository.state, repository.object_format,
                     repository.created_at, repository.archived_at
              FROM repository
-             JOIN account ON account.id = repository.owner_account_id
-             WHERE account.username = ?1 AND repository.slug = ?2
+             JOIN namespace ON namespace.id = repository.owner_namespace_id
+             WHERE namespace.slug = ?1 AND repository.slug = ?2
                AND repository.visibility = 'public' AND repository.state = 'active'",
             rusqlite::params![owner, slug],
             repository_from_row,
@@ -3754,20 +4119,27 @@ impl Store {
     ) -> Result<Vec<HomeRepositoryRecord>, StoreError> {
         let limit = i64::try_from(limit).expect("the home repository limit fits in SQLite");
         let mut statement = self.connection.prepare(
-            "SELECT account.username, repository.slug, repository.visibility, repository.state,
+            "SELECT namespace.slug, repository.slug, repository.visibility, repository.state,
                     COALESCE(repository_profile.description, ''),
                     COALESCE(MAX(repository_event.created_at), repository.created_at)
              FROM repository
-             JOIN account ON account.id = repository.owner_account_id
+             JOIN namespace ON namespace.id = repository.owner_namespace_id
+             LEFT JOIN account AS actor
+               ON actor.username = ?1 AND actor.state = 'active'
+             LEFT JOIN organization_member
+               ON organization_member.organization_id = namespace.id
+              AND organization_member.account_id = actor.id
              LEFT JOIN repository_profile ON repository_profile.repository_id = repository.id
              LEFT JOIN repository_event ON repository_event.repository_id = repository.id
              WHERE ((?1 IS NULL AND repository.visibility = 'public'
                      AND repository.state = 'active')
-                    OR account.username = ?1)
-             GROUP BY repository.id, account.username, repository.slug,
+                    OR (?1 IS NOT NULL
+                        AND (namespace.account_id = actor.id
+                             OR organization_member.account_id = actor.id)))
+             GROUP BY repository.id, namespace.slug, repository.slug,
                       repository.visibility, repository.state, repository_profile.description,
                       repository.created_at
-             ORDER BY 6 DESC, account.username, repository.slug
+             ORDER BY 6 DESC, namespace.slug, repository.slug
              LIMIT ?2",
         )?;
         statement
@@ -3796,7 +4168,11 @@ impl Store {
                     username: row.get(0)?,
                     bio: row.get(1)?,
                     contact_email: row.get(2)?,
+                    organizations: Vec::new(),
                     repositories: Vec::new(),
+                    activity_start_day: 0,
+                    activity_current_day: 0,
+                    activity: Vec::new(),
                     page: 1,
                     has_next: false,
                 })
@@ -3810,17 +4186,39 @@ impl Store {
             Err(error) => return Err(error.into()),
         };
         let mut statement = self.connection.prepare(
-            "SELECT account.username, repository.slug, repository.visibility, repository.state,
+            "SELECT namespace.slug, organization.display_name, organization_member.role
+             FROM organization_member
+             JOIN account ON account.id = organization_member.account_id
+             JOIN organization
+               ON organization.namespace_id = organization_member.organization_id
+             JOIN namespace ON namespace.id = organization.namespace_id
+             WHERE account.username = ?1
+               AND account.state = 'active'
+               AND organization.state = 'active'
+             ORDER BY namespace.slug
+             LIMIT 100",
+        )?;
+        profile.organizations = statement
+            .query_map([username], |row| {
+                Ok(AccountOrganizationRecord {
+                    slug: row.get(0)?,
+                    display_name: row.get(1)?,
+                    role: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut statement = self.connection.prepare(
+            "SELECT namespace.slug, repository.slug, repository.visibility, repository.state,
                     COALESCE(repository_profile.description, ''),
                     COALESCE(MAX(repository_event.created_at), repository.created_at)
              FROM repository
-             JOIN account ON account.id = repository.owner_account_id
+             JOIN namespace ON namespace.id = repository.owner_namespace_id
              LEFT JOIN repository_profile ON repository_profile.repository_id = repository.id
              LEFT JOIN repository_event ON repository_event.repository_id = repository.id
-             WHERE account.username = ?1
+             WHERE namespace.slug = ?1
                AND repository.state = 'active'
                AND repository.visibility = 'public'
-             GROUP BY repository.id, account.username, repository.slug,
+             GROUP BY repository.id, namespace.slug, repository.slug,
                       repository.visibility, repository.state, repository_profile.description,
                       repository.created_at
              ORDER BY 6 DESC, repository.slug
@@ -3841,6 +4239,42 @@ impl Store {
         Ok(profile)
     }
 
+    pub(crate) fn public_activity_days(
+        &self,
+        username: &str,
+        start_day: i64,
+        current_day: i64,
+    ) -> Result<Vec<ActivityDayRecord>, StoreError> {
+        let start = start_day
+            .checked_mul(86_400)
+            .ok_or(StoreError::EventLimit)?;
+        let end = current_day
+            .checked_add(1)
+            .and_then(|day| day.checked_mul(86_400))
+            .ok_or(StoreError::EventLimit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT repository_event.created_at / 86400, count(*)
+             FROM repository_event
+             JOIN repository ON repository.id = repository_event.repository_id
+             WHERE repository_event.actor = ?1
+               AND repository_event.created_at >= ?2
+               AND repository_event.created_at < ?3
+               AND repository.visibility = 'public'
+               AND repository.state = 'active'
+             GROUP BY repository_event.created_at / 86400
+             ORDER BY repository_event.created_at / 86400",
+        )?;
+        statement
+            .query_map(rusqlite::params![username, start, end], |row| {
+                Ok(ActivityDayRecord {
+                    day: row.get(0)?,
+                    count: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub(crate) fn public_profile_page(
         &self,
         username: &str,
@@ -3856,17 +4290,17 @@ impl Store {
             .map_err(|_| StoreError::EventLimit)?;
         let offset = i64::try_from(offset).map_err(|_| StoreError::EventLimit)?;
         let mut statement = self.connection.prepare(
-            "SELECT account.username, repository.slug, repository.visibility, repository.state,
+            "SELECT namespace.slug, repository.slug, repository.visibility, repository.state,
                     COALESCE(repository_profile.description, ''),
                     COALESCE(MAX(repository_event.created_at), repository.created_at)
              FROM repository
-             JOIN account ON account.id = repository.owner_account_id
+             JOIN namespace ON namespace.id = repository.owner_namespace_id
              LEFT JOIN repository_profile ON repository_profile.repository_id = repository.id
              LEFT JOIN repository_event ON repository_event.repository_id = repository.id
-             WHERE account.username = ?1
+             WHERE namespace.slug = ?1
                AND repository.state = 'active'
                AND repository.visibility = 'public'
-             GROUP BY repository.id, account.username, repository.slug,
+             GROUP BY repository.id, namespace.slug, repository.slug,
                       repository.visibility, repository.state, repository_profile.description,
                       repository.created_at
              ORDER BY 6 DESC, repository.slug
@@ -3918,7 +4352,7 @@ impl Store {
         limit: usize,
     ) -> Result<(RepositoryRecord, Vec<RepositoryEventRecord>), StoreError> {
         let repository = self.public_repository(owner, slug)?;
-        self.repository_events_for(repository, before, limit, false)
+        self.repository_events_for(repository, before, limit, None)
     }
 
     pub(crate) fn repository_events(
@@ -3929,7 +4363,7 @@ impl Store {
         limit: usize,
     ) -> Result<(RepositoryRecord, Vec<RepositoryEventRecord>), StoreError> {
         let repository = self.repository(owner, slug)?;
-        self.repository_events_for(repository, before, limit, false)
+        self.repository_events_for(repository, before, limit, None)
     }
 
     pub(crate) fn repository_issue_events(
@@ -3940,7 +4374,18 @@ impl Store {
         limit: usize,
     ) -> Result<(RepositoryRecord, Vec<RepositoryEventRecord>), StoreError> {
         let repository = self.repository(owner, slug)?;
-        self.repository_events_for(repository, before, limit, true)
+        self.repository_events_for(repository, before, limit, Some("issue"))
+    }
+
+    pub(crate) fn repository_pull_request_events(
+        &self,
+        owner: &str,
+        slug: &str,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<(RepositoryRecord, Vec<RepositoryEventRecord>), StoreError> {
+        let repository = self.repository(owner, slug)?;
+        self.repository_events_for(repository, before, limit, Some("pull-request"))
     }
 
     fn repository_events_for(
@@ -3948,7 +4393,7 @@ impl Store {
         repository: RepositoryRecord,
         before: Option<i64>,
         limit: usize,
-        issues_only: bool,
+        event_kind_prefix: Option<&str>,
     ) -> Result<(RepositoryRecord, Vec<RepositoryEventRecord>), StoreError> {
         let limit = i64::try_from(limit).map_err(|_| StoreError::EventLimit)?;
         let mut statement = self.connection.prepare(
@@ -3956,13 +4401,13 @@ impl Store {
                     payload_version, payload, created_at
              FROM repository_event
              WHERE repository_id = ?1 AND (?2 IS NULL OR sequence < ?2)
-               AND (?4 = 0 OR kind LIKE 'issue-%')
+               AND (?4 IS NULL OR kind LIKE ?4 || '-%')
              ORDER BY sequence DESC
              LIMIT ?3",
         )?;
         let events = statement
             .query_map(
-                rusqlite::params![repository.id, before, limit, issues_only],
+                rusqlite::params![repository.id, before, limit, event_kind_prefix],
                 |row| {
                     Ok(RepositoryEventRecord {
                         event_id: row.get(0)?,
@@ -4192,6 +4637,41 @@ pub(crate) struct PublicProfile {
     pub(crate) username: String,
     pub(crate) bio: String,
     pub(crate) contact_email: String,
+    pub(crate) organizations: Vec<AccountOrganizationRecord>,
+    pub(crate) repositories: Vec<HomeRepositoryRecord>,
+    pub(crate) activity_start_day: i64,
+    pub(crate) activity_current_day: i64,
+    pub(crate) activity: Vec<ActivityDayRecord>,
+    pub(crate) page: usize,
+    pub(crate) has_next: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ActivityDayRecord {
+    pub(crate) day: i64,
+    pub(crate) count: i64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct AccountOrganizationRecord {
+    pub(crate) slug: String,
+    pub(crate) display_name: String,
+    pub(crate) role: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct OrganizationMemberRecord {
+    pub(crate) username: String,
+    pub(crate) role: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct OrganizationProfile {
+    pub(crate) slug: String,
+    pub(crate) display_name: String,
+    pub(crate) description: String,
+    pub(crate) created_at: i64,
+    pub(crate) members: Vec<OrganizationMemberRecord>,
     pub(crate) repositories: Vec<HomeRepositoryRecord>,
     pub(crate) page: usize,
     pub(crate) has_next: bool,
@@ -4802,22 +5282,31 @@ fn repository_issue_access(
     actor: Option<&str>,
 ) -> Result<RepositoryIssueAccess, StoreError> {
     let result = connection.query_row(
-        "SELECT repository.id, owner.username, repository.slug,
+        "SELECT repository.id, owner.slug, repository.slug,
                 repository.visibility, repository.state, repository.object_format,
                 repository.created_at, repository.archived_at,
                 CASE WHEN actor.state = 'active' THEN actor.id END,
                 CASE
                     WHEN actor.state != 'active' THEN NULL
-                    WHEN actor.id = repository.owner_account_id THEN 'owner'
-                    ELSE repository_collaborator.role
+                    WHEN owner.account_id = actor.id THEN 'owner'
+                    WHEN organization_member.role = 'owner' THEN 'owner'
+                    WHEN organization_member.role = 'maintainer'
+                      OR repository_collaborator.role = 'maintainer' THEN 'maintainer'
+                    WHEN organization_member.role = 'writer'
+                      OR repository_collaborator.role = 'writer' THEN 'writer'
+                    WHEN organization_member.role = 'reader'
+                      OR repository_collaborator.role = 'reader' THEN 'reader'
                 END
          FROM repository
-         JOIN account AS owner ON owner.id = repository.owner_account_id
+         JOIN namespace AS owner ON owner.id = repository.owner_namespace_id
          LEFT JOIN account AS actor ON actor.username = ?3
          LEFT JOIN repository_collaborator
            ON repository_collaborator.repository_id = repository.id
           AND repository_collaborator.account_id = actor.id
-         WHERE owner.username = ?1 AND repository.slug = ?2",
+         LEFT JOIN organization_member
+           ON organization_member.organization_id = owner.id
+          AND organization_member.account_id = actor.id
+         WHERE owner.slug = ?1 AND repository.slug = ?2",
         rusqlite::params![owner, repository, actor],
         |row| {
             Ok(RepositoryIssueAccess {
@@ -4992,7 +5481,7 @@ fn activity_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActivityEventR
     })
 }
 
-const ACTIVITY_SELECT: &str = "SELECT repository.id, owner.username, repository.slug,
+const ACTIVITY_SELECT: &str = "SELECT repository.id, owner.slug, repository.slug,
             repository.visibility, repository.state, repository.object_format,
             repository.created_at, repository.archived_at,
             repository_event.event_id, repository_event.sequence,
@@ -5002,7 +5491,7 @@ const ACTIVITY_SELECT: &str = "SELECT repository.id, owner.username, repository.
             repository_event.created_at
      FROM repository_event
      JOIN repository ON repository.id = repository_event.repository_id
-     JOIN account AS owner ON owner.id = repository.owner_account_id";
+     JOIN namespace AS owner ON owner.id = repository.owner_namespace_id";
 
 fn watched_activity_events(
     connection: &Connection,
@@ -5015,7 +5504,12 @@ fn watched_activity_events(
            ON watch.repository_id = repository.id AND watch.account_id = ?1
          WHERE repository.state = 'active'
            AND (repository.visibility = 'public'
-                OR repository.owner_account_id = ?1
+                OR owner.account_id = ?1
+                OR EXISTS (
+                    SELECT 1 FROM organization_member
+                    WHERE organization_member.organization_id = owner.id
+                      AND organization_member.account_id = ?1
+                )
                 OR EXISTS (
                     SELECT 1 FROM repository_collaborator
                     WHERE repository_collaborator.repository_id = repository.id
@@ -5501,6 +5995,162 @@ fn active_account_id(connection: &Connection, username: &str) -> Result<i64, Sto
     }
 }
 
+fn verify_foreign_keys(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = statement.query([])?;
+    if let Some(row) = rows.next()? {
+        let table: String = row.get(0)?;
+        return Err(StoreError::Integrity(format!(
+            "foreign key violation in table {table}"
+        )));
+    }
+    Ok(())
+}
+
+fn active_namespace_id(connection: &Connection, slug: &str) -> Result<i64, StoreError> {
+    let result = connection.query_row(
+        "SELECT namespace.id
+         FROM namespace
+         LEFT JOIN account ON account.id = namespace.account_id
+         LEFT JOIN organization ON organization.namespace_id = namespace.id
+         WHERE namespace.slug = ?1
+           AND (
+               (namespace.kind = 'account' AND account.state = 'active')
+               OR (namespace.kind = 'organization' AND organization.state = 'active')
+           )",
+        [slug],
+        |row| row.get(0),
+    );
+    match result {
+        Ok(id) => Ok(id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            Err(StoreError::NamespaceNotFound(slug.to_owned()))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn active_organization_id(connection: &Connection, slug: &str) -> Result<i64, StoreError> {
+    connection
+        .query_row(
+            "SELECT namespace.id
+             FROM namespace
+             JOIN organization ON organization.namespace_id = namespace.id
+             WHERE namespace.slug = ?1 AND organization.state = 'active'",
+            [slug],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NamespaceNotFound(slug.to_owned()))
+}
+
+fn namespace_account_id(
+    connection: &Connection,
+    namespace_id: i64,
+) -> Result<Option<i64>, StoreError> {
+    connection
+        .query_row(
+            "SELECT account_id FROM namespace WHERE id = ?1",
+            [namespace_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn authorize_namespace_maintainer(
+    connection: &Connection,
+    namespace_id: i64,
+    actor: &str,
+) -> Result<(), StoreError> {
+    if actor == "admin-cli" {
+        return Ok(());
+    }
+    let actor_id = active_account_id(connection, actor)?;
+    let authorized: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM namespace
+             LEFT JOIN organization_member
+               ON organization_member.organization_id = namespace.id
+              AND organization_member.account_id = ?2
+             WHERE namespace.id = ?1
+               AND (
+                   namespace.account_id = ?2
+                   OR organization_member.role IN ('owner', 'maintainer')
+               )
+         )",
+        rusqlite::params![namespace_id, actor_id],
+        |row| row.get(0),
+    )?;
+    if authorized {
+        Ok(())
+    } else {
+        Err(StoreError::OrganizationDenied)
+    }
+}
+
+fn authorize_organization_owner(
+    connection: &Connection,
+    organization_id: i64,
+    actor: &str,
+) -> Result<(), StoreError> {
+    if actor == "admin-cli" {
+        return Ok(());
+    }
+    let actor_id = active_account_id(connection, actor)?;
+    let authorized: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM organization_member
+             WHERE organization_id = ?1
+               AND account_id = ?2
+               AND role = 'owner'
+         )",
+        rusqlite::params![organization_id, actor_id],
+        |row| row.get(0),
+    )?;
+    if authorized {
+        Ok(())
+    } else {
+        Err(StoreError::OrganizationDenied)
+    }
+}
+
+fn require_other_organization_owner(
+    connection: &Connection,
+    organization_id: i64,
+    account_id: i64,
+) -> Result<(), StoreError> {
+    let role: Option<String> = connection
+        .query_row(
+            "SELECT role
+             FROM organization_member
+             WHERE organization_id = ?1 AND account_id = ?2",
+            rusqlite::params![organization_id, account_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if role.as_deref() != Some("owner") {
+        return Ok(());
+    }
+    let other_owner: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM organization_member
+             WHERE organization_id = ?1
+               AND account_id != ?2
+               AND role = 'owner'
+         )",
+        rusqlite::params![organization_id, account_id],
+        |row| row.get(0),
+    )?;
+    if other_owner {
+        Ok(())
+    } else {
+        Err(StoreError::LastOrganizationOwner)
+    }
+}
+
 fn repository_state_error(
     transaction: &rusqlite::Transaction<'_>,
     owner_id: i64,
@@ -5508,7 +6158,7 @@ fn repository_state_error(
     slug: &str,
 ) -> Result<StoreError, StoreError> {
     let state = transaction.query_row(
-        "SELECT state FROM repository WHERE owner_account_id = ?1 AND slug = ?2",
+        "SELECT state FROM repository WHERE owner_namespace_id = ?1 AND slug = ?2",
         rusqlite::params![owner_id, slug],
         |row| row.get::<_, String>(0),
     );
@@ -5536,6 +6186,17 @@ fn repository_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryRe
         object_format: row.get(5)?,
         created_at: row.get(6)?,
         archived_at: row.get(7)?,
+    })
+}
+
+fn home_repository_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HomeRepositoryRecord> {
+    Ok(HomeRepositoryRecord {
+        owner: row.get(0)?,
+        slug: row.get(1)?,
+        visibility: row.get(2)?,
+        state: row.get(3)?,
+        description: row.get(4)?,
+        updated_at: row.get(5)?,
     })
 }
 

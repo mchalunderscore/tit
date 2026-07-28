@@ -52,6 +52,17 @@ impl RepositoryService {
         self.create(actor, actor, slug, object_format, correlation_id)
     }
 
+    pub(crate) fn create_for_namespace(
+        &self,
+        actor: &str,
+        owner: &str,
+        slug: &str,
+        object_format: Kind,
+        correlation_id: &str,
+    ) -> Result<RepositoryRecord, RepositoryServiceError> {
+        self.create(actor, owner, slug, object_format, correlation_id)
+    }
+
     pub(crate) fn home(
         &self,
         owner: Option<&str>,

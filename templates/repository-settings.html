@@ -7,7 +7,8 @@
 {% include "repository-nav.html" %}
   </header>
 
-  <div class="two-column">
+  <div class="settings-lanes">
+    <div class="settings-lane">
     <section>
       <h2>Repository settings</h2>
       <form method="post" action="/{{ owner }}/{{ repository }}/settings/general">
@@ -44,6 +45,22 @@
       {% endif %}
     </section>
 
+{% if is_owner %}
+    <section>
+      <h2>Rename repository</h2>
+      <form method="post" action="/{{ owner }}/{{ repository }}/settings/rename">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <div class="field">
+          <label for="new-name">New repository name</label>
+          <input id="new-name" name="new-name" value="{{ repository }}" maxlength="100" required>
+        </div>
+        <button type="submit">Rename repository</button>
+      </form>
+    </section>
+{% endif %}
+    </div>
+
+    <div class="settings-lane">
     <section>
       <h2>Collaborators</h2>
 {% if collaborators.is_empty() %}
@@ -80,32 +97,19 @@
         <button type="submit" name="action" value="set">Set collaborator</button>
       </form>
     </section>
+
+    <section>
+      <h2>Archive repository</h2>
+      <form method="post" action="/{{ owner }}/{{ repository }}/settings/archive">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <fieldset class="confirmation">
+          <legend>Archive this repository?</legend>
+          <label><input type="radio" name="confirm" value="no" checked> No</label>
+          <label><input type="radio" name="confirm" value="yes"> Yes</label>
+        </fieldset>
+        <button class="danger-action" type="submit">Archive repository</button>
+      </form>
+    </section>
+    </div>
   </div>
-
-{% if is_owner %}
-  <section>
-    <h2>Rename repository</h2>
-    <form method="post" action="/{{ owner }}/{{ repository }}/settings/rename">
-      <input type="hidden" name="csrf" value="{{ csrf }}">
-      <div class="field">
-        <label for="new-name">New repository name</label>
-        <input id="new-name" name="new-name" value="{{ repository }}" maxlength="100" required>
-      </div>
-      <button type="submit">Rename repository</button>
-    </form>
-  </section>
-{% endif %}
-
-  <section>
-    <h2>Archive repository</h2>
-    <form method="post" action="/{{ owner }}/{{ repository }}/settings/archive">
-      <input type="hidden" name="csrf" value="{{ csrf }}">
-      <fieldset class="confirmation">
-        <legend>Archive this repository?</legend>
-        <label><input type="radio" name="confirm" value="no" checked> No</label>
-        <label><input type="radio" name="confirm" value="yes"> Yes</label>
-      </fieldset>
-      <button class="danger-action" type="submit">Archive repository</button>
-    </form>
-  </section>
 {% endblock %}

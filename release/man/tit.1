@@ -1,4 +1,4 @@
-.TH TIT 1 "2026-07-24" "tit 0.1.0" "User Commands"
+.TH TIT 1 "2026-07-28" "tit 0.2.0" "User Commands"
 .SH NAME
 tit \- run a small self-hosted collaborative development environment
 .SH SYNOPSIS
@@ -78,7 +78,7 @@ Restore an archive to an empty private directory.
 Create the initial administrator.
 .TP
 .B admin
-Run an offline account, repository, or audit command.
+Run an offline account, organization, repository, or audit command.
 .SH SSH INTERFACE
 Run
 .B ssh -p 2222 tit.example help
@@ -91,6 +91,9 @@ The SSH server accepts these collaboration commands:
 .nf
 auth ONE-TIME-SECRET
 repo create NAME [--output human|json]
+org create NAME DISPLAY_NAME [--output human|json]
+org member set ORGANIZATION USER owner|maintainer|writer|reader [--output human|json]
+org member remove ORGANIZATION USER [--output human|json]
 issue list OWNER/REPOSITORY [--output human|json]
 issue create OWNER/REPOSITORY [--output human|json]
 issue comment OWNER/REPOSITORY NUMBER [--output human|json]
@@ -104,11 +107,15 @@ pr checkout OWNER/REPOSITORY NUMBER [--output human|json]
 .fi
 .SH WEB INTERFACE
 The Web interface does not require JavaScript.
-It provides account SSH key management, repository settings, issues, pull
-requests, watched repository activity, RSS feeds, and public profiles.
+It provides account SSH key management, organization namespaces, repository
+settings, issues, pull requests, watched repository activity, RSS feeds, and
+public profiles.
 Commit and pull-request revision pages provide patch downloads that work with
 .BR "git apply" .
 Repository owners can rename and unarchive repositories.
+Organization owners can create repositories in their organizations.
+They can edit the organization display name and description.
+An account profile lists the active organizations of that account.
 .SH FILES
 .TP
 .B /srv/tit/config.toml

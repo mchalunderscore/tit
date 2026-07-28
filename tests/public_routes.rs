@@ -55,6 +55,62 @@ async fn renders_and_mutates_a_public_issue_without_javascript() {
             .contains("This repository has no issues.")
     );
     assert!(!anonymous_issues.text().contains("Create an issue</h2>"));
+    assert!(
+        anonymous_issues
+            .text()
+            .contains("href=\"/alice/example/issues/rss.xml\"")
+    );
+    let issue_feed = request(
+        server.address(),
+        "GET",
+        "/alice/example/issues/rss.xml",
+        &[],
+        &[],
+    )
+    .await;
+    assert_eq!(issue_feed.status, 200);
+    assert_eq!(
+        issue_feed.header("content-type"),
+        "application/rss+xml; charset=utf-8"
+    );
+    assert!(
+        issue_feed
+            .text()
+            .contains("<title>alice/example issues</title>")
+    );
+    assert!(issue_feed.text().contains(
+        "<atom:link rel=\"self\" href=\"https://tit.example/alice/example/issues/rss.xml\" />"
+    ));
+
+    let pull_requests = request(server.address(), "GET", "/alice/example/pulls", &[], &[]).await;
+    assert_eq!(pull_requests.status, 200);
+    assert!(
+        pull_requests
+            .text()
+            .contains("href=\"/alice/example/pulls/rss.xml\"")
+    );
+    let pull_request_feed = request(
+        server.address(),
+        "GET",
+        "/alice/example/pulls/rss.xml",
+        &[],
+        &[],
+    )
+    .await;
+    assert_eq!(pull_request_feed.status, 200);
+    assert_eq!(
+        pull_request_feed.header("content-type"),
+        "application/rss+xml; charset=utf-8"
+    );
+    assert!(
+        pull_request_feed
+            .text()
+            .contains("<title>alice/example pull requests</title>")
+    );
+    assert!(pull_request_feed.text().contains(
+        "<atom:link rel=\"self\" href=\"https://tit.example/alice/example/pulls/rss.xml\" />"
+    ));
+    assert!(!pull_request_feed.text().contains("Repository imported"));
 
     let token = "11".repeat(32);
     let csrf = "22".repeat(32);
@@ -64,6 +120,193 @@ async fn renders_and_mutates_a_public_issue_without_javascript() {
         ("Content-Type", "application/x-www-form-urlencoded"),
         ("Cookie", cookie.as_str()),
     ];
+    let organization_profile = request(server.address(), "GET", "/acme", &[], &[]).await;
+    assert_eq!(organization_profile.status, 200);
+    assert!(
+        organization_profile
+            .text()
+            .contains("<h1 id=\"profile-heading\">Acme Organization</h1>")
+    );
+    assert!(organization_profile.text().contains("alice</a> · owner"));
+    assert!(!organization_profile.text().contains("Edit organization"));
+    assert!(!organization_profile.text().contains("Add or update member"));
+    let account_profile = request(server.address(), "GET", "/alice", &[], &[]).await;
+    assert_eq!(account_profile.status, 200);
+    assert!(
+        account_profile
+            .text()
+            .contains("<a href=\"/acme\">Acme Organization</a> · owner")
+    );
+    assert!(
+        account_profile
+            .text()
+            .contains("<h2 id=\"activity-heading\">Activity</h2>")
+    );
+    assert!(
+        account_profile
+            .text()
+            .contains("0 active days in the past year")
+    );
+    let account = request(
+        server.address(),
+        "GET",
+        "/account",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    )
+    .await;
+    assert_eq!(account.status, 200);
+    assert!(!account.text().contains("<h2>Create repository</h2>"));
+    assert!(account.text().contains("<strong>Feeds</strong>"));
+    assert!(account.text().contains("<strong>Sessions</strong>"));
+    assert!(
+        account
+            .text()
+            .contains("href=\"/new\" aria-label=\"Create\"")
+    );
+    let create_page = request(
+        server.address(),
+        "GET",
+        "/new",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    )
+    .await;
+    assert_eq!(create_page.status, 200);
+    assert!(create_page.text().contains("href=\"/new/repository\""));
+    assert!(create_page.text().contains("href=\"/new/organization\""));
+    let repository_page = request(
+        server.address(),
+        "GET",
+        "/new/repository",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    )
+    .await;
+    assert_eq!(repository_page.status, 200);
+    assert!(
+        repository_page
+            .text()
+            .contains("<option value=\"acme\">acme</option>")
+    );
+    assert!(
+        repository_page
+            .text()
+            .contains("<h1>Create repository</h1>")
+    );
+    let organization_page = request(
+        server.address(),
+        "GET",
+        "/new/organization",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    )
+    .await;
+    assert_eq!(organization_page.status, 200);
+    assert!(
+        organization_page
+            .text()
+            .contains("<h1>Create organization</h1>")
+    );
+    let organization = form(&[
+        ("csrf", &csrf),
+        ("name", "tools"),
+        ("display-name", "Tools"),
+        ("description", "Shared tools."),
+    ]);
+    let created_organization = request(
+        server.address(),
+        "POST",
+        "/organizations",
+        &headers,
+        organization.as_bytes(),
+    )
+    .await;
+    assert_eq!(created_organization.status, 303);
+    assert_eq!(created_organization.header("location"), "/tools");
+    let managed_organization = request(
+        server.address(),
+        "GET",
+        "/acme",
+        &[("Cookie", cookie.as_str())],
+        &[],
+    )
+    .await;
+    assert_eq!(managed_organization.status, 200);
+    assert!(
+        managed_organization
+            .text()
+            .contains("<h2>Edit organization</h2>")
+    );
+    assert!(managed_organization.text().contains("Add or update member"));
+    let member = form(&[("csrf", &csrf), ("username", "bob"), ("role", "writer")]);
+    let member_set = request(
+        server.address(),
+        "POST",
+        "/organizations/acme/members",
+        &headers,
+        member.as_bytes(),
+    )
+    .await;
+    assert_eq!(member_set.status, 303);
+    let bob_profile = request(server.address(), "GET", "/bob", &[], &[]).await;
+    assert!(
+        bob_profile
+            .text()
+            .contains("<a href=\"/acme\">Acme Organization</a> · writer")
+    );
+    let profile_update = form(&[
+        ("csrf", &csrf),
+        ("display-name", "Acme Cooperative"),
+        ("description", "A changed organization profile."),
+    ]);
+    let updated_organization = request(
+        server.address(),
+        "POST",
+        "/organizations/acme/profile",
+        &headers,
+        profile_update.as_bytes(),
+    )
+    .await;
+    assert_eq!(updated_organization.status, 303);
+    assert_eq!(updated_organization.header("location"), "/acme");
+    let organization_profile = request(server.address(), "GET", "/acme", &[], &[]).await;
+    assert!(organization_profile.text().contains("Acme Cooperative"));
+    assert!(
+        organization_profile
+            .text()
+            .contains("A changed organization profile.")
+    );
+    let organization_repository = form(&[
+        ("csrf", &csrf),
+        ("owner", "acme"),
+        ("name", "organization-project"),
+    ]);
+    let created_repository = request(
+        server.address(),
+        "POST",
+        "/account/repositories",
+        &headers,
+        organization_repository.as_bytes(),
+    )
+    .await;
+    assert_eq!(created_repository.status, 303);
+    assert_eq!(
+        created_repository.header("location"),
+        "/acme/organization-project"
+    );
+    assert_eq!(
+        request(
+            server.address(),
+            "GET",
+            "/acme/organization-project",
+            &[],
+            &[],
+        )
+        .await
+        .status,
+        200
+    );
 
     let rejected = form(&[
         ("csrf", &"33".repeat(32)),
@@ -111,6 +354,13 @@ async fn renders_and_mutates_a_public_issue_without_javascript() {
     assert!(detail.text().contains("#1 No JavaScript workflow"));
     assert!(detail.text().contains("<strong>safe</strong>"));
     assert!(!detail.text().to_ascii_lowercase().contains("<script"));
+    let active_profile = request(server.address(), "GET", "/alice", &[], &[]).await;
+    assert!(
+        active_profile
+            .text()
+            .contains("1 active day in the past year")
+    );
+    assert!(active_profile.text().contains("activity-level-2"));
 
     Store::open(&database)
         .expect("open the repository database")
@@ -137,6 +387,12 @@ async fn renders_and_mutates_a_public_issue_without_javascript() {
         .await
         .status,
         200
+    );
+    let private_profile = request(server.address(), "GET", "/alice", &[], &[]).await;
+    assert!(
+        private_profile
+            .text()
+            .contains("1 active day in the past year")
     );
 
     server.shutdown().await.expect("stop the public Web server");
@@ -232,6 +488,15 @@ impl Fixture {
             })
             .expect("create the repository owner");
         store
+            .connection()
+            .execute(
+                "INSERT INTO account
+                 (username, is_administrator, state, created_at)
+                 VALUES ('bob', 0, 'active', 1)",
+                [],
+            )
+            .expect("create an organization member");
+        store
             .create_repository(&NewRepository {
                 id: repository_id,
                 owner: "alice",
@@ -245,6 +510,16 @@ impl Fixture {
                 correlation_id: "test-import",
             })
             .expect("create the repository record");
+        store
+            .create_organization(
+                "acme",
+                "Acme Organization",
+                "A shared namespace.",
+                "alice",
+                3,
+                "create-organization",
+            )
+            .expect("create the organization");
 
         Self { instance }
     }

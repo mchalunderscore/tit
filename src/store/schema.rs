@@ -1,6 +1,6 @@
-pub(super) const VERSION: i64 = 24;
+pub(super) const VERSION: i64 = 26;
 
-pub(super) const MIGRATIONS: [&str; 24] = [
+pub(super) const MIGRATIONS: [&str; 26] = [
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_state.sql"),
     include_str!("migrations/003_git_intents.sql"),
@@ -25,4 +25,6 @@ pub(super) const MIGRATIONS: [&str; 24] = [
     include_str!("migrations/022_account_key_management.sql"),
     include_str!("migrations/023_default_branch.sql"),
     include_str!("migrations/024_default_branch_intents.sql"),
+    include_str!("migrations/025_organizations.sql"),
+    include_str!("migrations/026_public_activity.sql"),
 ];

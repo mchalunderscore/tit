@@ -19,6 +19,7 @@ pub(crate) mod instance;
 pub(crate) mod issue;
 pub(crate) mod maintenance;
 pub(crate) mod markdown;
+pub(crate) mod organization;
 pub(crate) mod policy;
 pub(crate) mod pull_request;
 pub(crate) mod rate_limit;
@@ -57,6 +58,9 @@ mod git_ssh_tests;
 #[cfg(test)]
 #[path = "../tests/metadata_search.rs"]
 mod metadata_search_tests;
+#[cfg(test)]
+#[path = "../tests/organizations.rs"]
+mod organization_tests;
 #[cfg(test)]
 #[path = "../tests/public_routes.rs"]
 mod public_routes_tests;

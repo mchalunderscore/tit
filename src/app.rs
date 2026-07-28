@@ -5,9 +5,10 @@ use crate::{
     account, admin, backup, bootstrap,
     cli::{
         AccountCommand, AdminCommand, Cli, CollaboratorRole, Command, InspectCommand,
-        RepairCommand, RepositoryCommand, RepositoryVisibility, SetupCommand,
+        OrganizationCommand, OrganizationRole, RepairCommand, RepositoryCommand,
+        RepositoryVisibility, SetupCommand,
     },
-    config, control, diagnostics, instance, repair, serve, store,
+    config, control, diagnostics, instance, organization, repair, serve, store,
 };
 use clap::Parser;
 
@@ -128,9 +129,57 @@ pub async fn run() -> ExitCode {
                 command: AdminCommand::Account { command },
             }) => run_account_command(&config.instance_dir, command),
             Some(Command::Admin {
+                command: AdminCommand::Organization { command },
+            }) => run_organization_command(&config.instance_dir, command),
+            Some(Command::Admin {
                 command: AdminCommand::Audit { limit },
             }) => run_audit_command(&config.instance_dir, limit),
         },
+        Err(error) => {
+            eprintln!("tit: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_organization_command(
+    instance_dir: &std::path::Path,
+    command: OrganizationCommand,
+) -> ExitCode {
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let _lock = instance::InstanceLock::acquire(instance_dir)?;
+        let database = instance::prepare_database(instance_dir)?;
+        let organizations = organization::OrganizationService::new(&database);
+        match command {
+            OrganizationCommand::Create {
+                slug,
+                owner,
+                display_name,
+            } => organizations.create(&slug, &display_name, "", &owner)?,
+            OrganizationCommand::MemberSet {
+                organization,
+                username,
+                role,
+            } => organizations.set_member(
+                &organization,
+                "admin-cli",
+                &username,
+                match role {
+                    OrganizationRole::Owner => "owner",
+                    OrganizationRole::Maintainer => "maintainer",
+                    OrganizationRole::Writer => "writer",
+                    OrganizationRole::Reader => "reader",
+                },
+            )?,
+            OrganizationCommand::MemberRemove {
+                organization,
+                username,
+            } => organizations.remove_member(&organization, "admin-cli", &username)?,
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("tit: {error}");
             ExitCode::FAILURE

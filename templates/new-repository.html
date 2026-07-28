@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Create repository · tit{% endblock %}
+{% block content %}
+  <h1>Create repository</h1>
+  <section class="create-form">
+    <form action="/account/repositories" method="post">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="field">
+        <label for="repository-owner">Owner</label>
+        <select id="repository-owner" name="owner">
+{% for namespace in namespaces %}
+          <option value="{{ namespace }}">{{ namespace }}</option>
+{% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="repository-name">Name</label>
+        <input id="repository-name" name="name" required maxlength="100" pattern="([a-z0-9]|[a-z0-9][a-z0-9._-]*[a-z0-9])">
+      </div>
+      <button type="submit">Create repository</button>
+    </form>
+  </section>
+{% endblock %}

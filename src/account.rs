@@ -185,9 +185,10 @@ impl AccountService {
 
     pub(crate) fn profile(&self, username: &str) -> Result<PublicProfile, AccountError> {
         validate_username(username)?;
-        Store::open(&self.database)?
-            .public_profile(username)
-            .map_err(Into::into)
+        let store = Store::open(&self.database)?;
+        let mut profile = store.public_profile(username)?;
+        load_public_activity(&store, &mut profile)?;
+        Ok(profile)
     }
 
     pub(crate) fn profile_page(
@@ -199,9 +200,10 @@ impl AccountService {
         if page == 0 || page > 10_000 {
             return Err(AccountError::InvalidProfile);
         }
-        let profile = Store::open(&self.database)?
-            .public_profile_page(username, page, PROFILE_REPOSITORY_PAGE_SIZE)
-            .map_err(AccountError::from)?;
+        let store = Store::open(&self.database)?;
+        let mut profile =
+            store.public_profile_page(username, page, PROFILE_REPOSITORY_PAGE_SIZE)?;
+        load_public_activity(&store, &mut profile)?;
         if page > 1 && profile.repositories.is_empty() {
             return Err(AccountError::InvalidProfile);
         }
@@ -324,6 +326,19 @@ impl AccountService {
     pub(crate) fn database(&self) -> &Path {
         &self.database
     }
+}
+
+fn load_public_activity(store: &Store, profile: &mut PublicProfile) -> Result<(), AccountError> {
+    let current_day = now()?.div_euclid(86_400);
+    let weekday_from_sunday = (current_day + 4).rem_euclid(7);
+    let start_day = current_day
+        .checked_sub(weekday_from_sunday)
+        .and_then(|day| day.checked_sub(52 * 7))
+        .ok_or(AccountError::Clock)?;
+    profile.activity = store.public_activity_days(&profile.username, start_day, current_day)?;
+    profile.activity_start_day = start_day;
+    profile.activity_current_day = current_day;
+    Ok(())
 }
 
 pub(crate) struct AccountKeyRequest<'a> {

@@ -33,6 +33,7 @@ use crate::auth::validate_username;
 use crate::feed_token::FeedTokenService;
 use crate::issue::IssueService;
 use crate::maintenance::MaintenanceGate;
+use crate::organization::{OrganizationError, OrganizationService};
 use crate::pull_request::PullRequestService;
 use crate::rate_limit::AttemptLimiter;
 use crate::repository::{RepositoryService, RepositoryServiceError};
@@ -112,6 +113,7 @@ fn format_time(timestamp: i64) -> String {
 struct WebState {
     public: Option<PublicWeb>,
     accounts: Option<AccountService>,
+    organizations: Option<OrganizationService>,
     jobs: Arc<Semaphore>,
     requests: Arc<Semaphore>,
     login_attempts: AttemptLimiter<IpAddr>,
@@ -201,6 +203,7 @@ impl RunningWebServer {
             WebState {
                 public: None,
                 accounts: None,
+                organizations: None,
                 jobs: Arc::new(Semaphore::new(MAX_BLOCKING_WEB_JOBS)),
                 requests: Arc::new(Semaphore::new(1024)),
                 login_attempts: login_attempt_limiter(),
@@ -265,6 +268,7 @@ impl RunningWebServer {
         let ssh_login_target = parse_ssh_login_target(&config.ssh_clone_base)?;
         let database = config.instance_dir.join(crate::store::DATABASE_FILE);
         let accounts = AccountService::new(database.clone());
+        let organizations = OrganizationService::new(&database);
         let trusted_proxy = config.trusted_proxy;
         let public_url = url::Url::parse(&format!("{}/", config.http_clone_base))
             .map_err(WebError::CanonicalUrl)?;
@@ -292,6 +296,7 @@ impl RunningWebServer {
             WebState {
                 public: Some(public),
                 accounts: Some(accounts),
+                organizations: Some(organizations),
                 jobs,
                 requests,
                 login_attempts: login_attempt_limiter(),
@@ -416,6 +421,9 @@ fn router_with_state(state: WebState) -> Router {
             axum::routing::post(login_challenge_download).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/account", get(account_page))
+        .route("/new", get(create_page))
+        .route("/new/repository", get(create_repository_page))
+        .route("/new/organization", get(create_organization_page))
         .route(
             "/account/profile",
             axum::routing::post(update_profile).layer(DefaultBodyLimit::max(2048)),
@@ -423,6 +431,22 @@ fn router_with_state(state: WebState) -> Router {
         .route(
             "/account/repositories",
             axum::routing::post(create_repository).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/organizations",
+            axum::routing::post(create_organization).layer(DefaultBodyLimit::max(2 * 1024)),
+        )
+        .route(
+            "/organizations/{organization}/profile",
+            axum::routing::post(update_organization_profile).layer(DefaultBodyLimit::max(2 * 1024)),
+        )
+        .route(
+            "/organizations/{organization}/members",
+            axum::routing::post(set_organization_member).layer(DefaultBodyLimit::max(2 * 1024)),
+        )
+        .route(
+            "/organizations/{organization}/members/remove",
+            axum::routing::post(remove_organization_member).layer(DefaultBodyLimit::max(2 * 1024)),
         )
         .route(
             "/account/keys/add",
@@ -1292,6 +1316,97 @@ async fn account_page(
     }
 }
 
+async fn create_page(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = create_context(state, &headers).await {
+        return response;
+    }
+    render(
+        StatusCode::OK,
+        &CreateTemplate {
+            request_id: &request_id.0,
+            signed_in: true,
+        },
+    )
+}
+
+async fn create_repository_page(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+) -> Response {
+    let (username, csrf) = match create_context(state.clone(), &headers).await {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    match organization_job(state, move |organizations| {
+        organizations.maintained_namespaces(&username)
+    })
+    .await
+    {
+        Ok(namespaces) => render(
+            StatusCode::OK,
+            &CreateRepositoryTemplate {
+                request_id: &request_id.0,
+                csrf: &csrf,
+                namespaces: &namespaces,
+                signed_in: true,
+            },
+        ),
+        Err(_) => render_error_with_auth(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id.0,
+            "Create error",
+            "The repository namespaces could not be read.",
+            true,
+        ),
+    }
+}
+
+async fn create_organization_page(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+) -> Response {
+    let (_, csrf) = match create_context(state, &headers).await {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    render(
+        StatusCode::OK,
+        &CreateOrganizationTemplate {
+            request_id: &request_id.0,
+            csrf: &csrf,
+            signed_in: true,
+        },
+    )
+}
+
+async fn create_context(
+    state: WebState,
+    headers: &HeaderMap,
+) -> Result<(String, String), Response> {
+    let Some(session_token) = cookie(headers, SESSION_COOKIE) else {
+        return Err(login_redirect(false));
+    };
+    let Some(csrf) = cookie(headers, CSRF_COOKIE) else {
+        return Err(login_redirect(true));
+    };
+    let csrf_for_auth = csrf.clone();
+    let session = match login_job(state, move |login| {
+        login.authenticate(&session_token, Some(&csrf_for_auth))
+    })
+    .await
+    {
+        Ok(session) => session,
+        Err(_) => return Err(login_redirect(true)),
+    };
+    Ok((session.username, csrf))
+}
+
 async fn begin_key_add(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
@@ -1506,10 +1621,13 @@ async fn public_profile(
     State(state): State<WebState>,
     Extension(request_id): Extension<RequestId>,
     Extension(actor): Extension<RequestActor>,
+    headers: HeaderMap,
     Path(username): Path<String>,
     Query(query): Query<ProfileQuery>,
 ) -> Response {
     let signed_in = actor.0.is_some();
+    let actor_username = actor.0;
+    let csrf = cookie(&headers, CSRF_COOKIE).unwrap_or_default();
     if validate_username(&username).is_err() || state.accounts.is_none() {
         return render_error_with_auth(
             StatusCode::NOT_FOUND,
@@ -1520,45 +1638,130 @@ async fn public_profile(
         );
     }
     let page_number = query.page.unwrap_or(1);
-    let result = account_job(state, move |accounts| {
-        accounts.profile_page(&username, page_number)
+    let account_username = username.clone();
+    let result = account_job(state.clone(), move |accounts| {
+        accounts.profile_page(&account_username, page_number)
     })
     .await;
     match result {
-        Ok(profile) => render(
-            StatusCode::OK,
-            &PublicProfileTemplate {
-                request_id: &request_id.0,
-                signed_in,
-                username: &profile.username,
-                bio: &profile.bio,
-                contact_email: &profile.contact_email,
-                repositories: profile
-                    .repositories
-                    .iter()
-                    .map(|repository| HomeRepositoryView {
-                        owner: &repository.owner,
-                        slug: &repository.slug,
-                        visibility: &repository.visibility,
-                        state: &repository.state,
-                        description: &repository.description,
-                        updated_at: repository.updated_at,
-                    })
-                    .collect(),
-                has_previous: profile.page > 1,
-                has_next: profile.has_next,
-                previous_page: profile.page.saturating_sub(1),
-                next_page: profile.page.saturating_add(1),
-            },
-        ),
-        Err(AccountError::Auth(_) | AccountError::Store(StoreError::AccountNotFound(_))) => {
-            render_error_with_auth(
-                StatusCode::NOT_FOUND,
-                &request_id.0,
-                "Not found",
-                "The profile was not found.",
-                signed_in,
+        Ok(profile) => {
+            let activity = activity_view(&profile);
+            let activity_total = activity.iter().map(|day| day.count).sum();
+            let active_days = activity.iter().filter(|day| day.count > 0).count();
+            render(
+                StatusCode::OK,
+                &PublicProfileTemplate {
+                    request_id: &request_id.0,
+                    signed_in,
+                    username: &profile.username,
+                    bio: &profile.bio,
+                    contact_email: &profile.contact_email,
+                    organizations: profile
+                        .organizations
+                        .iter()
+                        .map(|organization| AccountOrganizationView {
+                            slug: &organization.slug,
+                            display_name: &organization.display_name,
+                            role: &organization.role,
+                        })
+                        .collect(),
+                    repositories: profile
+                        .repositories
+                        .iter()
+                        .map(|repository| HomeRepositoryView {
+                            owner: &repository.owner,
+                            slug: &repository.slug,
+                            visibility: &repository.visibility,
+                            state: &repository.state,
+                            description: &repository.description,
+                            updated_at: repository.updated_at,
+                        })
+                        .collect(),
+                    activity,
+                    activity_total,
+                    active_days,
+                    has_previous: profile.page > 1,
+                    has_next: profile.has_next,
+                    previous_page: profile.page.saturating_sub(1),
+                    next_page: profile.page.saturating_add(1),
+                },
             )
+        }
+        Err(AccountError::Auth(_) | AccountError::Store(StoreError::AccountNotFound(_))) => {
+            let organization_slug = username.clone();
+            let profile_slug = organization_slug.clone();
+            match organization_job(state, move |organizations| {
+                let profile = organizations.profile_page(&profile_slug, page_number)?;
+                let can_edit = actor_username.as_deref().is_some_and(|actor| {
+                    organizations
+                        .can_manage(&profile_slug, actor)
+                        .unwrap_or(false)
+                });
+                let can_manage_members = actor_username.as_deref().is_some_and(|actor| {
+                    organizations
+                        .is_owner(&profile_slug, actor)
+                        .unwrap_or(false)
+                });
+                Ok((profile, can_edit, can_manage_members))
+            })
+            .await
+            {
+                Ok((profile, can_edit, can_manage_members)) => render(
+                    StatusCode::OK,
+                    &OrganizationProfileTemplate {
+                        request_id: &request_id.0,
+                        signed_in,
+                        csrf: &csrf,
+                        can_edit,
+                        can_manage_members,
+                        slug: &profile.slug,
+                        display_name: &profile.display_name,
+                        description: &profile.description,
+                        members: profile
+                            .members
+                            .iter()
+                            .map(|member| OrganizationMemberView {
+                                username: &member.username,
+                                role: &member.role,
+                            })
+                            .collect(),
+                        repositories: profile
+                            .repositories
+                            .iter()
+                            .map(|repository| HomeRepositoryView {
+                                owner: &repository.owner,
+                                slug: &repository.slug,
+                                visibility: &repository.visibility,
+                                state: &repository.state,
+                                description: &repository.description,
+                                updated_at: repository.updated_at,
+                            })
+                            .collect(),
+                        has_previous: profile.page > 1,
+                        has_next: profile.has_next,
+                        previous_page: profile.page.saturating_sub(1),
+                        next_page: profile.page.saturating_add(1),
+                    },
+                ),
+                Err(
+                    OrganizationError::Auth(_)
+                    | OrganizationError::InvalidProfile
+                    | OrganizationError::Store(StoreError::NamespaceNotFound(_)),
+                ) => render_error_with_auth(
+                    StatusCode::NOT_FOUND,
+                    &request_id.0,
+                    "Not found",
+                    "The profile was not found.",
+                    signed_in,
+                ),
+                Err(_) => render_error_with_auth(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &request_id.0,
+                    "Profile error",
+                    "The profile could not be read.",
+                    signed_in,
+                ),
+            }
         }
         Err(_) => render_error_with_auth(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1568,6 +1771,289 @@ async fn public_profile(
             signed_in,
         ),
     }
+}
+
+async fn update_organization_profile(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(organization): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "display-name", "description"]) {
+        Ok(fields) => fields,
+        Err(()) => {
+            return render_error_with_auth(
+                StatusCode::BAD_REQUEST,
+                &request_id.0,
+                "Organization error",
+                "The organization profile request is not valid.",
+                true,
+            );
+        }
+    };
+    let actor =
+        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
+            Ok(actor) => actor,
+            Err(response) => return response,
+        };
+    let display_name = fields[1].clone();
+    let description = normalize_browser_newlines(fields[2].clone());
+    let organization_for_job = organization.clone();
+    match organization_job(state, move |organizations| {
+        organizations.update_profile(&organization_for_job, &actor, &display_name, &description)
+    })
+    .await
+    {
+        Ok(()) => Response::builder()
+            .status(StatusCode::SEE_OTHER)
+            .header(header::LOCATION, format!("/{organization}"))
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::empty())
+            .expect("the organization redirect is valid"),
+        Err(OrganizationError::InvalidProfile | OrganizationError::Auth(_)) => {
+            render_error_with_auth(
+                StatusCode::BAD_REQUEST,
+                &request_id.0,
+                "Organization error",
+                "The display name or description is not valid.",
+                true,
+            )
+        }
+        Err(OrganizationError::Store(StoreError::OrganizationDenied)) => render_error_with_auth(
+            StatusCode::FORBIDDEN,
+            &request_id.0,
+            "Forbidden",
+            "Only an organization owner or maintainer can change the organization profile.",
+            true,
+        ),
+        Err(OrganizationError::Store(StoreError::NamespaceNotFound(_))) => render_error_with_auth(
+            StatusCode::NOT_FOUND,
+            &request_id.0,
+            "Not found",
+            "The organization was not found.",
+            true,
+        ),
+        Err(_) => render_error_with_auth(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id.0,
+            "Organization error",
+            "The organization profile could not be saved.",
+            true,
+        ),
+    }
+}
+
+async fn create_organization(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(
+        &headers,
+        &body,
+        &["csrf", "name", "display-name", "description"],
+    ) {
+        Ok(fields) => fields,
+        Err(()) => {
+            return render_error_with_auth(
+                StatusCode::BAD_REQUEST,
+                &request_id.0,
+                "Organization error",
+                "The organization request is not valid.",
+                true,
+            );
+        }
+    };
+    let actor =
+        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
+            Ok(actor) => actor,
+            Err(response) => return response,
+        };
+    let slug = fields[1].clone();
+    let display_name = fields[2].clone();
+    let description = normalize_browser_newlines(fields[3].clone());
+    let slug_for_job = slug.clone();
+    match organization_job(state, move |organizations| {
+        organizations.create(&slug_for_job, &display_name, &description, &actor)
+    })
+    .await
+    {
+        Ok(()) => Response::builder()
+            .status(StatusCode::SEE_OTHER)
+            .header(header::LOCATION, format!("/{slug}"))
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::empty())
+            .expect("the organization redirect is valid"),
+        Err(OrganizationError::Auth(_) | OrganizationError::InvalidProfile) => {
+            render_error_with_auth(
+                StatusCode::BAD_REQUEST,
+                &request_id.0,
+                "Organization error",
+                "The organization name, display name, or description is not valid.",
+                true,
+            )
+        }
+        Err(OrganizationError::Store(StoreError::NamespaceUnavailable(_))) => {
+            render_error_with_auth(
+                StatusCode::CONFLICT,
+                &request_id.0,
+                "Organization error",
+                "The organization name is not available.",
+                true,
+            )
+        }
+        Err(_) => render_error_with_auth(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id.0,
+            "Organization error",
+            "The organization could not be created.",
+            true,
+        ),
+    }
+}
+
+async fn set_organization_member(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(organization): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "username", "role"]) {
+        Ok(fields) => fields,
+        Err(()) => {
+            return organization_member_error(
+                &request_id.0,
+                StatusCode::BAD_REQUEST,
+                "The organization member request is not valid.",
+            );
+        }
+    };
+    let actor =
+        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
+            Ok(actor) => actor,
+            Err(response) => return response,
+        };
+    let username = fields[1].clone();
+    let role = fields[2].clone();
+    let organization_for_job = organization.clone();
+    match organization_job(state, move |organizations| {
+        organizations.set_member(&organization_for_job, &actor, &username, &role)
+    })
+    .await
+    {
+        Ok(()) => organization_redirect(&organization),
+        Err(OrganizationError::Auth(_))
+        | Err(OrganizationError::Store(StoreError::InvalidOrganizationRole)) => {
+            organization_member_error(
+                &request_id.0,
+                StatusCode::BAD_REQUEST,
+                "The username or organization role is not valid.",
+            )
+        }
+        Err(OrganizationError::Store(StoreError::OrganizationMemberNotFound(_))) => {
+            organization_member_error(
+                &request_id.0,
+                StatusCode::NOT_FOUND,
+                "The account is not active.",
+            )
+        }
+        Err(OrganizationError::Store(StoreError::OrganizationDenied)) => organization_member_error(
+            &request_id.0,
+            StatusCode::FORBIDDEN,
+            "Only an organization owner can change members.",
+        ),
+        Err(OrganizationError::Store(StoreError::LastOrganizationOwner)) => {
+            organization_member_error(
+                &request_id.0,
+                StatusCode::CONFLICT,
+                "An organization must have at least one owner.",
+            )
+        }
+        Err(_) => organization_member_error(
+            &request_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The organization member could not be saved.",
+        ),
+    }
+}
+
+async fn remove_organization_member(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(organization): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "username"]) {
+        Ok(fields) => fields,
+        Err(()) => {
+            return organization_member_error(
+                &request_id.0,
+                StatusCode::BAD_REQUEST,
+                "The organization member request is not valid.",
+            );
+        }
+    };
+    let actor =
+        match authenticate_mutation(state.clone(), &headers, &fields[0], &request_id.0).await {
+            Ok(actor) => actor,
+            Err(response) => return response,
+        };
+    let username = fields[1].clone();
+    let organization_for_job = organization.clone();
+    match organization_job(state, move |organizations| {
+        organizations.remove_member(&organization_for_job, &actor, &username)
+    })
+    .await
+    {
+        Ok(()) => organization_redirect(&organization),
+        Err(OrganizationError::Store(StoreError::OrganizationMemberNotFound(_))) => {
+            organization_member_error(
+                &request_id.0,
+                StatusCode::NOT_FOUND,
+                "The organization member was not found.",
+            )
+        }
+        Err(OrganizationError::Store(StoreError::OrganizationDenied)) => organization_member_error(
+            &request_id.0,
+            StatusCode::FORBIDDEN,
+            "Only an organization owner can change members.",
+        ),
+        Err(OrganizationError::Store(StoreError::LastOrganizationOwner)) => {
+            organization_member_error(
+                &request_id.0,
+                StatusCode::CONFLICT,
+                "An organization must have at least one owner.",
+            )
+        }
+        Err(_) => organization_member_error(
+            &request_id.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The organization member could not be removed.",
+        ),
+    }
+}
+
+fn organization_redirect(organization: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(header::LOCATION, format!("/{organization}"))
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::empty())
+        .expect("the organization redirect is valid")
+}
+
+fn organization_member_error(request_id: &str, status: StatusCode, message: &str) -> Response {
+    render_error_with_auth(
+        status,
+        request_id,
+        "Organization member error",
+        message,
+        true,
+    )
 }
 
 async fn update_profile(
@@ -1624,7 +2110,7 @@ async fn create_repository(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let fields = match parse_named_form(&headers, &body, &["csrf", "name"]) {
+    let fields = match parse_named_form(&headers, &body, &["csrf", "owner", "name"]) {
         Ok(fields) => fields,
         Err(()) => {
             return repository_form_error(
@@ -1656,13 +2142,15 @@ async fn create_repository(
         Ok(session) => session,
         Err(_) => return login_redirect(true),
     };
-    let owner = session.username;
-    let slug = fields[1].clone();
+    let actor = session.username;
+    let owner = fields[1].clone();
+    let slug = fields[2].clone();
     let correlation_id = request_id.0.clone();
     let owner_for_job = owner.clone();
     let slug_for_job = slug.clone();
     let result = repository_job(state, move |repositories| {
-        repositories.create_for_account(
+        repositories.create_for_namespace(
+            &actor,
             &owner_for_job,
             &slug_for_job,
             gix::hash::Kind::Sha1,
@@ -1688,6 +2176,20 @@ async fn create_repository(
                 &request_id.0,
                 StatusCode::CONFLICT,
                 "A repository with this name already exists.",
+            )
+        }
+        Err(RepositoryServiceError::Store(StoreError::OrganizationDenied)) => {
+            repository_form_error(
+                &request_id.0,
+                StatusCode::FORBIDDEN,
+                "The repository owner is not authorized.",
+            )
+        }
+        Err(RepositoryServiceError::Store(StoreError::NamespaceNotFound(_))) => {
+            repository_form_error(
+                &request_id.0,
+                StatusCode::BAD_REQUEST,
+                "The repository owner is not valid.",
             )
         }
         Err(_) => repository_form_error(
@@ -2011,6 +2513,32 @@ async fn account_job<T: Send + 'static>(
     })
     .await
     .map_err(|_| AccountError::Store(StoreError::Integrity("account worker failed".to_owned())))?
+}
+
+async fn organization_job<T: Send + 'static>(
+    state: WebState,
+    operation: impl FnOnce(OrganizationService) -> Result<T, OrganizationError> + Send + 'static,
+) -> Result<T, OrganizationError> {
+    let organizations = state.organizations.ok_or_else(|| {
+        OrganizationError::Store(StoreError::Integrity(
+            "organization service is unavailable".to_owned(),
+        ))
+    })?;
+    let permit = state.jobs.acquire_owned().await.map_err(|_| {
+        OrganizationError::Store(StoreError::Integrity(
+            "organization worker pool is unavailable".to_owned(),
+        ))
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation(organizations)
+    })
+    .await
+    .map_err(|_| {
+        OrganizationError::Store(StoreError::Integrity(
+            "organization worker failed".to_owned(),
+        ))
+    })?
 }
 
 fn account_result(
@@ -2480,6 +3008,30 @@ struct AccountTemplate<'a> {
 }
 
 #[derive(Template)]
+#[template(path = "new.html")]
+struct CreateTemplate<'a> {
+    request_id: &'a str,
+    signed_in: bool,
+}
+
+#[derive(Template)]
+#[template(path = "new-repository.html")]
+struct CreateRepositoryTemplate<'a> {
+    request_id: &'a str,
+    csrf: &'a str,
+    namespaces: &'a [String],
+    signed_in: bool,
+}
+
+#[derive(Template)]
+#[template(path = "new-organization.html")]
+struct CreateOrganizationTemplate<'a> {
+    request_id: &'a str,
+    csrf: &'a str,
+    signed_in: bool,
+}
+
+#[derive(Template)]
 #[template(path = "account-entry.html")]
 struct AccountEntryTemplate<'a> {
     request_id: &'a str,
@@ -2518,6 +3070,72 @@ struct PublicProfileTemplate<'a> {
     username: &'a str,
     bio: &'a str,
     contact_email: &'a str,
+    organizations: Vec<AccountOrganizationView<'a>>,
+    repositories: Vec<HomeRepositoryView<'a>>,
+    activity: Vec<ActivityDayView>,
+    activity_total: i64,
+    active_days: usize,
+    has_previous: bool,
+    has_next: bool,
+    previous_page: usize,
+    next_page: usize,
+}
+
+struct ActivityDayView {
+    date: String,
+    count: i64,
+    level: u8,
+}
+
+fn activity_view(profile: &crate::store::PublicProfile) -> Vec<ActivityDayView> {
+    let mut recorded = profile.activity.iter().peekable();
+    (profile.activity_start_day..=profile.activity_current_day)
+        .map(|day| {
+            let count = if recorded.peek().is_some_and(|record| record.day == day) {
+                recorded.next().map_or(0, |record| record.count)
+            } else {
+                0
+            };
+            let level = match count {
+                0 => 0,
+                1 => 1,
+                2..=3 => 2,
+                4..=7 => 3,
+                _ => 4,
+            };
+            let timestamp = day.saturating_mul(86_400);
+            let date = jiff::Timestamp::from_second(timestamp).map_or_else(
+                |_| "Invalid date".to_owned(),
+                |timestamp| timestamp.strftime("%Y-%m-%d").to_string(),
+            );
+            ActivityDayView { date, count, level }
+        })
+        .collect()
+}
+
+struct AccountOrganizationView<'a> {
+    slug: &'a str,
+    display_name: &'a str,
+    role: &'a str,
+}
+
+struct OrganizationMemberView<'a> {
+    username: &'a str,
+    role: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "organization-profile.html")]
+struct OrganizationProfileTemplate<'a> {
+    request_id: &'a str,
+    signed_in: bool,
+    csrf: &'a str,
+    can_edit: bool,
+    can_manage_members: bool,
+    slug: &'a str,
+    display_name: &'a str,
+    description: &'a str,
+    members: Vec<OrganizationMemberView<'a>>,
     repositories: Vec<HomeRepositoryView<'a>>,
     has_previous: bool,
     has_next: bool,

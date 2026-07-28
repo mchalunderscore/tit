@@ -88,6 +88,22 @@ fn creates_revises_and_recovers_numbered_pull_request_refs_for_both_hashes() {
                 .iter()
                 .any(|event| event.kind == "pull-request-reopened")
         );
+        let pull_request_events = Store::open(&fixture.database)
+            .expect("open the pull-request event store")
+            .repository_pull_request_events("alice", "project", None, 100)
+            .expect("read pull-request-only events")
+            .1;
+        assert!(!pull_request_events.is_empty());
+        assert!(
+            pull_request_events
+                .iter()
+                .all(|event| event.kind.starts_with("pull-request-"))
+        );
+        assert!(
+            pull_request_events
+                .iter()
+                .any(|event| event.kind == "pull-request-created")
+        );
         run(
             &fixture.worktree,
             Command::new("git")
@@ -965,8 +981,9 @@ impl Fixture {
             .connection()
             .execute(
                 "INSERT INTO repository
-                 (id, owner_account_id, slug, visibility, state, object_format, created_at)
-                 VALUES (?1, 1, 'project', 'public', 'active', ?2, 2)",
+                 (id, owner_namespace_id, slug, visibility, state, object_format, created_at)
+                 SELECT ?1, namespace.id, 'project', 'public', 'active', ?2, 2
+                 FROM namespace WHERE namespace.slug = 'alice'",
                 params![repository_id, object_format],
             )
             .expect("create repository metadata");

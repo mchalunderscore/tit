@@ -11,6 +11,17 @@ pub(crate) const PAGE_SIZE: usize = 20;
 pub(crate) enum RepositoryFeedKind {
     Activity,
     Issues,
+    PullRequests,
+}
+
+impl RepositoryFeedKind {
+    pub(crate) fn path(self) -> &'static str {
+        match self {
+            Self::Activity => "rss.xml",
+            Self::Issues => "issues/rss.xml",
+            Self::PullRequests => "pulls/rss.xml",
+        }
+    }
 }
 
 pub(crate) struct FeedPage<'a> {
@@ -50,7 +61,11 @@ impl FeedPage<'_> {
         for event in self.events {
             output.push_str("<item>\n");
             element(&mut output, "title", &event_title(event))?;
-            element(&mut output, "link", &repository_url)?;
+            element(
+                &mut output,
+                "link",
+                &repository_event_link(&repository_url, event),
+            )?;
             write!(output, "<guid isPermaLink=\"false\">")?;
             escape_xml(&event_id(&event.event_id), &mut output)?;
             output.push_str("</guid>\n");
@@ -66,6 +81,7 @@ impl FeedPage<'_> {
         let suffix = match self.kind {
             RepositoryFeedKind::Activity => "events",
             RepositoryFeedKind::Issues => "issues",
+            RepositoryFeedKind::PullRequests => "pull requests",
         };
         format!(
             "{}/{} {suffix}",
@@ -150,14 +166,21 @@ pub(crate) fn activity_link(base_url: &str, record: &ActivityEventRecord) -> Str
         "{}/{}/{}",
         base_url, record.repository.owner, record.repository.slug
     );
-    let number = event_payload(&record.event).and_then(|payload| payload.get("number")?.as_i64());
-    number.map_or(repository_url.clone(), |number| {
-        if record.event.kind.starts_with("pull-request-") {
-            format!("{repository_url}/pulls/{number}")
-        } else {
-            format!("{repository_url}/issues/{number}")
-        }
-    })
+    repository_event_link(&repository_url, &record.event)
+}
+
+fn repository_event_link(repository_url: &str, event: &RepositoryEventRecord) -> String {
+    let number = event_payload(event).and_then(|payload| payload.get("number")?.as_i64());
+    number.map_or_else(
+        || repository_url.to_owned(),
+        |number| {
+            if event.kind.starts_with("pull-request-") {
+                format!("{repository_url}/pulls/{number}")
+            } else {
+                format!("{repository_url}/issues/{number}")
+            }
+        },
+    )
 }
 
 fn event_id(event_id: &str) -> String {
@@ -187,6 +210,9 @@ fn event_title(event: &RepositoryEventRecord) -> String {
         "issue-reopened" => issue_title(event, "reopened"),
         "pull-request-created" => pull_request_title(event, "opened"),
         "pull-request-revised" => pull_request_title(event, "revised"),
+        "pull-request-edited" => pull_request_title(event, "edited"),
+        "pull-request-closed" => pull_request_title(event, "closed"),
+        "pull-request-reopened" => pull_request_title(event, "reopened"),
         "pull-request-commented" => pull_request_title(event, "commented on"),
         "pull-request-line-commented" => pull_request_title(event, "commented on a line in"),
         "pull-request-approved" => pull_request_title(event, "approved"),

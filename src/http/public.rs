@@ -212,6 +212,9 @@ impl PublicWeb {
                 RepositoryFeedKind::Issues => {
                     store.repository_issue_events(&owner, &repository, before, PAGE_SIZE + 1)
                 }
+                RepositoryFeedKind::PullRequests => {
+                    store.repository_pull_request_events(&owner, &repository, before, PAGE_SIZE + 1)
+                }
             }
             .map_err(Into::into)
         })
@@ -323,6 +326,10 @@ pub(super) fn routes() -> Router<WebState> {
         .route("/{owner}/{repository}/refs", get(refs))
         .route("/{owner}/{repository}/rss.xml", get(rss_feed))
         .route("/{owner}/{repository}/issues/rss.xml", get(issue_rss_feed))
+        .route(
+            "/{owner}/{repository}/pulls/rss.xml",
+            get(pull_request_rss_feed),
+        )
         .route("/{owner}/{repository}/search", get(search))
         .route("/{owner}/{repository}/commits", get(commits))
         .route("/{owner}/{repository}/commit/{commit}", get(commit))
@@ -376,6 +383,26 @@ async fn issue_rss_feed(
     .await
 }
 
+async fn pull_request_rss_feed(
+    State(state): State<WebState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(actor): Extension<RequestActor>,
+    AxumPath(path): AxumPath<RepositoryPath>,
+    Query(query): Query<FeedQuery>,
+    headers: HeaderMap,
+) -> Response {
+    feed_response(
+        state,
+        request_id,
+        actor,
+        path,
+        query,
+        headers,
+        RepositoryFeedKind::PullRequests,
+    )
+    .await
+}
+
 async fn feed_response(
     state: WebState,
     request_id: RequestId,
@@ -411,8 +438,11 @@ async fn feed_response(
     let next_before = has_next
         .then(|| events.last().map(|event| event.sequence))
         .flatten();
-    let name = "rss.xml";
-    let feed_url = format!("{}/{owner}/{repository}/{name}", web.http_clone_base);
+    let feed_url = format!(
+        "{}/{owner}/{repository}/{}",
+        web.http_clone_base,
+        kind.path()
+    );
     let self_url = query.before.map_or_else(
         || feed_url.clone(),
         |before| format!("{feed_url}?before={before}"),

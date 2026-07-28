@@ -22,6 +22,7 @@ use crate::git::receive_pack::{ReceivePack, ReceivePackError, recover_incomplete
 use crate::git::transport::{GitRepositories, GitSshService, RepositoryPathError};
 use crate::git::upload_pack::{ProtocolVersion, UploadPack, UploadPackError};
 use crate::issue::{IssueError, IssueService, MAX_BODY_BYTES, MAX_TITLE_BYTES};
+use crate::organization::{OrganizationError, OrganizationService};
 use crate::policy::RepositoryOperation;
 use crate::pull_request::{NewPullRequest, PullRequestError, PullRequestService};
 use crate::rate_limit::AttemptLimiter;
@@ -35,6 +36,7 @@ const AUTH_COMMAND_PREFIX: &[u8] = b"auth ";
 const GIT_PROTOCOL_VARIABLE: &str = "GIT_PROTOCOL";
 const MAX_RECEIVE_PACK_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_REPOSITORY_COMMAND_BYTES: usize = 512;
+const MAX_ORGANIZATION_COMMAND_BYTES: usize = 1_024;
 const MAX_ISSUE_COMMAND_BYTES: usize = 512;
 const MAX_PULL_REQUEST_COMMAND_BYTES: usize = 512;
 const MAX_ISSUE_INPUT_BYTES: usize = MAX_TITLE_BYTES + 1 + MAX_BODY_BYTES;
@@ -46,6 +48,11 @@ const GIT_CHANNEL_INACTIVITY_LIMIT: Duration = Duration::from_secs(30);
 const GIT_CHANNEL_WALL_CLOCK_LIMIT: Duration = Duration::from_secs(120);
 const MAX_GIT_CHANNEL_BYTES: u64 = 257 * 1024 * 1024;
 const REPOSITORY_CREATE_USAGE: &str = "repo create NAME [--output human|json]";
+const ORGANIZATION_CREATE_USAGE: &str = "org create NAME DISPLAY_NAME [--output human|json]";
+const ORGANIZATION_MEMBER_SET_USAGE: &str =
+    "org member set ORGANIZATION USER owner|maintainer|writer|reader [--output human|json]";
+const ORGANIZATION_MEMBER_REMOVE_USAGE: &str =
+    "org member remove ORGANIZATION USER [--output human|json]";
 const ISSUE_LIST_USAGE: &str = "issue list OWNER/REPOSITORY [--output human|json]";
 const ISSUE_CREATE_USAGE: &str = "issue create OWNER/REPOSITORY [--output human|json]";
 const ISSUE_COMMENT_USAGE: &str = "issue comment OWNER/REPOSITORY NUMBER [--output human|json]";
@@ -65,6 +72,9 @@ Available tit SSH commands:
   tit --version
   auth ONE-TIME-SECRET
   repo create NAME [--output human|json]
+  org create NAME DISPLAY_NAME [--output human|json]
+  org member set ORGANIZATION USER owner|maintainer|writer|reader [--output human|json]
+  org member remove ORGANIZATION USER [--output human|json]
   issue list OWNER/REPOSITORY [--output human|json]
   issue create OWNER/REPOSITORY [--output human|json]
   issue comment OWNER/REPOSITORY NUMBER [--output human|json]
@@ -198,6 +208,29 @@ impl RunningSshServer {
     ) -> Result<Self, SshServerError> {
         let host_key = PrivateKey::random(&mut rng(), Algorithm::Ed25519)?;
         Self::start_inner(address, authorized_keys, &[], Some(repositories), host_key).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start_with_account_git(
+        address: SocketAddr,
+        authorized_keys: Vec<(String, SshPublicKey)>,
+        repositories: GitRepositories,
+    ) -> Result<Self, SshServerError> {
+        recover_pushes(&repositories).await?;
+        let host_key = PrivateKey::random(&mut rng(), Algorithm::Ed25519)?;
+        Self::start_inner_with_keys(
+            address,
+            AuthorizedSshKeys::for_accounts(authorized_keys),
+            &[],
+            Some(repositories),
+            host_key,
+            SshRuntime {
+                max_connections: 1024,
+                telemetry: Telemetry::default(),
+                login: None,
+            },
+        )
+        .await
     }
 
     pub(crate) async fn start_with_dynamic_keys(
@@ -765,6 +798,19 @@ impl Handler for SshSession {
                     finish_git_channel(channel, 1, session)?;
                 }
             }
+        } else if is_organization_command(command) {
+            self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
+            session.channel_success(channel)?;
+            let machine_requested = requests_json(command);
+            let result = match (parse_organization_command(command), self.active_identity()) {
+                (Ok(command), Some(identity)) => {
+                    run_organization_command(self.repositories.clone(), identity.username, command)
+                        .await
+                }
+                (Ok(_), None) => Err(OrganizationCommandError::Unavailable),
+                (Err(()), _) => Err(OrganizationCommandError::Usage),
+            };
+            send_organization_command_result(channel, result, machine_requested, session)?;
         } else if is_repository_command(command) {
             self.audit.accepted_exec.fetch_add(1, Ordering::Relaxed);
             session.channel_success(channel)?;
@@ -1264,6 +1310,285 @@ impl Handler for SshSession {
 enum CommandOutput {
     Human,
     Json,
+}
+
+enum OrganizationCommand {
+    Create {
+        slug: String,
+        display_name: String,
+        output: CommandOutput,
+    },
+    SetMember {
+        organization: String,
+        username: String,
+        role: String,
+        output: CommandOutput,
+    },
+    RemoveMember {
+        organization: String,
+        username: String,
+        output: CommandOutput,
+    },
+}
+
+struct OrganizationCommandResult {
+    action: &'static str,
+    organization: String,
+    username: Option<String>,
+    role: Option<String>,
+    output: CommandOutput,
+}
+
+fn is_organization_command(command: &[u8]) -> bool {
+    command == b"org" || command.starts_with(b"org ")
+}
+
+fn parse_organization_command(command: &[u8]) -> Result<OrganizationCommand, ()> {
+    if command.len() > MAX_ORGANIZATION_COMMAND_BYTES || !command.is_ascii() {
+        return Err(());
+    }
+    let command = std::str::from_utf8(command).map_err(|_| ())?;
+    if command
+        .bytes()
+        .any(|byte| byte.is_ascii_control() && byte != b' ')
+    {
+        return Err(());
+    }
+    let mut tokens = command.split_ascii_whitespace().collect::<Vec<_>>();
+    let output = parse_trailing_output(&mut tokens)?;
+    match tokens.as_slice() {
+        ["org", "create", slug, display_name @ ..] if !display_name.is_empty() => {
+            Ok(OrganizationCommand::Create {
+                slug: (*slug).to_owned(),
+                display_name: display_name.join(" "),
+                output,
+            })
+        }
+        ["org", "member", "set", organization, username, role]
+            if matches!(*role, "owner" | "maintainer" | "writer" | "reader") =>
+        {
+            Ok(OrganizationCommand::SetMember {
+                organization: (*organization).to_owned(),
+                username: (*username).to_owned(),
+                role: (*role).to_owned(),
+                output,
+            })
+        }
+        ["org", "member", "remove", organization, username] => {
+            Ok(OrganizationCommand::RemoveMember {
+                organization: (*organization).to_owned(),
+                username: (*username).to_owned(),
+                output,
+            })
+        }
+        _ => Err(()),
+    }
+}
+
+fn parse_trailing_output(tokens: &mut Vec<&str>) -> Result<CommandOutput, ()> {
+    let Some(index) = tokens.iter().position(|token| *token == "--output") else {
+        return Ok(CommandOutput::Human);
+    };
+    if index + 2 != tokens.len() {
+        return Err(());
+    }
+    let output = match tokens[index + 1] {
+        "human" => CommandOutput::Human,
+        "json" => CommandOutput::Json,
+        _ => return Err(()),
+    };
+    tokens.truncate(index);
+    Ok(output)
+}
+
+enum OrganizationCommandError {
+    Usage,
+    Unavailable,
+    Service(OrganizationError),
+}
+
+async fn run_organization_command(
+    repositories: Option<Arc<GitRepositories>>,
+    actor: String,
+    command: OrganizationCommand,
+) -> Result<OrganizationCommandResult, OrganizationCommandError> {
+    let repositories = repositories.ok_or(OrganizationCommandError::Unavailable)?;
+    let database = repositories
+        .push_database()
+        .ok_or(OrganizationCommandError::Unavailable)?
+        .to_owned();
+    let permit = repositories
+        .blocking_permit()
+        .await
+        .map_err(|_| OrganizationCommandError::Unavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let organizations = OrganizationService::new(&database);
+        match command {
+            OrganizationCommand::Create {
+                slug,
+                display_name,
+                output,
+            } => {
+                organizations.create(&slug, &display_name, "", &actor)?;
+                Ok(OrganizationCommandResult {
+                    action: "created",
+                    organization: slug,
+                    username: None,
+                    role: None,
+                    output,
+                })
+            }
+            OrganizationCommand::SetMember {
+                organization,
+                username,
+                role,
+                output,
+            } => {
+                organizations.set_member(&organization, &actor, &username, &role)?;
+                Ok(OrganizationCommandResult {
+                    action: "member-set",
+                    organization,
+                    username: Some(username),
+                    role: Some(role),
+                    output,
+                })
+            }
+            OrganizationCommand::RemoveMember {
+                organization,
+                username,
+                output,
+            } => {
+                organizations.remove_member(&organization, &actor, &username)?;
+                Ok(OrganizationCommandResult {
+                    action: "member-removed",
+                    organization,
+                    username: Some(username),
+                    role: None,
+                    output,
+                })
+            }
+        }
+    })
+    .await
+    .map_err(|_| OrganizationCommandError::Unavailable)?
+    .map_err(OrganizationCommandError::Service)
+}
+
+fn send_organization_command_result(
+    channel: ChannelId,
+    result: Result<OrganizationCommandResult, OrganizationCommandError>,
+    machine_requested: bool,
+    session: &mut Session,
+) -> Result<(), russh::Error> {
+    match result {
+        Ok(result) => {
+            let data = match result.output {
+                CommandOutput::Human => organization_command_human(&result),
+                CommandOutput::Json => organization_command_json(&result),
+            };
+            session.data(channel, data)?;
+            finish_git_channel(channel, 0, session)
+        }
+        Err(error) => {
+            if machine_requested {
+                session.data(
+                    channel,
+                    json_line(serde_json::json!({
+                        "version": 1,
+                        "status": "error",
+                        "error": { "code": organization_command_error_code(&error) },
+                    })),
+                )?;
+            } else {
+                session.extended_data(
+                    channel,
+                    1,
+                    format!("tit: {}\n", organization_command_error_message(&error)).into_bytes(),
+                )?;
+            }
+            finish_git_channel(channel, 1, session)
+        }
+    }
+}
+
+fn organization_command_human(result: &OrganizationCommandResult) -> Vec<u8> {
+    match result.action {
+        "created" => format!("Created organization {}.\n", result.organization).into_bytes(),
+        "member-set" => format!(
+            "Set {} as {} in {}.\n",
+            result.username.as_deref().unwrap_or_default(),
+            result.role.as_deref().unwrap_or_default(),
+            result.organization
+        )
+        .into_bytes(),
+        "member-removed" => format!(
+            "Removed {} from {}.\n",
+            result.username.as_deref().unwrap_or_default(),
+            result.organization
+        )
+        .into_bytes(),
+        _ => unreachable!("the organization action is valid"),
+    }
+}
+
+fn organization_command_json(result: &OrganizationCommandResult) -> Vec<u8> {
+    json_line(serde_json::json!({
+        "version": 1,
+        "status": "success",
+        "action": result.action,
+        "organization": result.organization,
+        "member": result.username.as_ref().map(|username| serde_json::json!({
+            "username": username,
+            "role": result.role,
+        })),
+    }))
+}
+
+fn organization_command_error_code(error: &OrganizationCommandError) -> &'static str {
+    match error {
+        OrganizationCommandError::Usage => "invalid-command",
+        OrganizationCommandError::Unavailable => "service-unavailable",
+        OrganizationCommandError::Service(OrganizationError::Auth(_)) => "invalid-name",
+        OrganizationCommandError::Service(OrganizationError::InvalidProfile) => "invalid-profile",
+        OrganizationCommandError::Service(OrganizationError::Store(
+            StoreError::NamespaceUnavailable(_),
+        )) => "namespace-unavailable",
+        OrganizationCommandError::Service(OrganizationError::Store(
+            StoreError::NamespaceNotFound(_),
+        )) => "organization-unavailable",
+        OrganizationCommandError::Service(OrganizationError::Store(
+            StoreError::AccountNotFound(_) | StoreError::OrganizationMemberNotFound(_),
+        )) => "member-unavailable",
+        OrganizationCommandError::Service(OrganizationError::Store(
+            StoreError::OrganizationDenied,
+        )) => "permission-denied",
+        OrganizationCommandError::Service(OrganizationError::Store(
+            StoreError::LastOrganizationOwner,
+        )) => "last-owner",
+        OrganizationCommandError::Service(OrganizationError::Store(
+            StoreError::InvalidOrganizationRole,
+        )) => "invalid-role",
+        OrganizationCommandError::Service(_) => "organization-command-failed",
+    }
+}
+
+fn organization_command_error_message(error: &OrganizationCommandError) -> String {
+    match organization_command_error_code(error) {
+        "invalid-command" => format!(
+            "usage: {ORGANIZATION_CREATE_USAGE}\n       {ORGANIZATION_MEMBER_SET_USAGE}\n       {ORGANIZATION_MEMBER_REMOVE_USAGE}\n{HELP_GUIDANCE}"
+        ),
+        "invalid-name" => "The organization name or username is not valid.".to_owned(),
+        "invalid-profile" => "The organization display name is not valid.".to_owned(),
+        "namespace-unavailable" => "The organization name is not available.".to_owned(),
+        "organization-unavailable" => "The organization is not active.".to_owned(),
+        "member-unavailable" => "The account or organization member is not active.".to_owned(),
+        "permission-denied" => "The account is not an organization owner.".to_owned(),
+        "last-owner" => "An organization must have at least one owner.".to_owned(),
+        "invalid-role" => "The organization role is not valid.".to_owned(),
+        "service-unavailable" => "The organization service is not available.".to_owned(),
+        _ => "The organization command could not be completed.".to_owned(),
+    }
 }
 
 struct RepositoryCreateCommand {
@@ -2866,6 +3191,36 @@ pub(crate) struct RequestAuditSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_only_bounded_organization_commands() {
+        assert!(matches!(
+            parse_organization_command(b"org create acme Acme Organization --output json"),
+            Ok(OrganizationCommand::Create {
+                slug,
+                display_name,
+                output: CommandOutput::Json,
+            }) if slug == "acme" && display_name == "Acme Organization"
+        ));
+        assert!(matches!(
+            parse_organization_command(b"org member set acme bob owner"),
+            Ok(OrganizationCommand::SetMember { .. })
+        ));
+        assert!(matches!(
+            parse_organization_command(b"org member remove acme bob --output human"),
+            Ok(OrganizationCommand::RemoveMember { .. })
+        ));
+        for command in [
+            b"org create acme".as_slice(),
+            b"org create acme Acme --output".as_slice(),
+            b"org member set acme bob administrator".as_slice(),
+            b"org member remove acme bob extra".as_slice(),
+            b"org member remove acme bob --output json --output json".as_slice(),
+            &[b'x'; MAX_ORGANIZATION_COMMAND_BYTES + 1],
+        ] {
+            assert!(parse_organization_command(command).is_err());
+        }
+    }
 
     #[test]
     fn parses_only_bounded_issue_commands_and_input() {

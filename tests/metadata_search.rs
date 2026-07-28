@@ -134,10 +134,10 @@ fn measures_bounded_repository_name_search_without_an_index() {
                  SELECT number + 1 FROM sequence WHERE number < 9999
              )
              INSERT INTO repository
-                 (id, owner_account_id, slug, visibility, state, object_format,
+                 (id, owner_namespace_id, slug, visibility, state, object_format,
                   created_at, archived_at)
              SELECT printf('%032x', number),
-                    1,
+                    (SELECT id FROM namespace WHERE slug = 'alice'),
                     printf('repository-%05d', number),
                     'public', 'active', 'sha1', number + 2, NULL
              FROM sequence;",

@@ -32,7 +32,9 @@ const CURRENT_DATABASE: &str = concat!(
     include_str!("../src/store/migrations/022_account_key_management.sql"),
     include_str!("../src/store/migrations/023_default_branch.sql"),
     include_str!("../src/store/migrations/024_default_branch_intents.sql"),
-    "PRAGMA user_version = 24;\n",
+    include_str!("../src/store/migrations/025_organizations.sql"),
+    include_str!("../src/store/migrations/026_public_activity.sql"),
+    "PRAGMA user_version = 26;\n",
 );
 
 #[test]
@@ -660,6 +662,85 @@ fn administers_repository_visibility_and_collaborators() {
     assert!(audit.contains("outcome=success\n"));
     assert!(audit.contains("outcome=failure\n"));
     assert!(audit.contains("correlation-id="));
+}
+
+#[test]
+fn administers_organizations_and_their_repositories() {
+    let instance = TestInstance::new();
+    create_administrator(&instance, "alice");
+    let config = instance.config().to_str().expect("a UTF-8 path");
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the organization database");
+    database
+        .execute(
+            "INSERT INTO account (username, is_administrator, state, created_at)
+             VALUES ('bob', 0, 'active', 1)",
+            [],
+        )
+        .expect("create an organization member");
+    drop(database);
+
+    let created = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "organization",
+        "create",
+        "acme",
+        "alice",
+        "Acme Organization",
+    ]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let member = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "organization",
+        "member-set",
+        "acme",
+        "bob",
+        "reader",
+    ]);
+    assert!(member.status.success());
+    let repository = instance.run(&[
+        "--config",
+        config,
+        "admin",
+        "repository",
+        "create",
+        "acme",
+        "project",
+    ]);
+    assert!(repository.status.success());
+
+    let database = rusqlite::Connection::open(instance.path().join("tit.sqlite3"))
+        .expect("open the organization database");
+    let owner: String = database
+        .query_row(
+            "SELECT namespace.slug
+             FROM repository
+             JOIN namespace ON namespace.id = repository.owner_namespace_id
+             WHERE repository.slug = 'project'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the repository namespace");
+    assert_eq!(owner, "acme");
+    let role: String = database
+        .query_row(
+            "SELECT organization_member.role
+             FROM organization_member
+             JOIN account ON account.id = organization_member.account_id
+             WHERE account.username = 'bob'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the organization role");
+    assert_eq!(role, "reader");
 }
 
 #[test]

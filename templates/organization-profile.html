@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}{{ display_name }} · tit{% endblock %}
+{% block content %}
+  <div class="two-column">
+    <section aria-labelledby="profile-heading">
+      <h1 id="profile-heading">{{ display_name }}</h1>
+      <p><code>{{ slug }}</code></p>
+{% if description.is_empty() %}
+      <p>This organization has no description.</p>
+{% else %}
+      <p class="profile-bio">{{ description }}</p>
+{% endif %}
+{% if can_edit %}
+      <h2>Edit organization</h2>
+      <form action="/organizations/{{ slug }}/profile" method="post">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <p>
+          <label for="organization-display-name">Display name</label>
+          <input id="organization-display-name" name="display-name" maxlength="100" required value="{{ display_name }}">
+        </p>
+        <p>
+          <label for="organization-description">Description</label>
+          <textarea id="organization-description" name="description" maxlength="512" rows="5">{{ description }}</textarea>
+        </p>
+        <button type="submit">Save organization</button>
+      </form>
+{% endif %}
+    </section>
+    <section aria-labelledby="repositories-heading">
+      <h2 id="repositories-heading">Public repositories</h2>
+{% if repositories.is_empty() %}
+      <p>This organization has no public repositories.</p>
+{% else %}
+      <ul class="repository-list">
+{% for repository in repositories %}
+        <li><a href="/{{ repository.owner }}/{{ repository.slug }}">{{ repository.slug }}</a> · updated <time datetime="{{ repository.updated_at }}">{{ repository.updated_at|human_time }}</time>{% if repository.description.is_empty() %}{% else %}<br>{{ repository.description }}{% endif %}</li>
+{% endfor %}
+      </ul>
+{% if has_previous || has_next %}
+      <nav class="pagination" aria-label="Repository pages">
+{% if has_previous %}
+        <a href="/{{ slug }}?page={{ previous_page }}">Newer repositories</a>
+{% endif %}
+{% if has_next %}
+        <a href="/{{ slug }}?page={{ next_page }}">Older repositories</a>
+{% endif %}
+      </nav>
+{% endif %}
+{% endif %}
+      <h2>Members</h2>
+{% if can_manage_members %}
+      <form action="/organizations/{{ slug }}/members" method="post">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <p>
+          <label for="organization-member-username">Username</label>
+          <input id="organization-member-username" name="username" required maxlength="40">
+        </p>
+        <p>
+          <label for="organization-member-role">Organization role</label>
+          <select id="organization-member-role" name="role">
+            <option value="reader">reader</option>
+            <option value="writer">writer</option>
+            <option value="maintainer">maintainer</option>
+            <option value="owner">owner</option>
+          </select>
+        </p>
+        <button type="submit">Add or update member</button>
+      </form>
+{% endif %}
+      <ul>
+{% for member in members %}
+        <li>
+          <a href="/{{ member.username }}">{{ member.username }}</a> · {{ member.role }}
+{% if can_manage_members %}
+          <form class="inline-form" action="/organizations/{{ slug }}/members/remove" method="post">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="username" value="{{ member.username }}">
+            <button class="danger-action" type="submit">Remove</button>
+          </form>
+{% endif %}
+        </li>
+{% endfor %}
+      </ul>
+    </section>
+  </div>
+{% endblock %}

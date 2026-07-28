@@ -1,4 +1,4 @@
-use crate::{auth, ssh};
+use crate::{auth, git, maintenance, ssh, store};
 
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -8,7 +8,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use auth::SshPublicKey;
+use git::transport::GitRepositories;
 use ssh::RunningSshServer;
+use store::Store;
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -56,6 +58,9 @@ async fn reports_available_commands_and_explains_invalid_commands() {
     assert!(help_text.contains("Available tit SSH commands:"));
     assert!(help_text.contains("auth ONE-TIME-SECRET"));
     assert!(help_text.contains("repo create NAME"));
+    assert!(help_text.contains("org create NAME DISPLAY_NAME"));
+    assert!(help_text.contains("org member set ORGANIZATION USER owner|maintainer|writer|reader"));
+    assert!(help_text.contains("org member remove ORGANIZATION USER"));
     assert!(!help_text.contains("object-format"));
     assert!(help_text.contains("issue list OWNER/REPOSITORY"));
     assert!(help_text.contains("issue comment OWNER/REPOSITORY NUMBER"));
@@ -93,6 +98,113 @@ async fn reports_available_commands_and_explains_invalid_commands() {
     assert_eq!(response["version"], 1);
     assert_eq!(response["status"], "error");
     assert_eq!(response["error"]["code"], "invalid-command");
+
+    server.shutdown().await.expect("stop the SSH server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manages_organizations_as_the_authenticated_account() {
+    let directory = TempDir::new().expect("create an organization SSH fixture directory");
+    let alice_private = directory.path().join("alice");
+    let bob_private = directory.path().join("bob");
+    generate_key(&alice_private, KeyFixture::Ed25519);
+    generate_key(&bob_private, KeyFixture::Ed25519);
+    let database = directory.path().join("tit.sqlite3");
+    let repositories_root = directory.path().join("repositories");
+    fs::create_dir(&repositories_root).expect("create the repository root");
+    let store = Store::open(&database).expect("create the organization database");
+    store
+        .connection()
+        .execute_batch(
+            "INSERT INTO account
+             (id, username, is_administrator, state, created_at) VALUES
+             (1, 'alice', 1, 'active', 1),
+             (2, 'bob', 0, 'active', 1);",
+        )
+        .expect("create organization accounts");
+    drop(store);
+    let repositories = GitRepositories::new_managed_authorized_with_gate(
+        &repositories_root,
+        &database,
+        maintenance::MaintenanceGate::default(),
+    )
+    .expect("open the managed repository root");
+    let server = RunningSshServer::start_with_account_git(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        vec![
+            ("alice".to_owned(), parse_public_key(&alice_private)),
+            ("bob".to_owned(), parse_public_key(&bob_private)),
+        ],
+        repositories,
+    )
+    .await
+    .expect("start the organization SSH server");
+
+    let created = ssh(
+        &server,
+        &alice_private,
+        "ignored",
+        &["org create acme Acme Organization --output json"],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let response: serde_json::Value =
+        serde_json::from_slice(&created.stdout).expect("parse the create response");
+    assert_eq!(response["action"], "created");
+    assert_eq!(response["organization"], "acme");
+
+    let denied = ssh(
+        &server,
+        &bob_private,
+        "alice",
+        &["org member set acme bob owner --output json"],
+    );
+    assert!(!denied.status.success());
+    let response: serde_json::Value =
+        serde_json::from_slice(&denied.stdout).expect("parse the denied response");
+    assert_eq!(response["error"]["code"], "permission-denied");
+
+    let promoted = ssh(
+        &server,
+        &alice_private,
+        "ignored",
+        &["org member set acme bob owner"],
+    );
+    assert!(promoted.status.success());
+    assert_eq!(
+        String::from_utf8(promoted.stdout).expect("read the member-set response"),
+        "Set bob as owner in acme.\n"
+    );
+
+    let removed = ssh(
+        &server,
+        &bob_private,
+        "ignored",
+        &["org member remove acme alice"],
+    );
+    assert!(removed.status.success());
+    let last_owner = ssh(
+        &server,
+        &bob_private,
+        "ignored",
+        &["org member remove acme bob --output json"],
+    );
+    assert!(!last_owner.status.success());
+    let response: serde_json::Value =
+        serde_json::from_slice(&last_owner.stdout).expect("parse the last-owner response");
+    assert_eq!(response["error"]["code"], "last-owner");
+
+    let profile = Store::open(&database)
+        .expect("open the organization database")
+        .organization_profile("acme", 1, 20)
+        .expect("read the organization");
+    assert_eq!(profile.display_name, "Acme Organization");
+    assert_eq!(profile.members.len(), 1);
+    assert_eq!(profile.members[0].username, "bob");
+    assert_eq!(profile.members[0].role, "owner");
 
     server.shutdown().await.expect("stop the SSH server");
 }

@@ -117,6 +117,25 @@ const V17_FIXTURE: &str = concat!(
     include_str!("../src/store/migrations/017_pull_request_merges.sql"),
     "PRAGMA user_version = 17;\n",
 );
+const V22_FIXTURE: &str = concat!(
+    include_str!("fixtures/sqlite/v7.sql"),
+    include_str!("../src/store/migrations/008_web_sessions.sql"),
+    include_str!("../src/store/migrations/009_repository_authorization.sql"),
+    include_str!("../src/store/migrations/010_audit_history.sql"),
+    include_str!("../src/store/migrations/011_domain_events.sql"),
+    include_str!("../src/store/migrations/012_issues.sql"),
+    include_str!("../src/store/migrations/013_watches.sql"),
+    include_str!("../src/store/migrations/014_feed_tokens.sql"),
+    include_str!("../src/store/migrations/015_pull_requests.sql"),
+    include_str!("../src/store/migrations/016_pull_request_reviews.sql"),
+    include_str!("../src/store/migrations/017_pull_request_merges.sql"),
+    include_str!("../src/store/migrations/018_streamlined_login.sql"),
+    include_str!("../src/store/migrations/019_product_reduction.sql"),
+    include_str!("../src/store/migrations/020_repository_profiles.sql"),
+    include_str!("../src/store/migrations/021_pull_request_lifecycle.sql"),
+    include_str!("../src/store/migrations/022_account_key_management.sql"),
+    "PRAGMA user_version = 22;\n",
+);
 
 fn database(directory: &TempDir, name: &str) -> std::path::PathBuf {
     directory.path().join(name)
@@ -239,7 +258,7 @@ fn configures_connections_and_creates_the_current_schema() {
     let directory = TempDir::new().expect("create a temporary directory");
     let store = Store::open(&database(&directory, "store.sqlite")).expect("open the store");
 
-    assert_eq!(store.schema_version().expect("read the schema version"), 24);
+    assert_eq!(store.schema_version().expect("read the schema version"), 26);
     assert_eq!(
         store
             .connection()
@@ -769,7 +788,7 @@ fn creates_renames_archives_and_reads_owned_repositories() {
     };
     assert!(matches!(
         store.create_repository(&missing_owner),
-        Err(StoreError::AccountNotFound(owner)) if owner == "charlie"
+        Err(StoreError::NamespaceNotFound(owner)) if owner == "charlie"
     ));
     let (_, unchanged_events) = store
         .public_repository_events("alice", "project", None, 10)
@@ -1665,7 +1684,7 @@ fn migrates_each_committed_historical_fixture() {
         create_fixture(&path, fixture);
 
         let store = Store::open(&path).expect("migrate the fixture");
-        assert_eq!(store.schema_version().expect("read the schema version"), 24);
+        assert_eq!(store.schema_version().expect("read the schema version"), 26);
         store.integrity_check().expect("check migrated integrity");
         let state: String = store
             .connection()
@@ -1696,43 +1715,20 @@ fn migrates_each_committed_historical_fixture() {
 fn migration_uses_an_existing_repository_symbolic_head() {
     let directory = TempDir::new().expect("create a migration directory");
     let path = database(&directory, "tit.sqlite3");
-    let mut store = Store::open(&path).expect("create the current database");
-    store
-        .connection()
-        .execute(
+    create_fixture(&path, V22_FIXTURE);
+    let connection = Connection::open(&path).expect("open the historical database");
+    connection
+        .execute_batch(
             "INSERT INTO account
              (id, username, is_administrator, state, created_at)
-             VALUES (1, 'alice', 1, 'active', 1)",
-            [],
+             VALUES (1, 'alice', 1, 'active', 1);
+             INSERT INTO repository
+             (id, owner_account_id, slug, visibility, state, object_format, created_at)
+             VALUES ('00112233445566778899aabbccddeeff', 1, 'project', 'public',
+                     'active', 'sha1', 2);",
         )
-        .expect("create the migration account");
-    store
-        .create_repository(&NewRepository {
-            id: "00112233445566778899aabbccddeeff",
-            owner: "alice",
-            slug: "project",
-            object_format: "sha1",
-            default_branch: "refs/heads/main",
-            created_at: 2,
-            origin: RepositoryOrigin::Created,
-            initial_references: &[],
-            actor: "alice",
-            correlation_id: "migration-default",
-        })
-        .expect("create the migration repository");
-    store
-        .connection()
-        .execute("DROP TABLE repository_default_branch", [])
-        .expect("remove the new table from the historical fixture");
-    store
-        .connection()
-        .execute("DROP TABLE repository_default_branch_intent", [])
-        .expect("remove the intent table from the historical fixture");
-    store
-        .connection()
-        .pragma_update(None, "user_version", 22)
-        .expect("set the historical schema version");
-    drop(store);
+        .expect("create the historical repository metadata");
+    drop(connection);
     let repository = directory
         .path()
         .join("repositories")
@@ -1754,43 +1750,20 @@ fn migration_uses_an_existing_repository_symbolic_head() {
 fn migration_does_not_commit_when_a_repository_head_cannot_be_read() {
     let directory = TempDir::new().expect("create a migration directory");
     let path = database(&directory, "tit.sqlite3");
-    let mut store = Store::open(&path).expect("create the current database");
-    store
-        .connection()
-        .execute(
+    create_fixture(&path, V22_FIXTURE);
+    let connection = Connection::open(&path).expect("open the historical database");
+    connection
+        .execute_batch(
             "INSERT INTO account
              (id, username, is_administrator, state, created_at)
-             VALUES (1, 'alice', 1, 'active', 1)",
-            [],
+             VALUES (1, 'alice', 1, 'active', 1);
+             INSERT INTO repository
+             (id, owner_account_id, slug, visibility, state, object_format, created_at)
+             VALUES ('00112233445566778899aabbccddeeff', 1, 'project', 'public',
+                     'active', 'sha1', 2);",
         )
-        .expect("create the migration account");
-    store
-        .create_repository(&NewRepository {
-            id: "00112233445566778899aabbccddeeff",
-            owner: "alice",
-            slug: "project",
-            object_format: "sha1",
-            default_branch: "refs/heads/main",
-            created_at: 2,
-            origin: RepositoryOrigin::Created,
-            initial_references: &[],
-            actor: "alice",
-            correlation_id: "migration-default-failure",
-        })
-        .expect("create the migration repository");
-    store
-        .connection()
-        .execute("DROP TABLE repository_default_branch", [])
-        .expect("remove the new table from the historical fixture");
-    store
-        .connection()
-        .execute("DROP TABLE repository_default_branch_intent", [])
-        .expect("remove the intent table from the historical fixture");
-    store
-        .connection()
-        .pragma_update(None, "user_version", 22)
-        .expect("set the historical schema version");
-    drop(store);
+        .expect("create the historical repository metadata");
+    drop(connection);
     let head = directory
         .path()
         .join("repositories")
@@ -1860,8 +1833,62 @@ fn backfills_repository_events_when_version_five_is_migrated() {
 }
 
 #[test]
+fn organization_migration_rolls_back_and_restores_foreign_keys() {
+    let directory = TempDir::new().expect("create a migration directory");
+    let path = database(&directory, "tit.sqlite3");
+    create_fixture(&path, V22_FIXTURE);
+    let mut store = Store::open_unmigrated(&path).expect("open the version-22 fixture");
+    store
+        .connection()
+        .execute_batch(concat!(
+            include_str!("../src/store/migrations/023_default_branch.sql"),
+            include_str!("../src/store/migrations/024_default_branch_intents.sql"),
+            "PRAGMA user_version = 24;"
+        ))
+        .expect("create the version-24 fixture");
+    store
+        .connection()
+        .pragma_update(None, "foreign_keys", false)
+        .expect("disable foreign keys for the damaged fixture");
+    store
+        .connection()
+        .execute(
+            "INSERT INTO repository_collaborator
+             (repository_id, account_id, role, created_at)
+             VALUES ('00112233445566778899aabbccddeeff', 99, 'reader', 1)",
+            [],
+        )
+        .expect("insert an orphaned collaborator");
+    store
+        .connection()
+        .pragma_update(None, "foreign_keys", true)
+        .expect("restore foreign keys before migration");
+
+    assert!(matches!(store.migrate(), Err(StoreError::Integrity(_))));
+    assert_eq!(store.schema_version().expect("read the schema version"), 24);
+    assert!(
+        store
+            .connection()
+            .pragma_query_value::<bool, _>(None, "foreign_keys", |row| row.get(0))
+            .expect("read the foreign-key setting")
+    );
+    let old_owner_column: bool = store
+        .connection()
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('repository')
+                 WHERE name = 'owner_account_id'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect the rolled-back repository table");
+    assert!(old_owner_column);
+}
+
+#[test]
 fn recovers_complete_schema_versions_after_a_process_kill_during_migration() {
-    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 24)] {
+    for (mode, expected_version) in [("migration-uncommitted", 1), ("migration-committed", 26)] {
         let directory = TempDir::new().expect("create a temporary directory");
         let path = database(&directory, "fixture.sqlite");
         create_fixture(&path, V1_FIXTURE);

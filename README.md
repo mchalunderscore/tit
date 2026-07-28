@@ -7,9 +7,9 @@ One executable provides:
 - public HTTP clone and authenticated SSH clone and push;
 - accounts that use SSH keys;
 - repositories, issues, pull requests, reviews, and a protected default branch;
-- repository and issue RSS feeds;
+- repository, issue, and pull-request RSS feeds;
 - repository name and source search;
-- public user profiles;
+- public account and organization profiles;
 - backup, restore, diagnostics, audit, and repair commands.
 
 The server does not require Git, OpenSSH, JavaScript, or an external database
@@ -85,6 +85,34 @@ plain-text bio and contact email. The profile lists only public repositories.
 The account page lists active and revoked SSH keys. A fresh SSH `auth`
 approval is required to add or revoke a key.
 
+## Organizations
+
+An organization provides a shared repository namespace. An authenticated
+account can create an organization through SSH. The account becomes its first
+owner:
+
+```text
+ssh -p 2222 tit.example org create acme "Acme Organization"
+ssh -p 2222 tit.example org member set acme bob writer
+ssh -p 2222 tit.example org member remove acme bob
+```
+
+Only an organization owner can set or remove members. An organization owner
+can edit the display name and description on the organization profile. An
+organization owner can create a repository in the organization from the
+Create page. An owner can maintain all organization repositories. An
+organization maintainer can edit the organization profile and maintain all
+organization repositories. An organization writer can write to all organization
+repositories. An organization reader can read all organization repositories,
+including private repositories. A repository collaborator role can increase
+the role for one repository. An organization must always have at least one
+owner.
+
+The `/<organization>` profile lists active members and public repositories.
+An account profile lists the active organizations of that account.
+An administrator can also manage organizations while the server is stopped.
+Run `tit admin organization --help` for the offline commands.
+
 ## Repositories
 
 An authenticated account can create a repository through SSH:
@@ -137,12 +165,15 @@ arguments:
 ```text
 tit admin repository --help
 tit admin account --help
+tit admin organization --help
 ```
 
 ## Web UI
 
 Anonymous users can browse recently updated public repositories and public
-profiles. Authenticated users get an account overview and their repositories.
+profiles. Public account profiles include a one-year matrix of activity in
+active public repositories. Authenticated users get an account overview and
+their repositories.
 
 A repository page provides refs, commits, trees, blobs, blame, archives,
 source search, issues, pull requests, watch state, and RSS. The recent commit
